@@ -58,7 +58,7 @@ table must match it (`pixi run lint` compares them).
 | `fuzz` | in use | `fuzz.sql_parser.smoke`: a short libFuzzer run with a fixed seed (Clang `fuzz` preset only) |
 | `setup` | in use | `fixtures.generate`, `fixtures.tpch` and `fixtures.tpcds`: write the Parquet fixtures (and the data derived from TPC-H and TPC-DS) before any test that needs them |
 | `data` | in use | ClickBench data tests (`data.*`, [below](#clickbench-data-tests)): downloaded data, always redacted; only the `data` and `asan-data` test presets run them |
-| `bench-smoke` | in use | `bench.micro.smoke`: every micro benchmark once (presets with benchmarks: `ci-release`, `static`); numbers never gate |
+| `bench-smoke` | in use | every micro benchmark once across two shards (presets with benchmarks: `ci-release`, `static`); numbers never gate |
 | `tpc-sf1` | in use | the ratchet of the queries derived from TPC-DS at scale factor 1, `tpcds.status.sf1.1of8` to `8of8` ([below](#data-derived-from-tpc-ds)): hermetic, but the `ci-asan` and `tsan` test presets leave it out; the `asan-tpc-sf1` preset runs only it, nightly |
 
 The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`, `coverage`, `tsan`, `ci-shuffle`,
@@ -80,7 +80,7 @@ test preset runs only `fuzz` and `fuzz-replay`.
 - A filtered run still generates the fixtures first: every test that reads them requires the ctest fixture that
   `fixtures.generate` sets up.
 - `pixi run ci`, `pixi run asan`, `pixi run ci-gcc` and `pixi run release` run the same tests in the CI
-  configurations (`asan` all but `tpc-sf1`; `release` also builds the micro benchmarks and runs `bench.micro.smoke`).
+  configurations (`asan` all but `tpc-sf1`; `release` also builds the micro benchmarks and runs the `bench-smoke` tests).
   Each writes JUnit XML to `build/<preset>/junit.xml`. Benchmarks themselves are not tests:
   [benchmarks.md](benchmarks.md).
 - `pixi run tsan` runs the hermetic tests but `tpc-sf1` under ThreadSanitizer (`build/tsan`); `pixi run ci-shuffle`

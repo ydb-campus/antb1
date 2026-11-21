@@ -10,6 +10,7 @@
 #include <arrow/array/array_base.h>
 #include <arrow/array/builder_base.h>
 #include <arrow/record_batch.h>
+#include <arrow/result.h>
 #include <arrow/status.h>
 
 // Gathering rows of several batches into one array: the sort buffer's output (SortBuffer::Slice)
@@ -57,5 +58,17 @@ class ChunkColumns {
 template <bool kWithNulls, class Ref>
 arrow::Status GatherRows(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
                          arrow::ArrayBuilder& builder);
+
+// A group's first-seen row in the source table's per-column key chunks.
+struct GroupKeyRow {
+  std::uint32_t chunk;
+  std::uint32_t row;
+};
+
+// Gather in destination group order, copying just the indicated original key values. The
+// immutable source owns each array while this runs; the result owns its buffers.
+arrow::Result<std::shared_ptr<arrow::Array>> GatherGroupKeys(const arrow::ArrayVector& chunks,
+                                                             std::span<const GroupKeyRow> refs,
+                                                             arrow::MemoryPool* pool);
 
 }  // namespace antb1::exec

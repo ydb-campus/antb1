@@ -15,8 +15,8 @@ bool TakesColumnKeys(const std::vector<arrow::TypeHolder>& types);
 
 // Explicit fixed candidates use this when the one/two-key packed layout does not apply. The
 // generic index grows on insertion and rebuilds its buckets in group-ID order for either kind.
-std::unique_ptr<KeyTable> MakeColumnKeyTable(const std::vector<arrow::TypeHolder>& types,
-                                             arrow::MemoryPool* pool,
-                                             const KeyTableOptions& options, MemoryBudget* budget);
+arrow::Result<std::unique_ptr<KeyTable>> MakeColumnKeyTable(
+    const std::vector<arrow::TypeHolder>& types, arrow::MemoryPool* pool,
+    const KeyTableOptions& options, MemoryBudget* budget);
 
 }  // namespace antb1::exec

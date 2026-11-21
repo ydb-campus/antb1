@@ -1,10 +1,12 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <arrow/compute/exec.h>
@@ -20,6 +22,7 @@
 
 #include "grouped_aggregate_program.h"
 #include "key_table.h"
+#include "pool_vector.h"
 
 namespace arrow::compute {
 class ExecContext;
@@ -35,6 +38,11 @@ enum class GroupTableMode : std::uint8_t { kSeparate, kBatch };
 // hash (a fixed-width value's bytes, a binary value's bytes, a constant for NULL), combined over
 // the keys. Without columns every row has the same hash.
 arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBatch& keys);
+
+// Canonical routing hashes for valid row indices into normalized key arrays.
+arrow::Status SelectedGroupHashes(const arrow::compute::ExecBatch& keys,
+                                  std::span<const std::uint32_t> rows,
+                                  std::span<std::uint64_t> hashes);
 
 // The columns `columns` of `keys`, in that order.
 arrow::compute::ExecBatch ProjectKeys(const arrow::compute::ExecBatch& keys,
@@ -82,6 +90,12 @@ class GroupTable {
       int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys = true,
       std::size_t partitions = kPartitions, const KeyTableOptions& key_table = {},
       GroupTableMode mode = GroupTableMode::kSeparate);
+  // Fixed-key batch program with query-budgeted per-table metadata for matched local layouts.
+  static arrow::Result<std::unique_ptr<GroupTable>> MakeLocal(
+      const std::vector<plan::BoundColumn>& keys, const std::vector<plan::AggregateCall>& calls,
+      int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys = true,
+      std::size_t partitions = kPartitions,
+      const KeyTableOptions& options = {.kind = KeyTableKind::kFixed});
   GroupTable(const GroupTable&) = delete;
   GroupTable& operator=(const GroupTable&) = delete;
   GroupTable(GroupTable&&) = delete;
@@ -93,6 +107,9 @@ class GroupTable {
   // copied.
   arrow::Status Consume(const arrow::RecordBatch& rows,
                         std::vector<std::uint32_t>* group_ids = nullptr);
+  // Updates a batch-program table from the selected rows of the original payload arrays.
+  arrow::Status ConsumeSelected(const arrow::RecordBatch& rows,
+                                const arrow::BooleanArray* selection);
   // The group of each row of a batch without a selection, null where no group has its keys: adds
   // no group and touches no state (the inputs of a set operation that only look up). DOUBLE keys
   // are normalized first, as Consume normalizes them. For a table with keys.
@@ -122,6 +139,9 @@ class GroupTable {
   // The state of call `i`.
   [[nodiscard]] const GroupedAggregateState& state(std::size_t i) const { return *states_.at(i); }
   [[nodiscard]] bool uses_batch_program() const { return program_.has_value(); }
+  [[nodiscard]] bool supports_local_dispatch() const {
+    return program_ && program_->supports_local_dispatch();
+  }
   [[nodiscard]] std::size_t num_partitions() const;
   // After Partition: the groups of partition `partition`, in group order.
   [[nodiscard]] std::span<const std::uint32_t> partition_groups(std::size_t partition) const;
@@ -158,6 +178,10 @@ class GroupTable {
       const std::shared_ptr<arrow::Schema>& schema);
 
  private:
+  friend class PartitionedGroupTables;
+  friend class CardinalityLocalGroups;
+  arrow::Result<arrow::compute::ExecBatch> InputKeys(const arrow::RecordBatch& rows,
+                                                     bool normalize_doubles = true) const;
   GroupTable(std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
              arrow::MemoryPool* pool, bool first_keys);
 
@@ -172,7 +196,7 @@ class GroupTable {
   // The same groups, from the batch of part's keys this table has just consumed (row i the keys of
   // the part group that became to[i]) rather than from part's first_keys_: what a part that keeps
   // no first-seen keys has handed over already. One Take a column a chunk, where AddPartGroups
-  // needs two and a Concatenate to gather the same values out of part's chunks.
+  // gathers those values directly from the referenced first-key chunks.
   arrow::Status AddUniqueGroups(const arrow::compute::ExecBatch& keys,
                                 std::span<const std::uint32_t> to, std::uint32_t after);
   // Adds one new group per position, in order, with the keys of row positions[i] of `keys`, in
@@ -200,8 +224,14 @@ class GroupTable {
                                      const arrow::compute::ExecBatch& keys,
                                      std::span<const std::uint32_t> from);
   arrow::Status ConsumeRows(const arrow::RecordBatch& rows, std::vector<std::uint32_t>* group_ids);
+  // Key and source rows may differ when selected DOUBLE key values were compacted. Aggregate
+  // arguments and first-seen key spellings always refer to the original record batch.
   arrow::Status ConsumeProgram(const arrow::RecordBatch& rows,
-                               const arrow::compute::ExecBatch& keys);
+                               const arrow::compute::ExecBatch& keys,
+                               std::span<const std::uint32_t> key_rows,
+                               std::span<const std::uint32_t> source_rows);
+  arrow::Status MergeStoredChunks(const GroupTable& source,
+                                  std::optional<std::span<const std::uint32_t>> selection);
   arrow::Status MergeStoredGroups(const GroupTable& source, std::span<const std::uint32_t> from);
   arrow::Status FreezePartitions();
   std::uint32_t OutputRows(std::size_t& end_chunk) const;
@@ -217,6 +247,7 @@ class GroupTable {
     return static_cast<std::size_t>(hash) & (partitions_ - 1);
   }
 
+  std::optional<MemoryReservation> local_metadata_;  // owned by a dispatched lane through handoff
   MemoryReservation memory_;  // outlives the state and key metadata containers it charges
   std::vector<plan::BoundColumn> keys_;
   std::vector<plan::AggregateCall> aggregates_;
@@ -232,7 +263,7 @@ class GroupTable {
   StoredKeyTable* stored_keys_ = nullptr;  // mutable until FreezePartitions hands over key_table_
   bool stored_output_ = false;             // first-seen keys equal the stored representation
   std::vector<std::vector<std::shared_ptr<arrow::Array>>> first_keys_;  // per key, per chunk
-  std::vector<std::uint32_t> chunk_groups_;  // the number of new groups of each chunk
+  std::vector<std::uint32_t> chunk_ends_;  // exclusive end group ID of each first-key chunk
   std::uint32_t num_groups_ = 0;
   std::size_t next_chunk_ = 0;  // NextChunk: the next chunk and the group it starts at
   std::uint32_t next_group_ = 0;
@@ -246,6 +277,98 @@ class GroupTable {
     std::vector<StoredPartition, arrow::stl::allocator<StoredPartition>> partitions;
   };
   std::optional<FrozenGroups> frozen_;
+};
+
+// A worker's independently owned local tables, populated by stable lane dispatch. Finish releases
+// the dispatch scratch. Each destination can then take its own immutable partition concurrently.
+class PartitionedGroupTables {
+ public:
+  static arrow::Result<std::unique_ptr<PartitionedGroupTables>> Make(
+      const std::vector<plan::BoundColumn>& keys, const std::vector<plan::AggregateCall>& calls,
+      int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys = true,
+      std::size_t partitions = GroupTable::kPartitions,
+      const KeyTableOptions& options = {.kind = KeyTableKind::kFixed});
+  arrow::Status Consume(const arrow::RecordBatch& rows,
+                        const arrow::BooleanArray* selection = nullptr,
+                        std::chrono::nanoseconds* dispatch_elapsed = nullptr);
+  [[nodiscard]] std::uint64_t num_groups() const { return groups_; }
+  arrow::Status Finish();
+  // After Finish. Calls on different lanes are safe concurrently.
+  std::unique_ptr<const GroupTable> ReleasePartition(std::size_t lane);
+
+ private:
+  friend class CardinalityLocalGroups;
+  arrow::Status CreateLane(std::size_t lane);
+  // The frozen source's groups are disjoint and these destination lanes are empty.
+  arrow::Status Seed(const GroupTable& source);
+  PartitionedGroupTables(int input_width, arrow::MemoryPool* pool, const KeyTableOptions& options,
+                         MemoryReservation metadata)
+      : metadata_(std::move(metadata)),
+        input_width_(input_width),
+        options_(options),
+        lanes_(arrow::stl::allocator<std::unique_ptr<GroupTable>>(pool)),
+        rows_(pool),
+        hashes_(pool) {
+    options_.table_metadata = nullptr;  // a lane constructs with its own metadata reservation
+  }
+  arrow::Status Dispatch(const arrow::RecordBatch& rows, const arrow::BooleanArray* selection,
+                         std::chrono::nanoseconds* dispatch_elapsed);
+  MemoryReservation metadata_;
+  int input_width_;
+  KeyTableOptions options_;
+  std::vector<std::unique_ptr<GroupTable>, arrow::stl::allocator<std::unique_ptr<GroupTable>>>
+      lanes_;
+  std::unique_ptr<GroupTable> spare_;  // first populated lane reuses the eligibility table
+  GroupTable* prototype_ = nullptr;    // borrowed only by the producer, cleared by Finish
+  PoolVector<std::uint32_t> rows_;     // selected indices followed by the stable lane order
+  PoolVector<std::uint64_t> hashes_;
+  std::uint64_t groups_ = 0;
+  arrow::Status error_;
+};
+
+// Private observation threshold for the single-to-partitioned local layout experiment.
+inline constexpr std::uint32_t kLocalPromotionGroups = 32U * 1024;
+
+// Start one fixed local table and observe its actual distinct groups. A later nonempty input
+// tile may promote it: move the accumulated state of each group to its owning lane before
+// consuming new rows. Finish returns the same handoff as the selected local layout.
+class CardinalityLocalGroups {
+ public:
+  static arrow::Result<std::unique_ptr<CardinalityLocalGroups>> Make(
+      const std::vector<plan::BoundColumn>& keys, const std::vector<plan::AggregateCall>& calls,
+      int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys,
+      std::size_t partitions, const KeyTableOptions& options, std::uint32_t threshold);
+  arrow::Status Consume(const arrow::RecordBatch& rows,
+                        const arrow::BooleanArray* selection = nullptr,
+                        std::chrono::nanoseconds* dispatch_elapsed = nullptr,
+                        std::chrono::nanoseconds* promotion_elapsed = nullptr);
+  arrow::Status Finish(std::unique_ptr<GroupTable>& single,
+                       std::unique_ptr<PartitionedGroupTables>& partitioned);
+  [[nodiscard]] bool promoted() const { return promoted_groups_ != 0; }
+  [[nodiscard]] std::uint32_t promoted_groups() const { return promoted_groups_; }
+  [[nodiscard]] std::uint64_t num_groups() const;
+
+ private:
+  CardinalityLocalGroups(MemoryReservation metadata, int input_width, KeyTableOptions options,
+                         std::uint32_t threshold, bool can_promote)
+      : metadata_(std::move(metadata)),
+        input_width_(input_width),
+        options_(options),
+        threshold_(threshold),
+        can_promote_(can_promote) {
+    options_.table_metadata = nullptr;
+  }
+  arrow::Status Promote();
+  MemoryReservation metadata_;
+  int input_width_;
+  KeyTableOptions options_;
+  std::uint32_t threshold_;
+  bool can_promote_;
+  std::uint32_t promoted_groups_ = 0;
+  std::uint64_t finished_groups_ = 0;
+  std::unique_ptr<GroupTable> single_;
+  std::unique_ptr<PartitionedGroupTables> partitioned_;
+  arrow::Status error_;
 };
 
 }  // namespace antb1::exec

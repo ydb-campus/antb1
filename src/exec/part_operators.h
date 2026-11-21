@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -161,9 +162,17 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> KeepFirstRows(
 // aggregating on its own (its first batch hardly reduced), the rest of its rows routed to the
 // partitions.
 struct PartGroups {
-  std::shared_ptr<GroupTable> table;
+  std::unique_ptr<GroupTable> table;
+  std::unique_ptr<PartitionedGroupTables> partitioned;
+  int64_t local_rows = 0;
+  int64_t raw_rows = 0;
+  uint32_t promoted_groups = 0;
   std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> rows;  // per partition, or empty
 };
+
+// Internal comparison for ordinary part grouping (ADR 0019). The explicit layouts aggregate
+// every selected row locally and use the same stored-key backend and destination tables.
+enum class LocalGroupLayout { kAdaptive, kSingle, kPartitioned, kCardinality };
 
 // Makes the PartGroups of one part, batch by batch (PartGroupAggregateOperator's parts and each
 // root of PartGroupingSetsOperator's): after its first kRouteDecisionRows rows (or batch), a part
@@ -173,19 +182,26 @@ class PartGrouper {
  public:
   static arrow::Result<PartGrouper> Make(const std::vector<plan::BoundColumn>& keys,
                                          const std::vector<plan::AggregateCall>& aggregates,
-                                         int input_width, const ExecContext& part_ctx);
+                                         int input_width, const ExecContext& part_ctx,
+                                         LocalGroupLayout layout = LocalGroupLayout::kAdaptive);
+  arrow::Status Add(const Batch& batch, ProfileNode* profile);
   // Adds a batch's rows (without a selection).
   arrow::Status Add(const arrow::RecordBatch& rows, ProfileNode* profile);
-  // Partitions the part's table, records the part's metrics, and hands its groups over.
+  // Partitions the part's table and hands the groups and their counts to the consumer.
   arrow::Result<std::shared_ptr<PartGroups>> Finish(ProfileNode* profile);
 
  private:
+  arrow::Status AddLocal(const arrow::RecordBatch& rows, const arrow::BooleanArray* selection,
+                         ProfileNode* profile);
   std::shared_ptr<PartGroups> groups_;
+  std::unique_ptr<CardinalityLocalGroups> cardinality_;
+  LocalGroupLayout layout_ = LocalGroupLayout::kAdaptive;
+  arrow::MemoryPool* pool_ = nullptr;
   int64_t decide_after_ = 0;
   bool decided_ = true;
   bool route_ = false;
-  int64_t consumed_ = 0;
-  int64_t routed_ = 0;
+  std::chrono::nanoseconds dispatch_elapsed_{};
+  std::chrono::nanoseconds promotion_elapsed_{};
 };
 
 // Grouped aggregation over a part pipeline: every part is grouped into its own GroupTable on the
@@ -205,7 +221,8 @@ class PartGroupAggregateOperator final : public PartSink {
                              std::vector<plan::BoundColumn> keys,
                              std::vector<plan::AggregateCall> aggregates,
                              std::shared_ptr<arrow::Schema> schema,
-                             std::optional<PartitionTopN> top_n = std::nullopt);
+                             std::optional<PartitionTopN> top_n = std::nullopt,
+                             LocalGroupLayout layout = LocalGroupLayout::kAdaptive);
   ~PartGroupAggregateOperator() override;
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
@@ -225,6 +242,8 @@ class PartGroupAggregateOperator final : public PartSink {
   std::vector<plan::AggregateCall> aggregates_;
   std::shared_ptr<arrow::Schema> schema_;
   std::optional<PartitionTopN> top_n_;
+  LocalGroupLayout requested_layout_;
+  LocalGroupLayout layout_ = LocalGroupLayout::kAdaptive;
   std::optional<RowComparator> comparator_;  // with top_n_: its order, over schema_
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
   MemoryBudget* budget_ = nullptr;

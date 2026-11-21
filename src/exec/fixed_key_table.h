@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -28,6 +29,7 @@
 #include <arrow/type.h>
 #include <arrow/util/bit_util.h>
 #include <arrow/util/hashing.h>
+#include <arrow/util/small_vector.h>
 
 #include "antb1/common/check.h"
 #include "antb1/common/int128.h"
@@ -52,9 +54,9 @@ struct FixedKeyLayout {
     std::size_t width = 0;                  // a value's bytes: 2, 4, 8 or 16
     std::size_t offset = 0;                 // where they start in the key
   };
-  std::vector<Column> columns;  // one or two
-  std::size_t key_bytes = 0;    // 8, 16, 24, 32 or 40
-  std::size_t mask_offset = 0;  // two keys: the NULL byte's place in the key
+  arrow::internal::StaticVector<Column, 2> columns;  // inline, charged with the index
+  std::size_t key_bytes = 0;                         // 8, 16, 24, 32 or 40
+  std::size_t mask_offset = 0;                       // two keys: the NULL byte's place in the key
 };
 
 // The layout of keys of `types`, or nullopt when a FixedKeyTable does not take them. It takes one
@@ -168,7 +170,8 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
                             arrow::AllocateBuffer(keys.length * 4, pool_));
       auto* ids = owner->mutable_data_as<std::uint32_t>();
       const auto before = num_groups();
-      ARROW_RETURN_NOT_OK(ConsumeRows(keys, ids, nullptr));
+      ARROW_RETURN_NOT_OK(
+          ConsumeRows(keys, Narrow<std::size_t>(keys.length), std::identity{}, ids, nullptr));
       return KeyIds{.owner = std::move(owner),
                     .ids = {ids, static_cast<std::size_t>(keys.length)},
                     .before = before,
@@ -180,7 +183,19 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
                               const KeyIdConsumer& consume) override {
     return KeyTableNoBadAlloc([&] {
       ARROW_RETURN_NOT_OK(CheckBatch(keys));
-      return ConsumeRows(keys, nullptr, &consume);
+      return ConsumeRows(keys, Narrow<std::size_t>(keys.length), std::identity{}, nullptr,
+                         &consume);
+    });
+  }
+
+  arrow::Status ConsumeSelected(const arrow::compute::ExecBatch& keys,
+                                std::span<const std::uint32_t> rows,
+                                const KeyIdConsumer& consume) override {
+    return KeyTableNoBadAlloc([&] {
+      ARROW_RETURN_NOT_OK(CheckBatch(keys));
+      ARROW_RETURN_NOT_OK(this->CheckSelection(rows, Narrow<std::size_t>(keys.length)));
+      return ConsumeRows(
+          keys, rows.size(), [rows](std::size_t i) { return rows[i]; }, nullptr, &consume);
     });
   }
 
@@ -338,9 +353,9 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
     return arrow::Status::OK();
   }
 
-  arrow::Status ConsumeRows(const arrow::compute::ExecBatch& keys, std::uint32_t* output,
+  arrow::Status ConsumeRows(const arrow::compute::ExecBatch& keys, std::size_t rows,
+                            const auto& row_at, std::uint32_t* output,
                             const KeyIdConsumer* consume) {
-    const auto rows = static_cast<std::size_t>(keys.length);
     if (rows == 0) {
       return arrow::Status::OK();
     }
@@ -361,7 +376,7 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
       // Room for every row to be a new group, up to the limit that Insert enforces: a chunk of
       // known keys never fails for it.
       ARROW_RETURN_NOT_OK(MakeRoom(std::min<std::size_t>(count, max_groups_ - keys_.size())));
-      const bool nulls = PackAndHash(columns, start, count);
+      const bool nulls = PackAndHash(columns, start, count, row_at);
       auto* ids = consume == nullptr ? output + start : chunk_ids_.data();
       ARROW_RETURN_NOT_OK(nulls ? Probe<true>(count, ids) : Probe<false>(count, ids));
       if (count_hits) {
@@ -412,7 +427,8 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
         .control = control_.data(), .slots = slots_.data(), .keys = keys_.data(), .mask = mask_};
     for (std::size_t start = 0; start < rows; start += kChunk) {
       const std::size_t count = std::min(kChunk, rows - start);
-      const bool nulls = PackAndHash({sources.data(), layout_.columns.size()}, start, count);
+      const bool nulls =
+          PackAndHash({sources.data(), layout_.columns.size()}, start, count, std::identity{});
       for (std::size_t i = 0; i < count; ++i) {
         std::size_t empty = 0;
         const std::uint32_t id = nulls && chunk_nulls_[i] != 0
@@ -435,43 +451,43 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
                                                 std::move(validity), missing);
   }
 
-  // Packs rows [start, start + count) of `columns` into chunk_keys_ (FixedKeyLayout) and hashes
-  // them into chunk_hashes_. With one key its NULL rows are flagged in chunk_nulls_ instead, and
-  // the result is whether any row may be one. Each key is built whole for its widths, known at
-  // compile time here, then stored and hashed in the same pass: no key is written piecewise and
-  // read back.
-  bool PackAndHash(std::span<const Source> columns, std::size_t start, std::size_t count) {
+  // Packs `count` input rows addressed by row_at into chunk_keys_ and hashes them into
+  // chunk_hashes_. With one key its NULL rows are flagged in chunk_nulls_ instead, and the result
+  // is whether any row may be one. Each key is built whole for its widths, known at compile time
+  // here, then stored and hashed in the same pass: no key is written piecewise and read back.
+  bool PackAndHash(std::span<const Source> columns, std::size_t start, std::size_t count,
+                   const auto& row_at) {
     if (columns.size() == 1) {
       switch (layout_.columns[0].width) {
         case 2:
-          return PackOne<2>(columns[0], start, count);
+          return PackOne<2>(columns[0], start, count, row_at);
         case 4:
-          return PackOne<4>(columns[0], start, count);
+          return PackOne<4>(columns[0], start, count, row_at);
         case 8:
-          return PackOne<8>(columns[0], start, count);
+          return PackOne<8>(columns[0], start, count, row_at);
         default:
-          return PackOne<16>(columns[0], start, count);
+          return PackOne<16>(columns[0], start, count, row_at);
       }
     }
     switch (layout_.columns[0].width) {
       case 2:
-        PackTwoAfter<2>(columns, start, count);
+        PackTwoAfter<2>(columns, start, count, row_at);
         break;
       case 4:
-        PackTwoAfter<4>(columns, start, count);
+        PackTwoAfter<4>(columns, start, count, row_at);
         break;
       case 8:
-        PackTwoAfter<8>(columns, start, count);
+        PackTwoAfter<8>(columns, start, count, row_at);
         break;
       default:
-        PackTwoAfter<16>(columns, start, count);
+        PackTwoAfter<16>(columns, start, count, row_at);
         break;
     }
     return false;
   }
 
   template <std::size_t kWidth>
-  bool PackOne(const Source& source, std::size_t start, std::size_t count) {
+  bool PackOne(const Source& source, std::size_t start, std::size_t count, const auto& row_at) {
     if constexpr (kWidth > kKeyBytes) {
       ANTB1_CHECK(kWidth <= kKeyBytes);  // the layout picked kKeyBytes for this width
       return false;
@@ -483,15 +499,15 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
         std::fill_n(nulls, count, std::uint8_t{1});
         return true;
       }
-      const std::uint8_t* const values = source.values + (start * kWidth);
       if (source.validity != nullptr) {
         for (std::size_t i = 0; i < count; ++i) {
-          const bool is_null = IsNull(source, start + i);
+          const auto row = row_at(start + i);
+          const bool is_null = IsNull(source, row);
           nulls[i] = is_null ? 1 : 0;
           Key key{};
           // Arrow leaves NULL payloads unspecified: only initialized key bytes may be hashed.
           if (!is_null) {
-            std::memcpy(BytesOf(key), values + (i * kWidth), kWidth);
+            std::memcpy(BytesOf(key), source.values + (row * kWidth), kWidth);
           }
           keys[i] = key;
           hashes[i] = Hasher::Hash(key.words);
@@ -500,7 +516,7 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
       }
       for (std::size_t i = 0; i < count; ++i) {
         Key key{};
-        std::memcpy(BytesOf(key), values + (i * kWidth), kWidth);
+        std::memcpy(BytesOf(key), source.values + (row_at(start + i) * kWidth), kWidth);
         keys[i] = key;
         hashes[i] = Hasher::Hash(key.words);
       }
@@ -509,21 +525,23 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
   }
 
   template <std::size_t kFirst>
-  void PackTwoAfter(std::span<const Source> columns, std::size_t start, std::size_t count) {
+  void PackTwoAfter(std::span<const Source> columns, std::size_t start, std::size_t count,
+                    const auto& row_at) {
     switch (layout_.columns[1].width) {
       case 2:
-        return PackTwo<kFirst, 2>(columns[0], columns[1], start, count);
+        return PackTwo<kFirst, 2>(columns[0], columns[1], start, count, row_at);
       case 4:
-        return PackTwo<kFirst, 4>(columns[0], columns[1], start, count);
+        return PackTwo<kFirst, 4>(columns[0], columns[1], start, count, row_at);
       case 8:
-        return PackTwo<kFirst, 8>(columns[0], columns[1], start, count);
+        return PackTwo<kFirst, 8>(columns[0], columns[1], start, count, row_at);
       default:
-        return PackTwo<kFirst, 16>(columns[0], columns[1], start, count);
+        return PackTwo<kFirst, 16>(columns[0], columns[1], start, count, row_at);
     }
   }
 
   template <std::size_t kFirst, std::size_t kSecond>
-  void PackTwo(const Source& first, const Source& second, std::size_t start, std::size_t count) {
+  void PackTwo(const Source& first, const Source& second, std::size_t start, std::size_t count,
+               const auto& row_at) {
     if constexpr (kFirst + kSecond + 1 > kKeyBytes) {
       ANTB1_CHECK(kFirst + kSecond + 1 <= kKeyBytes);  // the layout picked kKeyBytes for these
     } else {
@@ -531,29 +549,29 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
       std::uint64_t* const hashes = chunk_hashes_.data();
       if (first.values != nullptr && first.validity == nullptr && second.values != nullptr &&
           second.validity == nullptr) {
-        const std::uint8_t* const a = first.values + (start * kFirst);
-        const std::uint8_t* const b = second.values + (start * kSecond);
         for (std::size_t i = 0; i < count; ++i) {
+          const auto row = row_at(start + i);
           Key key{};  // the NULL byte 0, and the padding
-          std::memcpy(BytesOf(key), a + (i * kFirst), kFirst);
-          std::memcpy(BytesOf(key) + kFirst, b + (i * kSecond), kSecond);
+          std::memcpy(BytesOf(key), first.values + (row * kFirst), kFirst);
+          std::memcpy(BytesOf(key) + kFirst, second.values + (row * kSecond), kSecond);
           keys[i] = key;
           hashes[i] = Hasher::Hash(key.words);
         }
         return;
       }
       for (std::size_t i = 0; i < count; ++i) {
+        const auto row = row_at(start + i);
         Key key{};
         unsigned mask = 0;
-        if (IsNull(first, start + i)) {
+        if (IsNull(first, row)) {
           mask |= 1U;
         } else {
-          std::memcpy(BytesOf(key), first.values + ((start + i) * kFirst), kFirst);
+          std::memcpy(BytesOf(key), first.values + (row * kFirst), kFirst);
         }
-        if (IsNull(second, start + i)) {
+        if (IsNull(second, row)) {
           mask |= 2U;
         } else {
-          std::memcpy(BytesOf(key) + kFirst, second.values + ((start + i) * kSecond), kSecond);
+          std::memcpy(BytesOf(key) + kFirst, second.values + (row * kSecond), kSecond);
         }
         BytesOf(key)[kFirst + kSecond] = static_cast<std::byte>(mask);
         keys[i] = key;
@@ -840,8 +858,9 @@ class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
 };
 
 // The table of `layout` (FixedKeyLayoutOf) growing by `growth`, for MakeKeyTable.
-std::unique_ptr<KeyTable> MakeFixedKeyTable(FixedKeyLayout layout, Growth growth,
-                                            arrow::MemoryPool* pool, const KeyTableOptions& options,
-                                            MemoryBudget* budget);
+arrow::Result<std::unique_ptr<KeyTable>> MakeFixedKeyTable(FixedKeyLayout layout, Growth growth,
+                                                           arrow::MemoryPool* pool,
+                                                           const KeyTableOptions& options,
+                                                           MemoryBudget* budget);
 
 }  // namespace antb1::exec

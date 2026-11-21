@@ -56,7 +56,7 @@ pixi run bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 | `BM_GroupInt64Budget`, `BM_GroupInt64Int32Budget` (and `...BudgetRandom`) | the same grouper with its buffers from an `exec::MemoryBudget`, as the engine's are, at 1000 to 4Mi groups: the baseline of step 0 below. `Random`: ids drawn at random (splitmix64), so groups repeat early as in real data, instead of the permutation the other grouping benchmarks use |
 | `BM_KeyTable_<shape>_<growth>[_Random]` | the fixed-width candidate backend through `MakeKeyTable`, including pool-budgeted buffers and returned IDs, on the same one/two-key inputs as the budgeted grouper. `SlotOrder` is the default growth policy; `IdOrder` is the diagnostic alternative. Each name checks IDs, unique keys and refused optional sizing outside timing. Compare against `BM_Group<shape>Budget[Random]` of the same run; ADR 0019 retains the 1.3x target at 1000, 16Ki, 256Ki and 1Mi groups, with 4Mi reported. This replaces the duplicate step-0 loop; its prior variants remain in PR #253's history |
 | `BM_KeyTable_Int64Int32Bool_{Grouper,Column}[_Random]` | groups 4 Mi rows by BIGINT, INTEGER and a nullable BOOLEAN. All three columns contribute to identity. Both arms use the same KeyTable interface, data and query pool. The benchmark checks group IDs, all three output columns and backend selection outside the timed loop, and reports peak pool bytes alongside CPU and wall time. |
-| `BM_GroupProgram/<shape>/<arm>` | times local grouping, aggregate updates, partitioning and merging. Grouper, Fixed and Batch compare the Arrow baseline, the step 2 fixed backend and the step 3 batch program. DensePrefetch exercises the optional three-column merge. |
+| `BM_GroupProgram/<shape>/<arm>` | times local grouping, aggregate updates, partitioning and merging. Grouper, Fixed and Batch compare the Arrow baseline, the step 2 fixed backend and the step 3 batch program. DensePrefetch exercises the optional three-column merge. Single and Partitioned compare one local table with worker-local lane tables. |
 
 The fixed-width candidate is selected explicitly with private `KeyTableKind` options in tests and these
 microbenchmarks. Automatic query execution retains the Grouper and packed-string paths: the initial candidate
@@ -114,7 +114,7 @@ schema. The `Column` arm explicitly selects the new layout.
 
 `BM_GroupProgram` runs COUNT(*) plus SUM and MAX of a nullable BIGINT payload. Its 4 Mi rows reach random
 groups drawn from 1,000, 16 Ki, 256 Ki, 1 Mi or 4 Mi target groups. The key shapes are BIGINT, BIGINT/INTEGER and
-BIGINT/INTEGER/nullable BOOLEAN. All arms feed each batch to a local table. Four 64 Ki-row batches form a
+BIGINT/INTEGER/nullable BOOLEAN. All arms aggregate their input locally. Four 64 Ki-row batches form a
 part. Two clustered controls visit the same BIGINT or three-column key for 16 consecutive rows at 256 Ki groups.
 A single worker merges each of 32 lanes in input-part order. Keeping this policy fixed isolates update and
 merge costs from the execution engine's adaptive decision to route raw rows.
@@ -123,12 +123,53 @@ For the three-column keys, compare `Batch` with `DensePrefetch` on the same inpu
 program. During destination merge, DensePrefetch gathers 256 selected hashes, key values and validity bits at a
 time and prefetches the destination bucket eight probes ahead. The benchmark verifies which merge loop ran.
 
+For step 4, `Single` and `Partitioned` use the same fixed key layout, aggregate program, direct destination merge
+and always-local aggregation policy. Both turn off the optional group count estimate. Single builds one table per
+part and partitions its group IDs on completion. Partitioned routes input row indices to up to 32 local tables in
+each worker, then hands each table to its destination lane and releases it after the merge. The
+`Int64Int32BoolSelected` case uses a nullable filter mask over the original key and payload columns. The oracle
+checks output keys and aggregates from the selected rows. All synthetic workers and merge lanes run on one thread.
+
+The experimental `Hybrid` arm starts each input part with one local table. When that table exceeds 32 Ki
+distinct groups and another selected input tile arrives, the worker transfers the accumulated keys and states
+to their lanes once. DOUBLE SUM and AVG stay on one table to preserve their accumulation order.
+`Hybrid16K` and `Hybrid64K` vary the threshold. Compare `promoted_parts`, `stayed_parts` and `promoted_groups`
+with `parts` and `partial_groups`. A worker starts counting again for each new part.
+`promotion_ms` sums migration elapsed time within the local-update phase. Random targets include 32 Ki and 64 Ki.
+The sparse three-key case selects roughly one row in 17. The alternating case gives every other part only 1,000
+possible groups. The high-cardinality `LongParts` cases give each part 2 Mi input rows out of a 16 Mi-row stream.
+
+The table gives median elapsed milliseconds on one pinned physical core from five interleaved Release runs of
+the BIGINT-key benchmark. Group counts are the observed mean per part. The first three rows use four 64 Ki-row
+batches per part and the last uses 32. All arms produced identical groups and aggregates.
+
+| Groups per part | Single ms | Partitioned ms | Hybrid ms | Parts promoted |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 41.0 | 78.5 | 40.9 | 0 of 16 |
+| 64,336 | 188.0 | 210.6 | 237.6 | 16 of 16 |
+| 254,101 | 638.1 | 514.8 | 543.7 | 16 of 16 |
+| 1,650,127 | 2,445.1 | 2,001.7 | 2,014.1 | 8 of 8 |
+
+At 1,000 groups Single and Hybrid both peaked at 1.54 MB of query memory, compared with 7.18 MB for
+Partitioned. At 64,336 groups Hybrid spent 35.0 ms moving existing groups. The 64 Ki threshold kept those
+parts on one table and took 188.0 ms. Longer parts amortized migration over more subsequent input rows.
+Automatic execution retains the existing adaptive local/raw policy.
+
+The ordinary part operator also accepts these layouts internally for comparisons. It checks eligibility before
+reading input. Partition top-N, unsupported key/state combinations, and aggregates with order-sensitive update
+errors (including AVG of DATE and wide DECIMAL or HUGEINT sums) use adaptive grouping. The query profile counts
+rows, groups, layouts and promotions once per accepted part. Hash, dispatch and promotion times include work
+on completed parts that the scheduler subsequently retries.
+
 The `local_ms` counter covers table creation, insertion and updates. `merge_ms` includes freezing or partitioning
 the producers, building and merging the destination tables, and releasing them and the producers. `output_ms`
 includes checking finalization and emitting every key and aggregate through NextChunk. Within `merge_ms`,
-`lane_merge_ms` covers the destination calls to MergePartition across all lanes. Each phase also reports
+`partition_ms` covers finishing local tables for handoff and `lane_merge_ms` covers destination merges and
+the completed source partitions they release. Each phase also reports
 process CPU milliseconds. Peak memory is the maximum charged to the query budget, with the input batches
-and validation model allocated separately. The batch program grows its state vectors by 1.5× and charges the old
+and validation model allocated separately. `local_bytes` is the query charge after all local updates.
+`local_rows`, `local_tables` and `partial_groups` count rows aggregated, populated local tables and groups
+across producer parts. The batch program grows its state vectors by 1.5× and charges the old
 and replacement buffers together during growth. The separate-update arms use the existing vectors' resize policy.
 Before timing, each arm checks its program choice, all output keys,
 counts, exact sums, NULLs and maxima against the synthetic inputs, and verifies that all query charges are released.
@@ -200,12 +241,13 @@ the destination ID scratch and calls `Probe`. Within the lane, `ColumnKeyTable::
 For the single BIGINT key, SUM and MAX local updates together rose from 42.8 to 50.2 cycles per row,
 and the direct packed-key merge loop took 17.0 cycles per row exclusive of callees.
 
-`bench.micro.smoke` (label `bench-smoke`) runs every benchmark for one iteration (`--benchmark_dry_run`), so they
-keep building and running:
+The `bench-smoke` tests run every registered benchmark once at its full size (`--benchmark_dry_run`).
+CTest runs the local grouping layouts in one shard and the rest of the catalog in a second. A shared resource lock
+limits peak memory by allowing one shard at a time. Each shard retains its correctness checks and 300-second timeout.
 
-- on every PR, in the `ci-release` preset (`pixi run release`, the `macos-release` CI leg);
-- every night, in `static-test`;
-- every night on all three static targets: the `static-cold` jobs run `pixi run bench --benchmark_dry_run=true`.
+- On every PR, the `macos-release` CI job runs both shards with `pixi run release`.
+- Nightly, `static-test` runs both shards.
+- The nightly `static-cold` jobs run `pixi run bench --benchmark_dry_run=true` on all three static targets.
 
 `build/static` is shared with `pixi run static` and `static-test`. Every new commit relinks `antb1` and
 `antb1-bench-micro` with ThinLTO, and a `static-test` run after it relinks its 20 test executables too. Never run two

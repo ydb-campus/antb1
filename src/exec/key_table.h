@@ -7,6 +7,7 @@
 #include <memory>
 #include <new>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <arrow/buffer.h>
@@ -80,6 +81,11 @@ class StoredKeyTable : public KeyTable {
  public:
   virtual arrow::Status ConsumeChunks(const arrow::compute::ExecBatch& keys,
                                       const KeyIdConsumer& consume) = 0;
+  // As ConsumeChunks for selected input rows. IDs follow selection order, including repeated
+  // rows; the callback offset indexes the selection. An empty selection adds no groups.
+  virtual arrow::Status ConsumeSelected(const arrow::compute::ExecBatch& keys,
+                                        std::span<const std::uint32_t> rows,
+                                        const KeyIdConsumer& consume) = 0;
   // The source and destination must be distinct tables of the same key types. Read its groups
   // in the supplied order. Their keys are copied into this table only when a group is new.
   virtual arrow::Status MergeStored(const StoredKeyTable& source,
@@ -101,7 +107,7 @@ class StoredKeyTable : public KeyTable {
   StoredKeyTable(arrow::MemoryPool* pool, MemoryBudget* budget)
       : pool_(pool), budget_(budget != nullptr ? budget : dynamic_cast<MemoryBudget*>(pool)) {}
   static arrow::Status CheckSelection(std::span<const std::uint32_t> selected,
-                                      std::uint32_t source_groups);
+                                      std::size_t source_size);
   arrow::Status CheckStoredRange(std::uint32_t first, std::uint32_t count) const;
   // Allocate and charge the batch and column descriptors with the lifetime of their owners.
   arrow::Result<KeySnapshot> MakeSnapshot(std::size_t columns, std::int64_t length) const;
@@ -138,6 +144,9 @@ struct KeyTableOptions {
   // Optional test/benchmark witness set when a nonempty column-key merge enters its probe loop.
   // A destination with a witness must have exclusive access to it for the table's lifetime.
   bool* prefetched_composite_merge = nullptr;
+  // Construction-only. A local lane owns this reservation for its concrete index and other
+  // persistent descriptors; it must outlive the index.
+  MemoryReservation* table_metadata = nullptr;
 };
 
 // A table over keys of `key_types` (at least one) that allocates from `ctx`'s memory pool. `ctx`

@@ -70,8 +70,8 @@ bool NoRow(const Ref& ref) {
 }
 
 // The rows `refs` of `arrays` (one array per chunk), appended to a builder of their type.
-template <class ArrayType, class BuilderType, bool kWithNulls, class Ref>
-arrow::Status GatherTyped(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
+template <class ArrayType, class BuilderType, bool kWithNulls, class Ptr, class Ref>
+arrow::Status GatherTyped(std::span<const Ptr> arrays, std::span<const Ref> refs,
                           arrow::ArrayBuilder& out) {
   auto& builder = static_cast<BuilderType&>(out);
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(refs.size())));
@@ -107,11 +107,10 @@ arrow::Status GatherTyped(std::span<const arrow::Array* const> arrays, std::span
 
 // Any other type: one slice per run of consecutive rows of a chunk (and one run of NULLs per run
 // of refs without a row).
-template <bool kWithNulls, class Ref>
-arrow::Status GatherSlices(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
-                           arrow::ArrayBuilder& builder) {
+template <bool kWithNulls, class Ref, class SpanOf>
+arrow::Status GatherSlices(std::span<const Ref> refs, arrow::ArrayBuilder& builder,
+                           const SpanOf& span_of) {
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(refs.size())));
-  std::vector<std::optional<arrow::ArraySpan>> spans(arrays.size());
   for (std::size_t i = 0; i < refs.size();) {
     const Ref first = refs[i];
     std::size_t length = 1;
@@ -127,21 +126,42 @@ arrow::Status GatherSlices(std::span<const arrow::Array* const> arrays, std::spa
            refs[i + length].row == first.row + length) {
       ++length;
     }
-    auto& span = spans[first.chunk];
-    if (!span.has_value()) {
-      span.emplace(*arrays[first.chunk]->data());
-    }
-    ARROW_RETURN_NOT_OK(builder.AppendArraySlice(*span, first.row, static_cast<int64_t>(length)));
+    ARROW_RETURN_NOT_OK(
+        builder.AppendArraySlice(span_of(first.chunk), first.row, static_cast<int64_t>(length)));
     i += length;
   }
   return arrow::Status::OK();
 }
 
-}  // namespace
-
 template <bool kWithNulls, class Ref>
-arrow::Status GatherRows(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
-                         arrow::ArrayBuilder& builder) {
+arrow::Status GatherOther(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
+                          arrow::ArrayBuilder& builder) {
+  // Sorts and joins repeatedly revisit chunks in arbitrary order.
+  std::vector<std::optional<arrow::ArraySpan>> spans(arrays.size());
+  return GatherSlices<kWithNulls>(refs, builder, [&](std::uint32_t chunk) -> const auto& {
+    auto& span = spans[chunk];
+    if (!span.has_value()) {
+      span.emplace(*arrays[chunk]->data());
+    }
+    return *span;
+  });
+}
+
+template <bool kWithNulls>
+arrow::Status GatherOther(std::span<const std::shared_ptr<arrow::Array>> arrays,
+                          std::span<const GroupKeyRow> refs, arrow::ArrayBuilder& builder) {
+  static_assert(!kWithNulls);  // every reference names a group, including groups with NULL keys
+  if (builder.type()->id() == arrow::Type::BOOL) {
+    return GatherTyped<arrow::BooleanArray, arrow::BooleanBuilder, false>(arrays, refs, builder);
+  }
+  // A group merge may select a handful of rows from a source with many first-key chunks.
+  return GatherSlices<false>(
+      refs, builder, [&](std::uint32_t chunk) { return arrow::ArraySpan(*arrays[chunk]->data()); });
+}
+
+template <bool kWithNulls, class Ptr, class Ref>
+arrow::Status Gather(std::span<const Ptr> arrays, std::span<const Ref> refs,
+                     arrow::ArrayBuilder& builder) {
   switch (builder.type()->id()) {
     case arrow::Type::INT16:
       return GatherTyped<arrow::Int16Array, arrow::Int16Builder, kWithNulls>(arrays, refs, builder);
@@ -173,8 +193,25 @@ arrow::Status GatherRows(std::span<const arrow::Array* const> arrays, std::span<
       return GatherTyped<arrow::BinaryArray, arrow::BinaryBuilder, kWithNulls>(arrays, refs,
                                                                                builder);
     default:
-      return GatherSlices<kWithNulls>(arrays, refs, builder);
+      return GatherOther<kWithNulls>(arrays, refs, builder);
   }
+}
+
+}  // namespace
+
+template <bool kWithNulls, class Ref>
+arrow::Status GatherRows(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
+                         arrow::ArrayBuilder& builder) {
+  return Gather<kWithNulls>(arrays, refs, builder);
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> GatherGroupKeys(const arrow::ArrayVector& chunks,
+                                                             std::span<const GroupKeyRow> refs,
+                                                             arrow::MemoryPool* pool) {
+  ANTB1_DCHECK(!refs.empty());
+  ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(chunks[refs.front().chunk]->type(), pool));
+  ARROW_RETURN_NOT_OK(Gather<false>(std::span(chunks), refs, *builder));
+  return builder->Finish();
 }
 
 template arrow::Status GatherRows<false, SortBuffer::RowRef>(

@@ -15,6 +15,7 @@
 
 #include "antb1/common/narrow.h"
 #include "antb1/exec/memory_budget.h"
+#include "antb1/exec/operator.h"
 
 #include "../group_table.h"
 #include "exec_test_util.h"
@@ -33,6 +34,12 @@ struct Query {
   std::vector<plan::AggregateCall> calls;
   std::shared_ptr<arrow::Schema> input;
   std::shared_ptr<arrow::Schema> output;
+
+  auto MakeCardinality(MemoryBudget& budget, std::uint32_t threshold) const {
+    return CardinalityLocalGroups::Make(
+        keys, calls, input->num_fields(), &budget, &budget, true, GroupTable::kPartitions,
+        {.kind = KeyTableKind::kFixed, .estimate = false}, threshold);
+  }
 
   std::unique_ptr<GroupTable> Make(Mode mode, MemoryBudget& budget, bool first = true,
                                    const KeyTableOptions& options = {
@@ -81,7 +88,7 @@ std::shared_ptr<arrow::RecordBatch> MakeRows(const Query& query, int part) {
     EXPECT_TRUE(payload.Append(kValues[static_cast<std::size_t>(part)]).ok());
   }
   arrow::ArrayVector columns{testing::Int64s(keys)};
-  if (query.keys.size() == 2) {
+  if (query.input->num_fields() == 3) {
     columns.push_back(testing::Bools(flags));
   }
   columns.push_back(payload.Finish().ValueOrDie());
@@ -182,6 +189,596 @@ TEST_F(GroupTableProgramTest, BothLayoutsAndMergeModesAgreeInPartOrder) {
     }
     EXPECT_EQ(budget.bytes_allocated(), 0);
   }
+}
+
+TEST_F(GroupTableProgramTest, DirectDispatchMatchesSelectedRowsAndCanonicalPartitionOrder) {
+  for (const bool composite : {false, true}) {
+    SCOPED_TRACE(composite);
+    auto query = NumericQuery(composite);
+    if (composite) {
+      query.keys.push_back(query.keys[0]);
+      auto fields = query.output->fields();
+      fields.insert(fields.begin() + 2, query.input->field(0));
+      query.output = arrow::schema(std::move(fields));
+    }
+    MemoryBudget budget(std::nullopt);
+    using Lanes = std::array<std::unique_ptr<const GroupTable>, GroupTable::kPartitions>;
+    std::vector<Lanes> released;
+    std::vector<std::unique_ptr<GroupTable>> controls;
+    for (int part = 0; part < 3; ++part) {
+      auto dense_control = query.Make(Mode::kSeparate, budget, false);
+      auto control = query.Make(Mode::kBatch, budget, false);
+      auto made = PartitionedGroupTables::Make(query.keys, query.calls, query.input->num_fields(),
+                                               &budget, &budget, false);
+      ASSERT_TRUE(made.ok()) << made.status();
+      auto dispatch = std::move(*made);
+      {
+        const auto small = MakeRows(query, part);
+        const auto input = arrow::ConcatenateRecordBatches({small, small, small}).ValueOrDie();
+        const auto batch = input->Slice(3, input->num_rows() - 7);
+        std::vector<std::optional<bool>> bits(Narrow<std::size_t>(batch->num_rows()) + 5);
+        for (std::size_t i = 5; i < bits.size(); ++i) {
+          bits[i] = i % 11 == 0 ? std::nullopt : std::optional(i % 3 != 0);
+        }
+        const auto mask =
+            std::static_pointer_cast<arrow::BooleanArray>(testing::Bools(bits)->Slice(5));
+        const auto dense = Materialize({.data = batch, .selection = mask}, &budget).ValueOrDie();
+        ASSERT_TRUE(dense_control->Consume(*dense).ok());
+        ASSERT_TRUE(control->ConsumeSelected(*batch, mask.get()).ok());
+        ASSERT_TRUE(dispatch->Consume(*batch, mask.get()).ok());
+      }
+      ASSERT_EQ(dispatch->num_groups(), dense_control->num_groups());
+      ASSERT_EQ(dispatch->num_groups(), control->num_groups());
+      ASSERT_TRUE(control->Partition().ok());
+      ASSERT_TRUE(dense_control->Partition().ok());
+      ASSERT_TRUE(dispatch->Finish().ok());
+      EXPECT_TRUE(dispatch->Consume(*MakeRows(query, part)).IsInvalid());
+      auto& saved = released.emplace_back();
+      for (std::size_t lane = 0; lane < saved.size(); ++lane) {
+        saved[lane] = dispatch->ReleasePartition(lane);
+        const auto groups = saved[lane] ? saved[lane]->num_groups() : 0U;
+        EXPECT_EQ(groups, dense_control->partition_groups(lane).size());
+        EXPECT_EQ(groups, control->partition_groups(lane).size());
+      }
+      controls.push_back(std::move(dense_control));
+    }
+    for (std::size_t lane = 0; lane < GroupTable::kPartitions; ++lane) {
+      auto expected = query.Make(Mode::kSeparate, budget);
+      auto actual = query.Make(Mode::kBatch, budget);
+      for (std::size_t p = 0; p < controls.size(); ++p) {
+        ASSERT_TRUE(expected->MergePartition(*controls[p], lane).ok());
+        if (auto& owned = released[p][lane]) {
+          ASSERT_TRUE(actual->Merge(*owned).ok());
+          owned.reset();
+        }
+      }
+      Results before;
+      Results after;
+      ASSERT_NO_FATAL_FAILURE(Collect(*expected, query, before));
+      ASSERT_NO_FATAL_FAILURE(Collect(*actual, query, after));
+      EXPECT_EQ(before, after);
+    }
+    controls.clear();
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
+TEST_F(GroupTableProgramTest, LocalPartitionsReleaseIndependentlyAndRefusedDispatchIsSticky) {
+  const auto query = NumericQuery(false);
+  const auto batch = MakeRows(query, 0);
+  constexpr std::int64_t kLimit = std::int64_t{4} * 1024 * 1024;
+  MemoryBudget budget(kLimit);
+  auto make = [&] {
+    return PartitionedGroupTables::Make(query.keys, query.calls, query.input->num_fields(), &budget,
+                                        &budget, false)
+        .ValueOrDie();
+  };
+  {
+    auto bundle = make();
+    std::vector<std::optional<bool>> keep(Narrow<std::size_t>(batch->num_rows()), false);
+    const auto mask = testing::Bools(keep);
+    ASSERT_TRUE(bundle->Consume(*batch, mask.get()).ok());
+    EXPECT_EQ(bundle->num_groups(), 0U);
+    ASSERT_TRUE(bundle->Finish().ok());
+    for (std::size_t lane = 0; lane < GroupTable::kPartitions; ++lane) {
+      EXPECT_EQ(bundle->ReleasePartition(lane), nullptr);
+    }
+  }
+  {
+    auto bundle = make();
+    MemoryReservation pressure;
+    pressure.Reset(&budget);
+    ASSERT_TRUE(pressure.Resize(kLimit - budget.bytes_allocated()).ok());
+    const auto refused = bundle->Consume(*batch);
+    ASSERT_TRUE(refused.IsOutOfMemory()) << refused;
+    pressure.Release();
+    EXPECT_EQ(bundle->Consume(*batch), refused);
+    EXPECT_EQ(bundle->Finish(), refused);
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+  auto fresh = make();
+  ASSERT_TRUE(fresh->Consume(*batch).ok());
+  ASSERT_TRUE(fresh->Finish().ok());
+  std::vector<std::unique_ptr<const GroupTable>> lanes;
+  for (std::size_t lane = 0; lane < GroupTable::kPartitions; ++lane) {
+    if (auto table = fresh->ReleasePartition(lane)) {
+      lanes.push_back(std::move(table));
+    }
+  }
+  fresh.reset();
+  ASSERT_GT(lanes.size(), 1U);
+  while (!lanes.empty()) {
+    const auto before = budget.bytes_allocated();
+    lanes.pop_back();
+    EXPECT_LT(budget.bytes_allocated(), before);
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+Query CountByKey() {
+  return {.keys = {Column(0, "k", LogicalType::kBigInt)},
+          .calls = {{.kind = plan::AggKind::kCountStar, .type = LogicalType::kBigInt}},
+          .input = arrow::schema({arrow::field("k", arrow::int64())}),
+          .output = arrow::schema(
+              {arrow::field("k", arrow::int64()), arrow::field("n", arrow::int64())})};
+}
+
+TEST_F(GroupTableProgramTest, CardinalityCrossingWaitsForMoreSelectedInput) {
+  const auto query = CountByKey();
+  const auto batch =
+      arrow::RecordBatch::Make(query.input, 6, {testing::Int64s({1, 2, 1, 3, 4, 2})});
+  const auto drop = testing::Bools({false, std::nullopt});
+  for (bool another_row : {false, true}) {
+    MemoryBudget budget(std::nullopt);
+    {
+      auto source = query.MakeCardinality(budget, 2).ValueOrDie();
+      ASSERT_TRUE(source->Consume(*batch->Slice(0, 2)).ok());
+      ASSERT_TRUE(source->Consume(*batch->Slice(2, 1)).ok());
+      EXPECT_EQ(source->num_groups(), 2U);
+      EXPECT_FALSE(source->promoted());
+      ASSERT_TRUE(source->Consume(*batch->Slice(3, 1)).ok());
+      ASSERT_TRUE(source->Consume(*batch->Slice(4, 0)).ok());
+      ASSERT_TRUE(source->Consume(*batch->Slice(4), drop.get()).ok());
+      EXPECT_EQ(source->num_groups(), 3U);
+      EXPECT_FALSE(source->promoted());
+      if (another_row) {
+        ASSERT_TRUE(source->Consume(*batch->Slice(5)).ok());
+      }
+      EXPECT_EQ(source->promoted(), another_row);
+      EXPECT_EQ(source->promoted_groups(), another_row ? 3U : 0U);
+      std::unique_ptr<GroupTable> single;
+      std::unique_ptr<PartitionedGroupTables> partitioned;
+      ASSERT_TRUE(source->Finish(single, partitioned).ok());
+      EXPECT_EQ(single != nullptr, !another_row);
+      EXPECT_EQ(partitioned != nullptr, another_row);
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
+TEST_F(GroupTableProgramTest, CardinalityDistinguishesOneKeySkewFromLateGrowthWithinOneBatch) {
+  const auto query = CountByKey();
+  // Cross the internal tile boundary within one Consume, with a long run of one hot key.
+  constexpr auto kTile = GroupTable::kMaxMergeChunk;
+  for (bool growing : {false, true}) {
+    std::vector<std::optional<std::int64_t>> keys(kTile + 1U, 0);
+    if (growing) {
+      keys[kTile - 2U] = 1;
+      keys[kTile - 1U] = 2;
+    }
+    const auto batch = arrow::RecordBatch::Make(query.input, Narrow<std::int64_t>(keys.size()),
+                                                {testing::Int64s(keys)});
+    MemoryBudget budget(std::nullopt);
+    auto source = query.MakeCardinality(budget, 2).ValueOrDie();
+    ASSERT_TRUE(source->Consume(*batch).ok());
+    EXPECT_EQ(source->num_groups(), growing ? 3U : 1U);
+    EXPECT_EQ(source->promoted(), growing);
+    EXPECT_EQ(source->promoted_groups(), growing ? 3U : 0U);
+    std::unique_ptr<GroupTable> single;
+    std::unique_ptr<PartitionedGroupTables> partitioned;
+    ASSERT_TRUE(source->Finish(single, partitioned).ok());
+    if (!growing) {
+      ASSERT_NE(single, nullptr);
+      EXPECT_EQ(partitioned, nullptr);
+      const auto result = single->NextChunk(query.output).ValueOrDie();
+      ASSERT_EQ(result->num_rows(), 1);
+      EXPECT_EQ(static_cast<const arrow::Int64Array&>(*result->column(1)).Value(0),
+                batch->num_rows());
+    }
+  }
+}
+
+TEST_F(GroupTableProgramTest, CardinalityMigrationKeepsCompositeGroupsSpellingAndCounts) {
+  const auto tag = Column(1, "tag", LogicalType::kBigInt);
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::float64()), arrow::field("tag", arrow::int64()),
+                     arrow::field("v", arrow::int64())});
+  const Query query{.keys = {Column(0, "k", LogicalType::kDouble), tag, tag},
+                    .calls = {{.kind = plan::AggKind::kCountStar, .type = LogicalType::kBigInt},
+                              {.kind = plan::AggKind::kCount,
+                               .arg = Column(2, "v", LogicalType::kBigInt),
+                               .type = LogicalType::kBigInt}},
+                    .input = schema,
+                    .output = arrow::schema({schema->field(0), schema->field(1), schema->field(1),
+                                             arrow::field("n", arrow::int64()),
+                                             arrow::field("valid", arrow::int64())})};
+  constexpr auto kNegZero = std::bit_cast<std::int64_t>(-0.);
+  constexpr auto kNan = std::bit_cast<std::int64_t>(0xfff800000000001aULL);
+  constexpr auto kOtherNan = std::bit_cast<std::int64_t>(0x7ff800000000006bULL);
+  constexpr auto kOne = std::bit_cast<std::int64_t>(1.);
+  constexpr auto kNull = std::nullopt;
+  MemoryBudget budget(std::nullopt);
+  auto source = query.MakeCardinality(budget, 2).ValueOrDie();
+  {
+    // The first +0 is masked. Both spellings recur after the group IDs change on promotion.
+    const auto bits = testing::Int64s(
+        {0, kNegZero, kNan, kNull, 0, kOtherNan, kOne, kNull, 0, kOtherNan, kNegZero});
+    const auto keys = bits->View(arrow::float64()).ValueOrDie();
+    const auto tags = testing::Int64s({1, 1, 2, 3, 1, 2, kNull, 3, 1, 2, kNull});
+    const auto values = testing::Int64s({9, kNull, 8, kNull, 5, kNull, 10, 11, 5, 6, 9});
+    const auto batch = arrow::RecordBatch::Make(schema, keys->length(), {keys, tags, values});
+    const auto prefix = testing::Bools({false, true, true, true, true, true});
+    ASSERT_TRUE(source->Consume(*batch->Slice(0, 6), prefix.get()).ok());
+    EXPECT_FALSE(source->promoted());
+    ASSERT_TRUE(source->Consume(*batch->Slice(6)).ok());
+    EXPECT_EQ(source->promoted_groups(), 3U);
+    EXPECT_EQ(source->num_groups(), 5U);
+  }
+  std::unique_ptr<GroupTable> single;
+  std::unique_ptr<PartitionedGroupTables> partitioned;
+  ASSERT_TRUE(source->Finish(single, partitioned).ok());
+  ASSERT_EQ(single, nullptr);
+  ASSERT_NE(partitioned, nullptr);
+  source.reset();
+  using Nullable = std::optional<std::int64_t>;
+  using Counts = std::map<std::pair<Nullable, Nullable>, std::pair<std::int64_t, std::int64_t>>;
+  const Counts expected{{{kNegZero, 1}, {3, 2}},
+                        {{kNan, 2}, {3, 2}},
+                        {{kNull, 3}, {2, 1}},
+                        {{kOne, kNull}, {1, 1}},
+                        {{kNegZero, kNull}, {1, 1}}};
+  Counts actual;
+  for (std::size_t lane = 0; lane < GroupTable::kPartitions; ++lane) {
+    auto part = partitioned->ReleasePartition(lane);
+    if (!part) {
+      continue;
+    }
+    auto dest = query.Make(Mode::kBatch, budget);
+    ASSERT_TRUE(dest->Merge(*part).ok());
+    part.reset();
+    for (;;) {
+      const auto batch = dest->NextChunk(query.output).ValueOrDie();
+      if (!batch) {
+        break;
+      }
+      const auto& keys = static_cast<const arrow::DoubleArray&>(*batch->column(0));
+      const auto& tags = static_cast<const arrow::Int64Array&>(*batch->column(1));
+      EXPECT_TRUE(tags.Equals(*batch->column(2)));
+      const auto& counts = static_cast<const arrow::Int64Array&>(*batch->column(3));
+      const auto& valid = static_cast<const arrow::Int64Array&>(*batch->column(4));
+      for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+        const Nullable bits =
+            keys.IsValid(i) ? Nullable(std::bit_cast<std::int64_t>(keys.Value(i))) : kNull;
+        const Nullable tag_value = tags.IsValid(i) ? Nullable(tags.Value(i)) : kNull;
+        EXPECT_TRUE(
+            actual.emplace(std::pair{bits, tag_value}, std::pair{counts.Value(i), valid.Value(i)})
+                .second);
+      }
+    }
+  }
+  EXPECT_EQ(actual, expected);
+  partitioned.reset();
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(GroupTableProgramTest, CardinalityPromotionRefusalCannotPublishPartialResults) {
+  const auto query = CountByKey();
+  constexpr std::int64_t kKeys = 256;
+  std::vector<std::optional<std::int64_t>> keys;
+  keys.reserve(kKeys);
+  for (std::int64_t i = 0; i < kKeys; ++i) {
+    keys.emplace_back(i);
+  }
+  const auto batch = arrow::RecordBatch::Make(query.input, Narrow<std::int64_t>(keys.size()),
+                                              {testing::Int64s(keys)});
+  const auto tail = batch->Slice(0, 1);
+  MemoryBudget measured(std::nullopt);
+  auto control = query.MakeCardinality(measured, 2).ValueOrDie();
+  ASSERT_TRUE(control->Consume(*batch).ok());
+  const auto prefix_bytes = measured.bytes_allocated();
+  ASSERT_TRUE(control->Consume(*tail).ok());
+  ASSERT_TRUE(control->promoted());
+  const auto extra = measured.max_memory() - prefix_bytes;
+  ASSERT_GT(extra, 1);
+  control.reset();
+  EXPECT_EQ(measured.bytes_allocated(), 0);
+
+  // A failed transfer may keep its original source and frozen routing IDs, but no temporary
+  // destination. Measure the same source's normal handoff without any promotion.
+  auto frozen = query.MakeCardinality(measured, 2).ValueOrDie();
+  ASSERT_TRUE(frozen->Consume(*batch).ok());
+  std::unique_ptr<GroupTable> original;
+  std::unique_ptr<PartitionedGroupTables> unused;
+  ASSERT_TRUE(frozen->Finish(original, unused).ok());
+  const auto frozen_bytes = measured.bytes_allocated();
+  original.reset();
+  frozen.reset();
+  ASSERT_EQ(measured.bytes_allocated(), 0);
+
+  // Refuse both at the start and partway through constructing the destination lanes. Leave
+  // headroom relative to this build's actual allocations, independent of object and slot sizes.
+  for (const auto headroom : {std::int64_t{0}, extra / 2}) {
+    MemoryBudget budget(measured.max_memory());
+    {
+      auto source = query.MakeCardinality(budget, 2).ValueOrDie();
+      ASSERT_TRUE(source->Consume(*batch).ok());
+      EXPECT_FALSE(source->promoted());
+      MemoryReservation pressure;
+      pressure.Reset(&budget);
+      ASSERT_TRUE(
+          pressure.Resize(measured.max_memory() - budget.bytes_allocated() - headroom).ok());
+      const auto refused = source->Consume(*tail);
+      ASSERT_TRUE(refused.IsOutOfMemory()) << refused;
+      EXPECT_FALSE(source->promoted());
+      pressure.Release();
+      EXPECT_LE(budget.bytes_allocated(), std::max(prefix_bytes, frozen_bytes));
+      EXPECT_EQ(source->Consume(*tail), refused);
+      std::unique_ptr<GroupTable> single;
+      std::unique_ptr<PartitionedGroupTables> partitioned;
+      EXPECT_EQ(source->Finish(single, partitioned), refused);
+      EXPECT_EQ(single, nullptr);
+      EXPECT_EQ(partitioned, nullptr);
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
+TEST_F(GroupTableProgramTest, CardinalityKeepsDoubleAccumulationOnOneTable) {
+  for (const auto kind : {plan::AggKind::kSum, plan::AggKind::kAvg}) {
+    auto query = NumericQuery(false);
+    query.calls.back().kind = kind;
+    const auto batch = MakeRows(query, 0);
+    MemoryBudget budget(std::nullopt);
+    auto source = query.MakeCardinality(budget, 2).ValueOrDie();
+    ASSERT_TRUE(source->Consume(*batch).ok());
+    ASSERT_GT(source->num_groups(), 2U);
+    ASSERT_TRUE(source->Consume(*batch).ok());
+    EXPECT_FALSE(source->promoted());
+    std::unique_ptr<GroupTable> single;
+    std::unique_ptr<PartitionedGroupTables> partitioned;
+    ASSERT_TRUE(source->Finish(single, partitioned).ok());
+    EXPECT_NE(single, nullptr);
+    EXPECT_EQ(partitioned, nullptr);
+  }
+}
+
+TEST_F(GroupTableProgramTest, LocalDispatchKeepsFallibleUpdatesOnTheirInputOrderPath) {
+  const std::vector keys{Column(0, "k", LogicalType::kBigInt)};
+  const auto narrow = LogicalType::Decimal(18, 2);
+  const auto wide = LogicalType::Decimal(38, 2);
+  const auto check = [&](plan::AggKind kind, LogicalType input, LogicalType result, bool eligible) {
+    const std::vector<plan::AggregateCall> calls{
+        {.kind = kind, .arg = Column(1, "v", input), .type = result}};
+    MemoryBudget budget(std::nullopt);
+    auto original =
+        GroupTable::Make(keys, calls, 2, &budget, &budget, true, GroupTable::kPartitions,
+                         {.kind = KeyTableKind::kFixed}, Mode::kBatch)
+            .ValueOrDie();
+    ASSERT_TRUE(original->uses_batch_program());
+    EXPECT_EQ(original->supports_local_dispatch(), eligible);
+    EXPECT_EQ(GroupTable::MakeLocal(keys, calls, 2, &budget, &budget).ok(), eligible);
+    EXPECT_EQ(PartitionedGroupTables::Make(keys, calls, 2, &budget, &budget).ok(), eligible);
+  };
+  check(plan::AggKind::kAvg, LogicalType::kDate, LogicalType::kTimestamp, false);
+  check(plan::AggKind::kSum, wide, wide, false);
+  check(plan::AggKind::kAvg, LogicalType::kHugeInt, LogicalType::kDouble, false);
+  check(plan::AggKind::kSumCounts, LogicalType::kBigInt, LogicalType::kBigInt, false);
+  check(plan::AggKind::kSum, narrow, wide, true);
+  check(plan::AggKind::kAvg, narrow, LogicalType::kDouble, true);
+}
+
+TEST_F(GroupTableProgramTest, LocalGroupLimitIncludesEveryLaneAndPromotedSeed) {
+  const auto query = CountByKey();
+  constexpr std::uint32_t kLimit = 3;
+  const auto candidates = testing::Int64s({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+  const auto buckets = SplitByKeys({{candidates}, candidates->length()}, GroupTable::kPartitions,
+                                   arrow::default_memory_pool())
+                           .ValueOrDie();
+  // Pick keys from four different lanes. No lane will reach even two groups.
+  std::vector<std::optional<std::int64_t>> keys;
+  for (const auto& bucket : buckets.rows) {
+    if (!bucket.empty()) {
+      keys.emplace_back(static_cast<const arrow::Int64Array&>(*candidates).Value(bucket.front()));
+    }
+  }
+  ASSERT_GT(keys.size(), kLimit);
+  const auto rows = arrow::RecordBatch::Make(query.input, Narrow<std::int64_t>(keys.size()),
+                                             {testing::Int64s(keys)});
+  const KeyTableOptions options{
+      .kind = KeyTableKind::kFixed, .estimate = false, .max_groups = kLimit};
+  for (const bool promote : {false, true}) {
+    for (const bool overflow : {false, true}) {
+      SCOPED_TRACE(promote);
+      SCOPED_TRACE(overflow);
+      MemoryBudget budget(std::nullopt);
+      std::unique_ptr<PartitionedGroupTables> lanes;
+      std::unique_ptr<CardinalityLocalGroups> observed;
+      if (promote) {
+        observed = CardinalityLocalGroups::Make(query.keys, query.calls, 1, &budget, &budget, true,
+                                                GroupTable::kPartitions, options, 1)
+                       .ValueOrDie();
+      } else {
+        lanes = PartitionedGroupTables::Make(query.keys, query.calls, 1, &budget, &budget, true,
+                                             GroupTable::kPartitions, options)
+                    .ValueOrDie();
+      }
+      const auto consume = [&](std::int64_t offset, std::int64_t length) {
+        const auto batch = rows->Slice(offset, length);
+        return observed ? observed->Consume(*batch) : lanes->Consume(*batch);
+      };
+      ASSERT_TRUE(consume(0, 2).ok());
+      ASSERT_TRUE(consume(2, 1).ok());
+      if (observed) {
+        ASSERT_EQ(observed->promoted_groups(), 2U);
+      }
+      // All three existing keys can still be updated at the exact limit.
+      ASSERT_TRUE(consume(0, 3).ok());
+      ASSERT_EQ(observed ? observed->num_groups() : lanes->num_groups(), kLimit);
+      std::unique_ptr<GroupTable> single;
+      const auto finish = [&] {
+        return observed ? observed->Finish(single, lanes) : lanes->Finish();
+      };
+      if (overflow) {
+        const auto refused = consume(3, 1);
+        ASSERT_TRUE(refused.IsOutOfMemory()) << refused;
+        EXPECT_EQ(consume(0, 1), refused);
+        EXPECT_EQ(finish(), refused);
+        if (observed) {
+          EXPECT_EQ(lanes, nullptr);
+        }
+      } else {
+        ASSERT_TRUE(finish().ok());
+        ASSERT_NE(lanes, nullptr);
+        std::size_t populated = 0;
+        for (std::size_t lane = 0; lane < GroupTable::kPartitions; ++lane) {
+          if (const auto part = lanes->ReleasePartition(lane)) {
+            EXPECT_EQ(part->num_groups(), 1U);
+            ++populated;
+          }
+        }
+        EXPECT_EQ(populated, kLimit);
+      }
+      EXPECT_EQ(single, nullptr);
+    }
+  }
+}
+
+TEST_F(GroupTableProgramTest, PromotedDecimalSumAndAverageMatchIndependentMaterializedStates) {
+  const auto narrow = LogicalType::Decimal(18, 2);
+  const auto wide = LogicalType::Decimal(38, 2);
+  const auto value = Column(1, "v", narrow);
+  const auto input =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", plan::ToArrow(narrow))});
+  const Query query{
+      .keys = {Column(0, "k", LogicalType::kBigInt)},
+      .calls = {{.kind = plan::AggKind::kSum, .arg = value, .type = wide},
+                {.kind = plan::AggKind::kAvg, .arg = value, .type = LogicalType::kDouble}},
+      .input = input,
+      .output = arrow::schema({input->field(0), arrow::field("sum", plan::ToArrow(wide)),
+                               arrow::field("avg", arrow::float64())})};
+  constexpr auto kNull = std::nullopt;
+  const auto keys = testing::Int64s({99, 1, 1, 2, 8, 1, 3, 1, 2, 3, 4, 3, 1, 1, 99});
+  const auto values =
+      testing::Decimals(narrow, {"99", "125", "87000", kNull, "-98000", "-25", "300", "650", kNull,
+                                 "-100", "1000", "-9000", "-4000", kNull, "99"});
+  const auto rows = arrow::RecordBatch::Make(input, keys->length(), {keys, values});
+  const auto bits = testing::Bools({true, true, false, true, kNull, true, true, true, true, true,
+                                    true, false, kNull, true, true});
+  const auto selected = [&](std::int64_t offset, std::int64_t length) -> Batch {
+    const auto mask = std::static_pointer_cast<arrow::BooleanArray>(bits->Slice(offset, length));
+    return {.data = rows->Slice(offset, length), .selection = mask};
+  };
+  MemoryBudget budget(std::nullopt);
+  auto source = query.MakeCardinality(budget, 2).ValueOrDie();
+  const auto seed = selected(1, 6);
+  ASSERT_TRUE(source->Consume(*seed.data, seed.selection.get()).ok());
+  EXPECT_FALSE(source->promoted());
+  const auto tail = selected(7, 7);
+  ASSERT_TRUE(source->Consume(*tail.data, tail.selection.get()).ok());
+  ASSERT_EQ(source->promoted_groups(), 3U);
+  ASSERT_EQ(source->num_groups(), 4U);
+  std::unique_ptr<GroupTable> single;
+  std::unique_ptr<PartitionedGroupTables> lanes;
+  ASSERT_TRUE(source->Finish(single, lanes).ok());
+  ASSERT_NE(lanes, nullptr);
+  auto actual = query.Make(Mode::kBatch, budget);
+  for (std::size_t lane = 0; lane < GroupTable::kPartitions; ++lane) {
+    if (const auto part = lanes->ReleasePartition(lane)) {
+      ASSERT_TRUE(actual->Merge(*part).ok());
+    }
+  }
+
+  // Materialize the selected rows once. Separate input indices give the oracle independent
+  // SUM and AVG accumulators, while the promoted table aliases them on the same input index.
+  const auto dense = Materialize(selected(1, 13), &budget).ValueOrDie();
+  const auto oracle_rows = dense->AddColumn(2, "v_copy", dense->column(1)).ValueOrDie();
+  auto oracle_query = query;
+  oracle_query.input = oracle_rows->schema();
+  oracle_query.calls[1].arg = Column(2, "v_copy", narrow);
+  auto oracle = oracle_query.Make(Mode::kSeparate, budget);
+  ASSERT_TRUE(oracle->Consume(*oracle_rows).ok());
+  const auto collect = [&](GroupTable& table) {
+    std::map<std::int64_t, std::pair<std::string, std::optional<double>>> result;
+    while (const auto batch = table.NextChunk(query.output).ValueOrDie()) {
+      const auto& ids = static_cast<const arrow::Int64Array&>(*batch->column(0));
+      const auto& avgs = static_cast<const arrow::DoubleArray&>(*batch->column(2));
+      for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+        const auto sum = batch->column(1)->GetScalar(i).ValueOrDie()->ToString();
+        const auto avg = avgs.IsValid(i) ? std::optional(avgs.Value(i)) : kNull;
+        EXPECT_TRUE(result.emplace(ids.Value(i), std::pair{sum, avg}).second);
+      }
+    }
+    return result;
+  };
+  const auto expected = collect(*oracle);
+  ASSERT_EQ(expected.size(), 4U);
+  EXPECT_EQ(collect(*actual), expected);
+}
+
+TEST_F(GroupTableProgramTest, WideLocalTableMetadataCanBeRefusedWithNoGroups) {
+  auto query = NumericQuery(false);
+  query.calls.assign(128, {.kind = plan::AggKind::kCountStar, .type = LogicalType::kBigInt});
+  const auto make = [&](MemoryBudget& budget) {
+    return GroupTable::MakeLocal(query.keys, query.calls, query.input->num_fields(), &budget,
+                                 &budget);
+  };
+  MemoryBudget measured(std::nullopt);
+  auto made = make(measured);
+  ASSERT_TRUE(made.ok()) << made.status();
+  auto table = std::move(*made);
+  EXPECT_EQ(table->num_groups(), 0U);
+  const auto live = measured.bytes_allocated();
+  EXPECT_GT(live, Narrow<std::int64_t>(query.calls.size() * sizeof(plan::AggregateCall)));
+  table.reset();
+  EXPECT_EQ(measured.bytes_allocated(), 0);
+  MemoryBudget tight(live - 1);
+  EXPECT_TRUE(make(tight).status().IsOutOfMemory());
+  EXPECT_EQ(tight.bytes_allocated(), 0);
+}
+
+TEST_F(GroupTableProgramTest, PartitionedDoubleKeysKeepFirstSelectedSpelling) {
+  constexpr std::uint64_t kNegZero = 1ULL << 63U;
+  constexpr std::uint64_t kNan = 0xfff8000000000046ULL;
+  constexpr std::uint64_t kOther = 0x7ff8000000000001ULL;
+  const auto schema = arrow::schema({arrow::field("k", arrow::float64())});
+  const auto keys = std::vector{Column(0, "k", LogicalType::kDouble)};
+  const auto bits = testing::Int64s(
+      {0, std::bit_cast<std::int64_t>(kOther), std::bit_cast<std::int64_t>(kNan),
+       std::bit_cast<std::int64_t>(kNegZero), 0, std::bit_cast<std::int64_t>(kOther)});
+  const auto column = bits->View(arrow::float64()).ValueOrDie();
+  const auto batch = arrow::RecordBatch::Make(schema, 6, {column});
+  const auto mask = testing::Bools({false, false, true, true, true, true});
+  MemoryBudget budget(std::nullopt);
+  auto bundle = PartitionedGroupTables::Make(keys, {}, 1, &budget, &budget).ValueOrDie();
+  ASSERT_TRUE(bundle->Consume(*batch, mask.get()).ok());
+  ASSERT_TRUE(bundle->Finish().ok());
+  std::vector<std::uint64_t> seen;
+  for (std::size_t i = 0; i < GroupTable::kPartitions; ++i) {
+    auto source = bundle->ReleasePartition(i);
+    if (!source) {
+      continue;
+    }
+    auto dest = GroupTable::MakeLocal(keys, {}, 1, &budget, &budget).ValueOrDie();
+    ASSERT_TRUE(dest->Merge(*source).ok());
+    source.reset();
+    const auto result = dest->NextChunk(schema).ValueOrDie();
+    const auto& out = static_cast<const arrow::DoubleArray&>(*result->column(0));
+    for (std::int64_t r = 0; r < out.length(); ++r) {
+      seen.push_back(std::bit_cast<std::uint64_t>(out.Value(r)));
+    }
+  }
+  std::ranges::sort(seen);
+  EXPECT_EQ(seen, (std::vector<std::uint64_t>{kNegZero, kNan}));
 }
 
 TEST_F(GroupTableProgramTest, FirstSeenDoubleBitsSurviveFullAndPartitionMerges) {
@@ -498,6 +1095,81 @@ TEST_F(GroupTableProgramTest, UnsupportedKeysAndAggregatesUseExistingPath) {
   ASSERT_FALSE(global->uses_batch_program());
   ASSERT_TRUE(global->Consume(*rows).ok());
   EXPECT_EQ(global->num_groups(), 1U);
+}
+
+TEST_F(GroupTableProgramTest, SparseFirstKeyMergeAllocationsAreIndependentOfSourceChunks) {
+  const auto schema =
+      arrow::schema({arrow::field("id", arrow::int64()), arrow::field("d", arrow::float64()),
+                     arrow::field("b", arrow::boolean())});
+  const auto keys =
+      std::vector{Column(0, "id", LogicalType::kBigInt), Column(1, "d", LogicalType::kDouble),
+                  Column(2, "b", LogicalType::kBoolean)};
+  constexpr std::int64_t kRows = 2304;  // a partition crosses the 1,024-group merge tile
+  constexpr std::uint64_t kNan = 0xfff8000000000046ULL;
+  std::vector<std::optional<std::int64_t>> ids;
+  std::vector<std::optional<std::int64_t>> bits;
+  std::vector<std::optional<bool>> flags;
+  ids.reserve(kRows);
+  bits.reserve(kRows);
+  flags.reserve(kRows);
+  for (std::int64_t row = 0; row < kRows; ++row) {
+    ids.emplace_back(row);
+    bits.emplace_back(row % 2 == 0 ? std::bit_cast<std::int64_t>(kNan)
+                                   : std::bit_cast<std::int64_t>(-0.0));
+    flags.emplace_back(row % 3 == 0 ? std::nullopt : std::optional(row % 5 == 0));
+  }
+  const auto spellings = testing::Int64s(bits)->View(arrow::float64()).ValueOrDie();
+  const auto batch = arrow::RecordBatch::Make(
+      schema, kRows, {testing::Int64s(ids), spellings, testing::Bools(flags)});
+  std::vector<std::int64_t> allocations;
+  allocations.reserve(2);
+  for (const auto chunk_size : {kRows, std::int64_t{3}}) {
+    MemoryBudget source_memory(std::nullopt);
+    arrow::ProxyMemoryPool counted(arrow::default_memory_pool());
+    MemoryBudget destination_memory(std::nullopt, &counted);
+    const auto make = [&](MemoryBudget& memory) {
+      return GroupTable::MakeLocal(keys, {}, schema->num_fields(), &memory, &memory, true, 2,
+                                   {.kind = KeyTableKind::kFixed, .estimate = false})
+          .ValueOrDie();
+    };
+    auto source = make(source_memory);
+    for (std::int64_t begin = 0; begin < kRows; begin += chunk_size) {
+      ASSERT_TRUE(source->Consume(*batch->Slice(begin, chunk_size)).ok());
+    }
+    ASSERT_TRUE(source->Partition().ok());
+    // At least half the groups land in one lane, independently of the partition hash.
+    const std::size_t lane =
+        source->partition_groups(0).size() >= Narrow<std::size_t>(kRows / 2) ? 0U : 1U;
+    const auto groups = source->partition_groups(lane);
+    const std::vector<std::uint32_t> expected(groups.begin(), groups.end());
+    ASSERT_GT(expected.size(), 1024U);
+    auto destination = make(destination_memory);
+    const auto before = counted.num_allocations();
+    const auto status = destination->MergePartition(*source, lane);
+    ASSERT_TRUE(status.ok()) << status;
+    allocations.push_back(counted.num_allocations() - before);
+    source.reset();
+    EXPECT_EQ(source_memory.bytes_allocated(), 0);
+
+    std::size_t seen = 0;
+    while (const auto out = destination->NextChunk(schema).ValueOrDie()) {
+      const auto& id = static_cast<const arrow::Int64Array&>(*out->column(0));
+      const auto& key = static_cast<const arrow::DoubleArray&>(*out->column(1));
+      const auto& flag = static_cast<const arrow::BooleanArray&>(*out->column(2));
+      for (std::int64_t i = 0; i < out->num_rows(); ++i) {
+        ASSERT_LT(seen, expected.size());
+        const auto row = expected[seen++];
+        EXPECT_EQ(id.Value(i), row);
+        EXPECT_EQ(std::bit_cast<std::int64_t>(key.Value(i)), bits[row]);
+        EXPECT_EQ(flag.IsValid(i) ? std::optional(flag.Value(i)) : std::nullopt, flags[row]);
+      }
+    }
+    EXPECT_EQ(seen, expected.size());
+    destination.reset();
+    EXPECT_EQ(destination_memory.bytes_allocated(), 0);
+  }
+  // Splitting the same producer into 768 first-key chunks must not allocate a Take per chunk.
+  EXPECT_EQ(allocations.front(), allocations.back());
 }
 
 }  // namespace

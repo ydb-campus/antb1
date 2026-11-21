@@ -5,16 +5,43 @@
 #include <cstdint>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <new>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
+#include <arrow/result.h>
 #include <arrow/status.h>
+#include <arrow/stl_allocator.h>
 
 #include "antb1/common/narrow.h"
 #include "antb1/exec/memory_budget.h"
 
 namespace antb1::exec {
+
+// Charge a concrete index or aggregate-state object to its lane before constructing it.
+template <class Base, class Object, class... Args>
+arrow::Result<std::unique_ptr<Base>> MakeGroupObject(MemoryReservation* memory, Args&&... args) {
+  if (memory == nullptr) {
+    return std::make_unique<Object>(std::forward<Args>(args)...);
+  }
+  const auto before = memory->bytes();
+  constexpr auto kBytes = static_cast<std::int64_t>(sizeof(Object));
+  if (before > std::numeric_limits<std::int64_t>::max() - kBytes) {
+    return arrow::Status::CapacityError("local group metadata size overflow");
+  }
+  ARROW_RETURN_NOT_OK(memory->Resize(before + kBytes));
+  try {
+    return std::make_unique<Object>(std::forward<Args>(args)...);
+  } catch (const arrow::stl::BadAlloc& e) {
+    ARROW_RETURN_NOT_OK(memory->Resize(before));
+    return arrow::Status::OutOfMemory(e.what());
+  } catch (const std::bad_alloc&) {
+    ARROW_RETURN_NOT_OK(memory->Resize(before));
+    return arrow::Status::OutOfMemory("building a local group table");
+  }
+}
 
 // Grow geometrically, charging the replacement while the old allocation is live. A refused
 // reservation or allocation leaves the current vector and its charge intact.

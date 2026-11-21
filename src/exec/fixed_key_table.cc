@@ -13,6 +13,7 @@
 #include "antb1/common/check.h"
 
 #include "column_key_table.h"
+#include "group_vector.h"
 #include "key_table.h"
 
 namespace antb1::exec {
@@ -37,20 +38,26 @@ bool TakesKeyType(arrow::Type::type id) {
 }
 
 template <Growth kGrowth>
-std::unique_ptr<KeyTable> MakeGrowing(FixedKeyLayout layout, arrow::MemoryPool* pool,
-                                      const KeyTableOptions& options, MemoryBudget* budget) {
+arrow::Result<std::unique_ptr<KeyTable>> MakeGrowing(FixedKeyLayout layout, arrow::MemoryPool* pool,
+                                                     const KeyTableOptions& options,
+                                                     MemoryBudget* budget) {
   switch (layout.key_bytes) {
     case 8:
-      return std::make_unique<FixedKeyTable<8, kGrowth>>(std::move(layout), pool, options, budget);
+      return MakeGroupObject<KeyTable, FixedKeyTable<8, kGrowth>>(
+          options.table_metadata, std::move(layout), pool, options, budget);
     case 16:
-      return std::make_unique<FixedKeyTable<16, kGrowth>>(std::move(layout), pool, options, budget);
+      return MakeGroupObject<KeyTable, FixedKeyTable<16, kGrowth>>(
+          options.table_metadata, std::move(layout), pool, options, budget);
     case 24:
-      return std::make_unique<FixedKeyTable<24, kGrowth>>(std::move(layout), pool, options, budget);
+      return MakeGroupObject<KeyTable, FixedKeyTable<24, kGrowth>>(
+          options.table_metadata, std::move(layout), pool, options, budget);
     case 32:
-      return std::make_unique<FixedKeyTable<32, kGrowth>>(std::move(layout), pool, options, budget);
+      return MakeGroupObject<KeyTable, FixedKeyTable<32, kGrowth>>(
+          options.table_metadata, std::move(layout), pool, options, budget);
     default:
       ANTB1_CHECK(layout.key_bytes == 40);
-      return std::make_unique<FixedKeyTable<40, kGrowth>>(std::move(layout), pool, options, budget);
+      return MakeGroupObject<KeyTable, FixedKeyTable<40, kGrowth>>(
+          options.table_metadata, std::move(layout), pool, options, budget);
   }
 }
 
@@ -85,9 +92,10 @@ std::optional<FixedKeyLayout> FixedKeyLayoutOf(const std::vector<arrow::TypeHold
   return layout;
 }
 
-std::unique_ptr<KeyTable> MakeFixedKeyTable(FixedKeyLayout layout, Growth growth,
-                                            arrow::MemoryPool* pool, const KeyTableOptions& options,
-                                            MemoryBudget* budget) {
+arrow::Result<std::unique_ptr<KeyTable>> MakeFixedKeyTable(FixedKeyLayout layout, Growth growth,
+                                                           arrow::MemoryPool* pool,
+                                                           const KeyTableOptions& options,
+                                                           MemoryBudget* budget) {
   return growth == Growth::kSlotOrder
              ? MakeGrowing<Growth::kSlotOrder>(std::move(layout), pool, options, budget)
              : MakeGrowing<Growth::kIdOrder>(std::move(layout), pool, options, budget);

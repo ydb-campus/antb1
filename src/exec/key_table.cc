@@ -406,9 +406,9 @@ class PackedStringKeyTable final : public KeyTable {
 }  // namespace
 
 arrow::Status StoredKeyTable::CheckSelection(std::span<const std::uint32_t> selected,
-                                             std::uint32_t source_groups) {
-  if (!selected.empty() && std::ranges::max(selected) >= source_groups) {
-    return arrow::Status::Invalid("group ID outside the ", source_groups, " stored groups");
+                                             std::size_t source_size) {
+  if (!selected.empty() && std::ranges::max(selected) >= source_size) {
+    return arrow::Status::Invalid("selected index outside the ", source_size, " source rows");
   }
   return arrow::Status::OK();
 }
