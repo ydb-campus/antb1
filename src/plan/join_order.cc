@@ -1198,7 +1198,7 @@ std::vector<std::optional<int64_t>> EachDistinctValues(const LogicalNode& node,
         if (estimate.has_value()) {
           // ColumnDomain has a distinct count for every part here. Even disjoint parts
           // contribute at most this many non-NULL values apiece, plus one shared NULL group.
-          const int64_t bound = Saturated(Int128{table.num_parts()} * *estimate + 1);
+          const int64_t bound = Saturated((Int128{table.num_parts()} * *estimate) + 1);
           source.max_values = std::min(source.max_values.value_or(kLargest), bound);
           source.max_part_values = Saturated(Int128{*estimate} + 1);
         }
