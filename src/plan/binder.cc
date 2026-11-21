@@ -4427,13 +4427,6 @@ class Binder {
   };
   std::vector<Relation> relations_;    // one per binding, in FROM order
   std::size_t conjunct_relation_ = 0;  // the relation the conjunct being bound is routed to
-  // Per edge, the column each side compares, which JoinEdge does not carry: the key pair of the
-  // join that takes the edge.
-  struct EdgeKey {
-    std::size_t relation = 0;  // a relation of the edge's own block, by its index there
-    BoundColumn column;
-    bool null_equal = false;  // IS NOT DISTINCT FROM (JoinKey::null_equal); the same on both sides
-  };
   // A conjunct over two or more relations of one block that is no key: the join that first has all
   // of them evaluates it (JoinNode::residual).
   struct Residual {
@@ -4449,7 +4442,7 @@ class Binder {
     std::vector<std::size_t> relations;  // into relations_, in FROM order; never empty
     std::vector<JoinRelation> stats;     // parallel to `relations`
     std::vector<JoinEdge> edges;         // its sides index `relations`
-    std::vector<std::pair<EdgeKey, EdgeKey>> edge_keys;  // parallel to `edges`
+    std::unordered_map<ColumnId, BoundColumn> key_columns;  // includes computed join keys
     std::vector<Residual> residuals;
     // After OrderRelations: one per relation of the key-connected core but its first, which `root`
     // is when there are none; the relations no key connects to the core, each of one row, then join
@@ -6645,13 +6638,16 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
       // branch, or, for a binding inside an outer join unit, the unit's, above its join -- where a
       // padded row's side is what the expression makes of its NULLs (COALESCE(z.x, 1) is 1), not
       // the NULL the branch below the padding would leave.
+      struct EdgeKey {
+        std::size_t relation;
+        BoundColumn column;
+      };
       const auto side = [&](std::size_t i) {
         const std::size_t binding = i == 0 ? left.front() : right.front();
         const std::size_t local = *LocalOf(block_, binding);
         return EdgeKey{.relation = local,
                        .column = JoinKeyColumn(blocks_[block_].relations[local],
-                                               predicate->operands[i], *type),
-                       .null_equal = null_equal};
+                                               predicate->operands[i], *type)};
       };
       const EdgeKey a = side(0);
       const EdgeKey b = side(1);
@@ -6660,20 +6656,23 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
       // containers are the block's own, so an equality that an outer join unit already keys on is a
       // conjunct of its own block again: it filters the unit's rows, padded ones included. An `=`
       // and an IS NOT DISTINCT FROM of the same pair are the `=` key: it implies the other.
-      const auto same = [&](const std::pair<EdgeKey, EdgeKey>& keys) {
-        return (keys.first.column.id == a.column.id && keys.second.column.id == b.column.id) ||
-               (keys.first.column.id == b.column.id && keys.second.column.id == a.column.id);
+      const auto same = [&](const JoinEdge& edge) {
+        return (edge.a_key == a.column.id && edge.b_key == b.column.id) ||
+               (edge.a_key == b.column.id && edge.b_key == a.column.id);
       };
-      const auto found = std::ranges::find_if(block.edge_keys, same);
-      if (found == block.edge_keys.end()) {
+      const auto found = std::ranges::find_if(block.edges, same);
+      if (found == block.edges.end()) {
         block.edges.push_back(JoinEdge{.a = a.relation,
                                        .b = b.relation,
                                        .a_domain = KeyDomainOf(*predicate->operands[0]),
-                                       .b_domain = KeyDomainOf(*predicate->operands[1])});
-        block.edge_keys.emplace_back(a, b);
+                                       .b_domain = KeyDomainOf(*predicate->operands[1]),
+                                       .a_key = a.column.id,
+                                       .b_key = b.column.id,
+                                       .null_equal = null_equal});
+        block.key_columns.try_emplace(a.column.id, a.column);
+        block.key_columns.try_emplace(b.column.id, b.column);
       } else if (!null_equal) {
-        found->first.null_equal = false;
-        found->second.null_equal = false;
+        found->null_equal = false;
       }
       return arrow::Status::OK();
     }
@@ -7900,6 +7899,7 @@ arrow::Status Binder::OrderBlock(std::size_t b) {
     }
   }
   JoinBlock& block = blocks_[b];
+  InferJoinEdges(block.edges);
   block.stats.clear();
   block.stats.reserve(block.relations.size());
   for (const std::size_t r : block.relations) {
@@ -8905,11 +8905,11 @@ LogicalNodePtr Binder::CoreTree(std::size_t b) {
       // An edge has no orientation: the side whose relation is below the left input is the left
       // key. With a composite input that is no longer "the relation this step adds", which is why
       // each step carries the relations below it (ADR 0026's C5).
-      const auto& [a, b_key] = block.edge_keys[e];
-      const bool a_left = left_below.test(a.relation);
-      keys.push_back(JoinKey{.left = a_left ? a.column : b_key.column,
-                             .right = a_left ? b_key.column : a.column,
-                             .null_equal = a.null_equal});
+      const JoinEdge& edge = block.edges[e];
+      const bool a_left = left_below.test(edge.a);
+      keys.push_back(JoinKey{.left = block.key_columns.at(a_left ? edge.a_key : edge.b_key),
+                             .right = block.key_columns.at(a_left ? edge.b_key : edge.a_key),
+                             .null_equal = edge.null_equal});
     }
     below[k] = left_below | below_of(step.right);
     lowest[k] = std::min(lowest_of(step.left), lowest_of(step.right));

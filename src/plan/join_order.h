@@ -41,7 +41,14 @@ struct JoinEdge {
   // what the edge divides by (join_order.cc's DivisorOf).
   std::optional<int64_t> a_domain;
   std::optional<int64_t> b_domain;
+  ColumnId a_key = kNoColumnId;
+  ColumnId b_key = kNoColumnId;
+  bool null_equal = false;
 };
+
+// Adds the missing relation pairs that compare equivalent keys in this inner block.
+// Written edges stay first. A class matches NULLs only when all its comparisons do.
+void InferJoinEdges(std::vector<JoinEdge>& edges);
 
 // A set of a block's relations, by index. The order works in sets because every question it asks is
 // a set question: which relations are below a step, which an edge connects, and -- for the search
@@ -62,9 +69,9 @@ struct JoinOperand {
 struct JoinStep {
   JoinOperand left;
   JoinOperand right;
-  // The edges between the two inputs, ascending: the keys of this join. Empty only for a cross step
-  // between two parts no edge connects: a nested loop (ADR 0040), its residuals its only
-  // conditions.
+  // The independent edges between the two inputs, ascending: the keys of this join. Empty only for
+  // a cross step between two parts no edge connects: a nested loop (ADR 0040), its residuals its
+  // only conditions.
   std::vector<std::size_t> edges;
   // The side this join builds on: its right input, unless that input's estimate exceeds its left
   // input's by more than `build_side_ratio` (ADR 0026). An unknown estimate on either side keeps
@@ -99,10 +106,9 @@ inline constexpr std::size_t kSearchRelations = 12;
 // not a chain, it takes one whose joins carry the fewest rows in total. The cost of a subset is the
 // cost of the two it joins plus the rows it produces and the rows of the smaller of the two, the
 // side a hash join holds; a single relation costs nothing, its scan being the same in any order.
-// The rows of a subset are read with the keys assumed independent (SubsetRows) -- per pair of
-// relations the largest domain of the edges between them divides, so that two keys between the same
-// pair read as the one composite key they are while keys to different relations really do narrow
-// twice. Ties keep the plan found first, and the subsets are
+// SubsetRows first discards equalities implied by paths wholly inside the subset. Of the
+// remaining edges between each pair of relations, the largest domain divides: a composite key
+// narrows the pair once. Ties keep the plan found first, and the subsets are
 // visited in a fixed order, so the choice is a function of the relations and the edges alone.
 //
 // With `kGreedy`, or above kSearchRelations relations, ADR 0022's rule instead:
@@ -125,13 +131,13 @@ std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
                                  JoinOrderSearch search = JoinOrderSearch::kCost);
 
 // The rows the relations of `set` produce when joined, as the cost the search minimises reads them:
-// every relation's rows multiplied, divided once per pair of them an edge connects. Per pair the
+// every relation's rows multiplied, divided per pair connected by an independent equality. The
 // divisor is the largest domain of the edges between that pair -- two keys between the same two
 // relations are the one composite key they describe, whose parts narrow together, a foreign key
 // into a composite primary key being the common case. Across pairs the divisors multiply, so two
-// keys to *different* relations do narrow twice, which is what lets a selective multi-key join be
-// told from a weak one. In 128 bits, saturated, at least 1, and 0 when a relation has no row or a
-// key has no value. A property of the set alone, not of any order of it.
+// independent constraints to different relations can narrow twice. In 128 bits, saturated, at least
+// 1, and 0 when a relation has no row or a key has no value. A property of the set alone, not of
+// any order of it.
 //
 // This is the narrower of the ADR's two readings and nothing that decides memory may use it: a
 // build side reads a join's rows the other way (ADR 0026's C5). It is public so that a test can
