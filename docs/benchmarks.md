@@ -241,12 +241,13 @@ the destination ID scratch and calls `Probe`. Within the lane, `ColumnKeyTable::
 For the single BIGINT key, SUM and MAX local updates together rose from 42.8 to 50.2 cycles per row,
 and the direct packed-key merge loop took 17.0 cycles per row exclusive of callees.
 
-`bench.micro.smoke` (label `bench-smoke`) runs every benchmark for one iteration (`--benchmark_dry_run`), so they
-keep building and running:
+The `bench-smoke` tests run every registered benchmark once at its full size (`--benchmark_dry_run`).
+CTest runs the local grouping layouts in one shard and the rest of the catalog in a second. A shared resource lock
+limits peak memory by allowing one shard at a time. Each shard retains its correctness checks and 300-second timeout.
 
-- on every PR, in the `ci-release` preset (`pixi run release`, the `macos-release` CI leg);
-- every night, in `static-test`;
-- every night on all three static targets: the `static-cold` jobs run `pixi run bench --benchmark_dry_run=true`.
+- On every PR, the `macos-release` CI job runs both shards with `pixi run release`.
+- Nightly, `static-test` runs both shards.
+- The nightly `static-cold` jobs run `pixi run bench --benchmark_dry_run=true` on all three static targets.
 
 `build/static` is shared with `pixi run static` and `static-test`. Every new commit relinks `antb1` and
 `antb1-bench-micro` with ThinLTO, and a `static-test` run after it relinks its 20 test executables too. Never run two

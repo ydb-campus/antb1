@@ -727,13 +727,15 @@ TEST_F(GroupTableProgramTest, PromotedDecimalSumAndAverageMatchIndependentMateri
 
 TEST_F(GroupTableProgramTest, WideLocalTableMetadataCanBeRefusedWithNoGroups) {
   auto query = NumericQuery(false);
-  query.calls.assign(128, query.calls.front());
+  query.calls.assign(128, {.kind = plan::AggKind::kCountStar, .type = LogicalType::kBigInt});
   const auto make = [&](MemoryBudget& budget) {
     return GroupTable::MakeLocal(query.keys, query.calls, query.input->num_fields(), &budget,
                                  &budget);
   };
   MemoryBudget measured(std::nullopt);
-  auto table = make(measured).ValueOrDie();
+  auto made = make(measured);
+  ASSERT_TRUE(made.ok()) << made.status();
+  auto table = std::move(*made);
   EXPECT_EQ(table->num_groups(), 0U);
   const auto live = measured.bytes_allocated();
   EXPECT_GT(live, Narrow<std::int64_t>(query.calls.size() * sizeof(plan::AggregateCall)));

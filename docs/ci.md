@@ -96,7 +96,7 @@ Advisory jobs (not required):
   ([testing.md](testing.md#labels)).
 - `gcc-compat` builds with GCC 15 and GCC-only warnings, with `-Werror`, and runs the hermetic tests.
 - `macos-release` is a RelWithDebInfo build with `-Werror` against libc++ on Apple silicon, followed by the hermetic
-  tests; it also builds the micro benchmarks and runs each once (`bench.micro.smoke`).
+  tests; it also builds the micro benchmarks and runs each once (label `bench-smoke`).
 - `clang-tidy` runs clang-tidy on every translation unit, with warnings as errors.
 - `clang-coverage-fuzz` runs two Clang-only gates. `pixi run coverage` builds with source-based coverage, runs the
   hermetic tests and fails when a module drops below its floor in `tools/ci/coverage_thresholds.json`; its per-module
