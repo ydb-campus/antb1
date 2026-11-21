@@ -226,9 +226,11 @@ std::optional<int64_t> GroupCountFromDomains(const LogicalNode& node,
 
 struct ScanKeyDomain {
   const ScanNode* scan = nullptr;
-  // Exact footer ranges can bound the number of grouping values, including NULL. A per-part
-  // distinct-count hint is only an estimate, so it supplies no such bound.
+  // Table-wide upper bound including NULL, from an exact range, the table row count, or
+  // a distinct-count bound covering every part.
   std::optional<int64_t> max_values;
+  // Tighter bound within any one part, when all parts report distinct counts.
+  std::optional<int64_t> max_part_values;
 };
 
 // The distinct values of each of `columns` on its own, in their order, std::nullopt where the

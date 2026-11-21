@@ -146,7 +146,7 @@ TEST(SharedSubPlansTest, GroupsEveryMemberTogether) {
 }
 
 TEST(SharedSubPlansTest, CostsTheJointDomainOfFilteredGroupingKeys) {
-  constexpr int64_t kTickets = kMaxSharedResultBytes / (int64_t{5} * 32);
+  constexpr int64_t kTickets = kMaxSharedResultBytes / (int64_t{5} * 36);
   auto readings =
       std::make_shared<testing::FakeTable>(arrow::schema({arrow::field("ticket", arrow::int64()),
                                                           arrow::field("sensor", arrow::int64())}),
@@ -163,7 +163,8 @@ TEST(SharedSubPlansTest, CostsTheJointDomainOfFilteredGroupingKeys) {
   ASSERT_TRUE(catalog.Register("sensors", sensors).ok());
 
   // One band admits any of four slots; another admits only one. Five pairs fit the cap
-  // at 32 bytes per group. A sixth pair or one more ticket pushes the result past the cap.
+  // with 32 bytes of values and four bytes reserved for validity per group.
+  // A sixth pair or one more ticket pushes the result past the admission limit.
   constexpr std::string_view kFivePairs = "d.band = 2 OR (d.band = 4 AND d.slot = 3)";
   constexpr std::string_view kInner = "readings AS r JOIN sensors AS d ON r.sensor = d.id";
   const auto expect_sharing = [&](std::string_view from, std::string_view filter,
@@ -198,6 +199,73 @@ TEST(SharedSubPlansTest, CostsTheJointDomainOfFilteredGroupingKeys) {
   readings->WithStats(
       0, 0, PartStats{.min = 1, .max = kTickets, .null_count = 10, .rows = 2'000'000'000});
   expect_sharing(kInner, kFivePairs, 0, false);
+}
+
+TEST(SharedSubPlansTest, RequiresATableWideBoundForKeysOutsideTheFilter) {
+  constexpr int64_t kPartRows = 1'000'000;
+  constexpr int kParts = 20;
+  auto tickets = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("id", arrow::int64()), arrow::field("label", arrow::int64()),
+                     arrow::field("region", arrow::int64())}),
+      kPartRows * kParts);
+  tickets->WithParts(std::vector<int64_t>(kParts, kPartRows));
+  for (int part = 0; part < kParts; ++part) {
+    // The twenty parts may have disjoint IDs.
+    tickets->WithDistinctCount(part, 0, kPartRows).WithDistinctCount(part, 2, 1);
+  }
+  auto labels = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("id", arrow::int64()), arrow::field("band", arrow::int64())}),
+      20'000'000);
+  labels->WithStats(0, 1, PartStats{.min = 1, .max = 100, .rows = 20'000'000});
+  Catalog catalog;
+  ASSERT_TRUE(catalog.Register("tickets", tickets).ok());
+  ASSERT_TRUE(catalog.Register("labels", labels).ok());
+  const auto bound = BindSql(
+      "WITH g AS (SELECT t.id, t.region, d.band, COUNT(*) AS n FROM tickets t JOIN labels d "
+      "ON t.label = d.id AND d.band = 1 GROUP BY t.id, t.region, d.band) "
+      "SELECT a.id, a.region, a.band, a.n, b.n FROM g a JOIN g b ON a.id = b.id",
+      catalog);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  const auto groups = SharedSubPlans(*bound);
+  ASSERT_EQ(groups.size(), 1U);
+  int exhausted = 0;
+  ASSERT_FALSE(WorthSharing(groups.front(), exhausted)) << "the initial estimate exceeds the cap";
+  EXPECT_FALSE(WorthSharing(groups.front()));
+  // Each part now contributes at most (150,000 + NULL) IDs times (one region + NULL).
+  // Both keys come from the same row, so there are twenty sets of tuples.
+  for (int part = 0; part < kParts; ++part) {
+    tickets->WithDistinctCount(part, 0, 150'000);
+  }
+  EXPECT_FALSE(WorthSharing(groups.front(), exhausted));
+  EXPECT_TRUE(WorthSharing(groups.front()));
+}
+
+TEST(SharedSubPlansTest, ReservesValidityBytesForNullableAggregateResults) {
+  constexpr int64_t kRows = 100'000'000;
+  constexpr int64_t kGroups = kMaxSharedResultBytes / 32;
+  auto table = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("band", arrow::int64()),
+                     arrow::field("v", arrow::int64())}),
+      kRows);
+  table->WithStats(0, 1, PartStats{.min = 1, .max = 100, .rows = kRows})
+      .WithStats(0, 2, PartStats{.min = 1, .max = 10, .null_count = kRows / 2, .rows = kRows});
+  Catalog catalog;
+  ASSERT_TRUE(catalog.Register("t", table).ok());
+  const auto bound = BindSql(
+      "WITH g AS (SELECT k, band, MIN(v) AS lo, MAX(v) AS hi FROM t WHERE band = 1 "
+      "GROUP BY k, band) SELECT a.k, a.band, a.lo, a.hi, b.lo FROM g a JOIN g b ON a.k = b.k",
+      catalog);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  const auto groups = SharedSubPlans(*bound);
+  ASSERT_EQ(groups.size(), 1U);
+  // The four BIGINT value buffers alone can fill the cap. A group with only NULL v values
+  // and another with a value require validity bitmaps for MIN and MAX.
+  table->WithStats(0, 0, PartStats{.min = 1, .max = kGroups, .rows = kRows});
+  EXPECT_FALSE(WorthSharing(groups.front()));
+  table->WithStats(0, 0, PartStats{.min = 1, .max = kGroups / 2, .rows = kRows});
+  int exhausted = 0;
+  EXPECT_FALSE(WorthSharing(groups.front(), exhausted));
+  EXPECT_TRUE(WorthSharing(groups.front())) << "the smaller filtered result fits with validity";
 }
 
 TEST(SharedSubPlansTest, RequiresTheWholeDisjunctionWithinThePlanningBudget) {
