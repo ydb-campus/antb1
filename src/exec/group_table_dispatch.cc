@@ -4,19 +4,24 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/compute/api_vector.h>
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
 #include "antb1/exec/memory_budget.h"
 
+#include "double_key.h"
 #include "group_table.h"
+#include "group_vector.h"
 
 namespace antb1::exec {
 namespace {
@@ -58,6 +63,55 @@ std::size_t SelectRows(const arrow::BooleanArray* selection, std::size_t start, 
   return n;
 }
 
+// Usually the original arrays already contain canonical values at all selected positions.
+// If an accepted -0 or NaN needs a rewrite, keep only the selected grouping keys together in
+// source order. The aggregate payload and the first-seen spellings stay in the original batch.
+arrow::Result<std::optional<arrow::compute::ExecBatch>> CompactDoubleKeys(
+    const arrow::compute::ExecBatch& keys, std::span<const std::uint32_t> rows,
+    arrow::compute::ExecContext* ctx, MemoryBudget* budget, MemoryReservation& metadata) {
+  const bool needs_change = std::ranges::any_of(keys.values, [&](const arrow::Datum& key) {
+    return key.type()->id() == arrow::Type::DOUBLE &&
+           NeedsDoubleKeyNormalization(arrow::DoubleArray(key.array()), rows);
+  });
+  if (!needs_change) {
+    return std::nullopt;
+  }
+  metadata.Reset(budget);
+  const auto charge = [&](std::size_t count, std::size_t width) {
+    const auto available =
+        static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max() - metadata.bytes());
+    if (count > available / width) {
+      return arrow::Status::CapacityError("compact grouping key metadata size overflow");
+    }
+    return metadata.Resize(metadata.bytes() + Narrow<std::int64_t>(count * width));
+  };
+  // Each compact fixed-width column keeps an ArrayData and two buffer pointers. The pool
+  // already accounts for the values and validity bytes. Keep the metadata charge through use.
+  constexpr auto kBufferPtr = sizeof(std::shared_ptr<arrow::Buffer>);
+  ARROW_RETURN_NOT_OK(charge(keys.values.size(), sizeof(arrow::ArrayData) + (2 * kBufferPtr)));
+  std::vector<arrow::Datum> compact;
+  ARROW_RETURN_NOT_OK(ReserveGroupVector(compact, keys.values.size(), metadata));
+  const auto length = Narrow<std::int64_t>(rows.size());
+  const arrow::UInt32Array indices(length, arrow::Buffer::Wrap(rows.data(), length));
+  for (const auto& key : keys.values) {
+    if (key.type()->id() == arrow::Type::DOUBLE) {
+      ARROW_ASSIGN_OR_RAISE(
+          auto column, SelectDoubleKeys(arrow::DoubleArray(key.array()), rows, ctx->memory_pool()));
+      compact.emplace_back(std::move(column));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(
+          auto column, arrow::compute::Take(*key.make_array(), indices,
+                                            arrow::compute::TakeOptions::NoBoundsCheck(), ctx));
+      compact.emplace_back(std::move(column));
+    }
+    const auto capacity = compact.back().array()->buffers.capacity();
+    if (capacity > 2) {
+      ARROW_RETURN_NOT_OK(charge(capacity - 2, kBufferPtr));
+    }
+  }
+  return arrow::compute::ExecBatch(std::move(compact), length);
+}
+
 }  // namespace
 
 arrow::Status GroupTable::ConsumeSelected(const arrow::RecordBatch& rows,
@@ -75,14 +129,27 @@ arrow::Status GroupTable::ConsumeSelected(const arrow::RecordBatch& rows,
           if (mask == nullptr) {
             return ConsumeRows(batch, nullptr);
           }
-          ARROW_ASSIGN_OR_RAISE(auto keys, NormalizedKeys(batch));
+          const auto selected = Narrow<std::size_t>(mask->true_count());
+          if (selected == 0) {
+            return arrow::Status::OK();
+          }
+          ARROW_ASSIGN_OR_RAISE(auto keys, InputKeys(batch, /*normalize_doubles=*/false));
           const auto size = Narrow<std::size_t>(batch.num_rows());
           PoolVector<std::uint32_t> indices(pool_);
-          ARROW_RETURN_NOT_OK(indices.Resize(std::min(size, kDispatchRows)));
+          ARROW_RETURN_NOT_OK(indices.Resize(std::min(selected, kDispatchRows)));
           for (std::size_t i = 0; i < size; i += kDispatchRows) {
             const auto n = SelectRows(mask, i, std::min(size - i, kDispatchRows), indices.data());
             if (n > 0) {
-              ARROW_RETURN_NOT_OK(ConsumeProgram(batch, keys, std::span(indices.data(), n)));
+              const std::span<const std::uint32_t> source_rows(indices.data(), n);
+              MemoryReservation metadata;
+              ARROW_ASSIGN_OR_RAISE(
+                  auto compact,
+                  CompactDoubleKeys(keys, source_rows, kernels_.get(), memory_.budget(), metadata));
+              if (compact) {
+                ARROW_RETURN_NOT_OK(ConsumeProgram(batch, *compact, {}, source_rows));
+              } else {
+                ARROW_RETURN_NOT_OK(ConsumeProgram(batch, keys, source_rows, source_rows));
+              }
             }
           }
           return arrow::Status::OK();
@@ -185,10 +252,11 @@ arrow::Status PartitionedGroupTables::Dispatch(const arrow::RecordBatch& rows,
                                                const arrow::BooleanArray* selection,
                                                std::chrono::nanoseconds* dispatch_elapsed) {
   const auto size = Narrow<std::size_t>(rows.num_rows());
-  if (size == 0) {
+  const auto kept = selection != nullptr ? Narrow<std::size_t>(selection->true_count()) : size;
+  if (kept == 0) {
     return arrow::Status::OK();
   }
-  const auto width = std::min(size, kDispatchRows);
+  const auto width = std::min(kept, kDispatchRows);
   // Stage replacement scratch before releasing its old buffer so the budget sees the overlap.
   if (hashes_.size() < width) {
     PoolVector<std::uint64_t> hashes(prototype_->pool_);
@@ -200,24 +268,39 @@ arrow::Status PartitionedGroupTables::Dispatch(const arrow::RecordBatch& rows,
   }
   using Clock = std::chrono::steady_clock;
   const auto before_keys = dispatch_elapsed != nullptr ? Clock::now() : Clock::time_point{};
-  ARROW_ASSIGN_OR_RAISE(const auto keys, prototype_->NormalizedKeys(rows));
+  ARROW_ASSIGN_OR_RAISE(const auto raw_keys, prototype_->InputKeys(rows, selection == nullptr));
   if (dispatch_elapsed != nullptr) {
     *dispatch_elapsed += Clock::now() - before_keys;
   }
   auto* const selected = rows_.data();
   auto* const order = selected + width;
   const auto lane_mask = lanes_.size() - 1;
-  for (std::size_t i = 0; i < size; i += width) {
+  for (std::size_t i = 0; i < size; i += kDispatchRows) {
     const auto start = dispatch_elapsed != nullptr ? Clock::now() : Clock::time_point{};
-    const auto n = SelectRows(selection, i, std::min(size - i, width), selected);
+    const auto n = SelectRows(selection, i, std::min(size - i, kDispatchRows), selected);
     if (n == 0) {
       if (dispatch_elapsed != nullptr) {
         *dispatch_elapsed += Clock::now() - start;
       }
       continue;
     }
+    MemoryReservation metadata;
+    std::optional<arrow::compute::ExecBatch> compact;
+    PoolVector<std::uint32_t> source_order(prototype_->pool_);
+    std::span<const std::uint32_t> key_rows(selected, n);
+    if (selection != nullptr) {
+      ARROW_ASSIGN_OR_RAISE(compact,
+                            CompactDoubleKeys(raw_keys, key_rows, prototype_->kernels_.get(),
+                                              prototype_->memory_.budget(), metadata));
+    }
+    if (compact) {
+      ARROW_RETURN_NOT_OK(source_order.Resize(n));
+      std::ranges::iota(std::span(source_order.data(), n), 0U);
+      key_rows = {source_order.data(), n};
+    }
+    const auto& keys = compact ? *compact : raw_keys;
     const std::span hashes(hashes_.data(), n);
-    ARROW_RETURN_NOT_OK(SelectedGroupHashes(keys, {selected, n}, hashes));
+    ARROW_RETURN_NOT_OK(SelectedGroupHashes(keys, key_rows, hashes));
     std::array<std::size_t, GroupTable::kPartitions + 1> starts{};
     for (const auto hash : hashes) {
       ++starts[(hash & lane_mask) + 1];
@@ -227,7 +310,14 @@ arrow::Status PartitionedGroupTables::Dispatch(const arrow::RecordBatch& rows,
                      starts.begin());
     auto next = starts;
     for (std::size_t row = 0; row < n; ++row) {
-      order[next[hashes[row] & lane_mask]++] = selected[row];
+      order[next[hashes[row] & lane_mask]++] = key_rows[row];
+    }
+    std::span<const std::uint32_t> input_order(order, n);
+    if (compact) {
+      for (std::size_t row = 0; row < n; ++row) {
+        source_order[row] = selected[order[row]];
+      }
+      input_order = {source_order.data(), n};
     }
     if (dispatch_elapsed != nullptr) {
       *dispatch_elapsed += Clock::now() - start;
@@ -242,7 +332,8 @@ arrow::Status PartitionedGroupTables::Dispatch(const arrow::RecordBatch& rows,
         ARROW_RETURN_NOT_OK(CreateLane(lane));
       }
       const auto before = table->num_groups();
-      ARROW_RETURN_NOT_OK(table->ConsumeProgram(rows, keys, {order + starts[lane], count}));
+      ARROW_RETURN_NOT_OK(table->ConsumeProgram(rows, keys, {order + starts[lane], count},
+                                                input_order.subspan(starts[lane], count)));
       groups_ += table->num_groups() - before;
       if (groups_ > options_.max_groups) {
         return arrow::Status::OutOfMemory("a GROUP BY of more than ", options_.max_groups,

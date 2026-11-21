@@ -158,7 +158,8 @@ Automatic execution retains the existing adaptive local/raw policy.
 The ordinary part operator also accepts these layouts internally for comparisons. It checks eligibility before
 reading input. Partition top-N, unsupported key/state combinations, and aggregates with order-sensitive update
 errors (including AVG of DATE and wide DECIMAL or HUGEINT sums) use adaptive grouping. The query profile counts
-the parts that used each explicit layout and reports hash and dispatch time within the partitioned local update.
+rows, groups, layouts and promotions once per accepted part. Hash, dispatch and promotion times include work
+on completed parts that the scheduler subsequently retries.
 
 The `local_ms` counter covers table creation, insertion and updates. `merge_ms` includes freezing or partitioning
 the producers, building and merging the destination tables, and releasing them and the producers. `output_ms`

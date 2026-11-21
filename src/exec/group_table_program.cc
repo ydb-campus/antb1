@@ -26,7 +26,8 @@ const StoredKeyTable* GroupTable::StoredKeys() const {
 
 arrow::Status GroupTable::ConsumeProgram(const arrow::RecordBatch& rows,
                                          const arrow::compute::ExecBatch& keys,
-                                         std::span<const std::uint32_t> selection) {
+                                         std::span<const std::uint32_t> key_rows,
+                                         std::span<const std::uint32_t> source_rows) {
   ANTB1_CHECK(program_.has_value());
   ARROW_ASSIGN_OR_RAISE(const auto bound, program_->Bind(rows));
   std::uint32_t groups = num_groups_;
@@ -40,8 +41,8 @@ arrow::Status GroupTable::ConsumeProgram(const arrow::RecordBatch& rows,
         ARROW_RETURN_NOT_OK(first_rows.Reserve(after - groups));
         for (std::size_t i = 0; i < ids.size(); ++i) {
           if (ids[i] == groups) {
-            first_rows.UnsafeAppend(selection.empty() ? Narrow<std::int64_t>(offset + i)
-                                                      : selection[offset + i]);
+            first_rows.UnsafeAppend(source_rows.empty() ? Narrow<std::int64_t>(offset + i)
+                                                        : source_rows[offset + i]);
             ++groups;
           }
         }
@@ -50,11 +51,12 @@ arrow::Status GroupTable::ConsumeProgram(const arrow::RecordBatch& rows,
       ARROW_RETURN_NOT_OK(ResizeStates(after));
       groups = after;
     }
-    return selection.empty() ? bound.Consume(offset, ids)
-                             : bound.ConsumeSelected(selection.subspan(offset, ids.size()), ids);
+    return source_rows.empty()
+               ? bound.Consume(offset, ids)
+               : bound.ConsumeSelected(source_rows.subspan(offset, ids.size()), ids);
   };
-  ARROW_RETURN_NOT_OK(selection.empty() ? stored_keys_->ConsumeChunks(keys, update)
-                                        : stored_keys_->ConsumeSelected(keys, selection, update));
+  ARROW_RETURN_NOT_OK(key_rows.empty() ? stored_keys_->ConsumeChunks(keys, update)
+                                       : stored_keys_->ConsumeSelected(keys, key_rows, update));
   if (groups > num_groups_) {
     arrow::ArrayVector first;
     if (KeepsKeyChunks()) {
@@ -198,7 +200,7 @@ struct OutputMetadata {
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> GroupTable::NextOutputChunk(
     const std::shared_ptr<arrow::Schema>& schema) {
-  if (stored_output_ ? next_group_ == num_groups_ : next_chunk_ >= chunk_groups_.size()) {
+  if (stored_output_ ? next_group_ == num_groups_ : next_chunk_ >= chunk_ends_.size()) {
     return nullptr;
   }
   auto end = next_chunk_;

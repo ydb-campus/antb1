@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -1218,6 +1220,126 @@ TEST_F(GroupedAggregateTest, DoubleKeysGroupSignedZerosAndNaNs) {
     } else {
       EXPECT_EQ(k.Value(r), 1.5);
       EXPECT_EQ(n.Value(r), 1);
+    }
+  }
+}
+
+// A rejected noncanonical key must not force a copy of an entire input tile. The selected
+// spellings and aggregate arguments also have to follow the original row through lane dispatch.
+TEST_F(GroupedAggregateTest, SparseDoubleKeysFitBudgetAndKeepSelectedSpelling) {
+  constexpr auto kRows = std::int64_t{64} * 1024;
+  constexpr auto kLimit = std::int64_t{256} * 1024;  // dense DOUBLE values alone need 512 KiB
+  constexpr auto kNan = std::bit_cast<double>(0xfff8000000000033ULL);
+  constexpr auto kOtherNan = std::bit_cast<double>(0x7ff8000000000066ULL);
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::float64()), arrow::field("tag", arrow::boolean()),
+                     arrow::field("v", arrow::int64())});
+  constexpr std::size_t kOffset = 3;
+  std::vector<std::optional<std::int64_t>> bits(kRows + kOffset, std::bit_cast<std::int64_t>(-0.0));
+  std::vector<std::optional<std::int64_t>> payload(bits.size());
+  std::vector<std::optional<bool>> tags(bits.size(), false);
+  std::vector<std::optional<bool>> kept(bits.size(), false);
+  const auto put = [&](std::size_t row, std::optional<double> value, bool valid) {
+    const auto i = kOffset + row;
+    bits[i] = value ? std::optional(std::bit_cast<std::int64_t>(*value)) : std::nullopt;
+    payload[i] = valid ? std::optional<std::int64_t>(1) : std::nullopt;
+    tags[i] = true;
+    kept[i] = true;
+  };
+  put(31, 1.5, true);
+  const auto selected_mask = [&] {
+    return std::static_pointer_cast<arrow::BooleanArray>(testing::Bools(kept)->Slice(kOffset));
+  };
+  const auto one = selected_mask();
+  kept[kOffset + 31] = false;
+  kept[kOffset + 7] = std::nullopt;
+  put(71, -0.0, false);
+  put(95, kNan, true);
+  put(197, 0.0, false);
+  put(283, kOtherNan, false);
+  put(6009, -0.0, true);
+  put(6011, std::nullopt, true);
+  const auto sparse = selected_mask();
+  const auto column = testing::Int64s(bits)->View(arrow::float64()).ValueOrDie();
+  const auto batch =
+      arrow::RecordBatch::Make(schema, kRows + kOffset,
+                               {column, testing::Bools(tags), testing::Int64s(payload)})
+          ->Slice(kOffset);
+  const auto none = arrow::MakeArrayOfNull(arrow::boolean(), kRows).ValueOrDie();
+  const auto calls =
+      std::vector<plan::AggregateCall>{{.kind = AggKind::kCountStar, .type = LogicalType::kBigInt},
+                                       {.kind = AggKind::kCount,
+                                        .arg = Column(2, "v", LogicalType::kBigInt),
+                                        .type = LogicalType::kBigInt}};
+  using Counts = std::map<std::optional<std::uint64_t>, std::pair<std::int64_t, std::int64_t>>;
+  const Counts expected{{std::bit_cast<std::uint64_t>(1.5), {1, 1}},
+                        {std::bit_cast<std::uint64_t>(-0.0), {3, 1}},
+                        {std::bit_cast<std::uint64_t>(kNan), {2, 1}},
+                        {std::nullopt, {1, 1}}};
+  for (bool composite : {false, true}) {
+    auto keys = std::vector{Column(0, "k", LogicalType::kDouble)};
+    auto fields = arrow::FieldVector{schema->field(0)};
+    if (composite) {
+      keys.push_back(Column(1, "tag", LogicalType::kBoolean));
+      fields.push_back(schema->field(1));
+    }
+    fields.push_back(arrow::field("n", arrow::int64()));
+    fields.push_back(arrow::field("valid", arrow::int64()));
+    const auto output = arrow::schema(std::move(fields));
+    for (bool partitioned : {false, true}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "composite=" << composite << ", partitioned=" << partitioned);
+      MemoryBudget budget(kLimit);
+      Counts actual;
+      {
+        constexpr std::size_t kLanes = 4;
+        auto dest = GroupTable::MakeLocal(keys, calls, 3, &budget, &budget).ValueOrDie();
+        std::unique_ptr<PartitionedGroupTables> lanes;
+        if (partitioned) {
+          lanes = PartitionedGroupTables::Make(keys, calls, 3, &budget, &budget, true, kLanes)
+                      .ValueOrDie();
+        }
+        const auto consume = [&](const arrow::BooleanArray& mask) {
+          return lanes ? lanes->Consume(*batch, &mask) : dest->ConsumeSelected(*batch, &mask);
+        };
+        MemoryReservation pressure;
+        pressure.Reset(&budget);
+        ASSERT_TRUE(pressure.Resize(kLimit - budget.bytes_allocated()).ok());
+        ASSERT_TRUE(consume(static_cast<const arrow::BooleanArray&>(*none)).ok());
+        pressure.Release();
+        ASSERT_TRUE(consume(*one).ok());
+        ASSERT_TRUE(consume(*sparse).ok());
+        if (lanes) {
+          EXPECT_EQ(lanes->num_groups(), expected.size());
+          ASSERT_TRUE(lanes->Finish().ok());
+          for (std::size_t lane = 0; lane < kLanes; ++lane) {
+            if (auto local = lanes->ReleasePartition(lane)) {
+              ASSERT_TRUE(dest->Merge(*local).ok());
+            }
+          }
+        }
+        for (;;) {
+          const auto result = dest->NextChunk(output).ValueOrDie();
+          if (!result) {
+            break;
+          }
+          const auto& values = static_cast<const arrow::DoubleArray&>(*result->column(0));
+          const auto& n = static_cast<const arrow::Int64Array&>(*result->column(composite ? 2 : 1));
+          const auto& valid =
+              static_cast<const arrow::Int64Array&>(*result->column(composite ? 3 : 2));
+          for (std::int64_t row = 0; row < result->num_rows(); ++row) {
+            if (composite) {
+              EXPECT_TRUE(static_cast<const arrow::BooleanArray&>(*result->column(1)).Value(row));
+            }
+            const auto key_bits =
+                values.IsNull(row) ? std::nullopt
+                                   : std::optional(std::bit_cast<std::uint64_t>(values.Value(row)));
+            EXPECT_TRUE(actual.emplace(key_bits, std::pair{n.Value(row), valid.Value(row)}).second);
+          }
+        }
+      }
+      EXPECT_EQ(actual, expected);
+      EXPECT_EQ(budget.bytes_allocated(), 0);
     }
   }
 }

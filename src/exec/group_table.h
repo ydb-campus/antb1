@@ -180,7 +180,8 @@ class GroupTable {
  private:
   friend class PartitionedGroupTables;
   friend class CardinalityLocalGroups;
-  arrow::Result<arrow::compute::ExecBatch> NormalizedKeys(const arrow::RecordBatch& rows) const;
+  arrow::Result<arrow::compute::ExecBatch> InputKeys(const arrow::RecordBatch& rows,
+                                                     bool normalize_doubles = true) const;
   GroupTable(std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
              arrow::MemoryPool* pool, bool first_keys);
 
@@ -195,7 +196,7 @@ class GroupTable {
   // The same groups, from the batch of part's keys this table has just consumed (row i the keys of
   // the part group that became to[i]) rather than from part's first_keys_: what a part that keeps
   // no first-seen keys has handed over already. One Take a column a chunk, where AddPartGroups
-  // needs two and a Concatenate to gather the same values out of part's chunks.
+  // gathers those values directly from the referenced first-key chunks.
   arrow::Status AddUniqueGroups(const arrow::compute::ExecBatch& keys,
                                 std::span<const std::uint32_t> to, std::uint32_t after);
   // Adds one new group per position, in order, with the keys of row positions[i] of `keys`, in
@@ -223,9 +224,12 @@ class GroupTable {
                                      const arrow::compute::ExecBatch& keys,
                                      std::span<const std::uint32_t> from);
   arrow::Status ConsumeRows(const arrow::RecordBatch& rows, std::vector<std::uint32_t>* group_ids);
+  // Key and source rows may differ when selected DOUBLE key values were compacted. Aggregate
+  // arguments and first-seen key spellings always refer to the original record batch.
   arrow::Status ConsumeProgram(const arrow::RecordBatch& rows,
                                const arrow::compute::ExecBatch& keys,
-                               std::span<const std::uint32_t> selection = {});
+                               std::span<const std::uint32_t> key_rows,
+                               std::span<const std::uint32_t> source_rows);
   arrow::Status MergeStoredChunks(const GroupTable& source,
                                   std::optional<std::span<const std::uint32_t>> selection);
   arrow::Status MergeStoredGroups(const GroupTable& source, std::span<const std::uint32_t> from);
@@ -259,7 +263,7 @@ class GroupTable {
   StoredKeyTable* stored_keys_ = nullptr;  // mutable until FreezePartitions hands over key_table_
   bool stored_output_ = false;             // first-seen keys equal the stored representation
   std::vector<std::vector<std::shared_ptr<arrow::Array>>> first_keys_;  // per key, per chunk
-  std::vector<std::uint32_t> chunk_groups_;  // the number of new groups of each chunk
+  std::vector<std::uint32_t> chunk_ends_;  // exclusive end group ID of each first-key chunk
   std::uint32_t num_groups_ = 0;
   std::size_t next_chunk_ = 0;  // NextChunk: the next chunk and the group it starts at
   std::uint32_t next_group_ = 0;

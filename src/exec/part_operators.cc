@@ -283,6 +283,29 @@ arrow::Result<std::unique_ptr<GroupTable>> MakePartTable(
                                GroupTable::kPartitions, kLocalFixedKeys);
 }
 
+// The scheduler may discard finished parts and replay them after an earlier allocation fails.
+// Count rows, groups and layouts when Next() hands the accepted result to its consumer.
+void RecordGroupCounts(ProfileNode& profile, const PartGroups& part, LocalGroupLayout layout) {
+  profile.Add("local_rows", MetricUnit::kCount, part.local_rows);
+  const auto groups = part.partitioned ? part.partitioned->num_groups() : part.table->num_groups();
+  profile.Add("local_groups", MetricUnit::kCount, Narrow<int64_t>(groups));
+  if (part.raw_rows > 0) {
+    profile.Add("raw_parts", MetricUnit::kCount, 1);
+    profile.Add("raw_rows", MetricUnit::kCount, part.raw_rows);
+  }
+  if (layout != LocalGroupLayout::kAdaptive) {
+    profile.Add(part.partitioned ? "partitioned_local_parts" : "single_local_parts",
+                MetricUnit::kCount, 1);
+  }
+  if (layout == LocalGroupLayout::kCardinality) {
+    profile.Add("hybrid_local_parts", MetricUnit::kCount, 1);
+    if (part.promoted_groups > 0) {
+      profile.Add("promoted_local_parts", MetricUnit::kCount, 1);
+      profile.Add("promoted_groups", MetricUnit::kCount, part.promoted_groups);
+    }
+  }
+}
+
 }  // namespace
 
 // ---- PartGrouper ----
@@ -348,7 +371,7 @@ arrow::Status PartGrouper::AddLocal(const arrow::RecordBatch& rows,
     ARROW_RETURN_NOT_OK(groups_->table->ConsumeSelected(rows, selection));
   }
   if (profile != nullptr) {
-    consumed_ += selection != nullptr ? selection->true_count() : rows.num_rows();
+    groups_->local_rows += selection != nullptr ? selection->true_count() : rows.num_rows();
   }
   return arrow::Status::OK();
 }
@@ -367,21 +390,21 @@ arrow::Status PartGrouper::Add(const arrow::RecordBatch& rows, ProfileNode* prof
         groups_->rows[p].push_back(std::move(split[p]));
       }
     }
-    routed_ += rows.num_rows();
+    groups_->raw_rows += rows.num_rows();
     return arrow::Status::OK();
   }
   {
     const ProfileTimer local(profile, "local_path");
     ARROW_RETURN_NOT_OK(table.Consume(rows));
   }
-  consumed_ += rows.num_rows();
+  groups_->local_rows += rows.num_rows();
   // A part that reduces less than 4 to 1 would insert most of its groups twice (its table, then the
   // partition's), which costs more than inserting its rows once in the partitions. The decision
   // waits for enough rows (a selective filter can leave a batch a few rows, which never reduce),
   // and is made once, from the part's data alone.
-  if (!decided_ && consumed_ >= decide_after_) {
+  if (!decided_ && groups_->local_rows >= decide_after_) {
     decided_ = true;
-    if (int64_t{table.num_groups()} * 4 > consumed_) {
+    if (int64_t{table.num_groups()} * 4 > groups_->local_rows) {
       route_ = true;
       groups_->rows.resize(GroupTable::kPartitions);
     }
@@ -402,33 +425,12 @@ arrow::Result<std::shared_ptr<PartGroups>> PartGrouper::Finish(ProfileNode* prof
     }
   }
   if (profile != nullptr) {
-    // What the local path bought: the rows the parts aggregated themselves and the groups they
-    // came to, so the reduction the routing rule tests can be read off rather than inferred from
-    // the group count. With local_path and routed_path -- each path's whole cost across both the
-    // workers and the lanes, summed over threads -- this says which path a query should have
-    // taken and why, which no single-threaded benchmark of the tables can show.
-    profile->Add("local_rows", MetricUnit::kCount, consumed_);
-    const auto groups =
-        groups_->partitioned ? groups_->partitioned->num_groups() : groups_->table->num_groups();
-    profile->Add("local_groups", MetricUnit::kCount, Narrow<int64_t>(groups));
-    if (layout_ != LocalGroupLayout::kAdaptive) {
-      profile->Add(groups_->partitioned ? "partitioned_local_parts" : "single_local_parts",
-                   MetricUnit::kCount, 1);
-    }
-    if (cardinality_) {
-      profile->Add("hybrid_local_parts", MetricUnit::kCount, 1);
-      if (cardinality_->promoted()) {
-        profile->Add("promoted_local_parts", MetricUnit::kCount, 1);
-        profile->Add("promoted_groups", MetricUnit::kCount, cardinality_->promoted_groups());
-        profile->Add("local_promotion", MetricUnit::kNanos, promotion_elapsed_.count());
-      }
+    if (cardinality_ && cardinality_->promoted()) {
+      groups_->promoted_groups = cardinality_->promoted_groups();
+      profile->Add("local_promotion", MetricUnit::kNanos, promotion_elapsed_.count());
     }
     if (groups_->partitioned) {
       profile->Add("local_hash_dispatch", MetricUnit::kNanos, dispatch_elapsed_.count());
-    }
-    if (routed_ > 0) {
-      profile->Add("raw_parts", MetricUnit::kCount, 1);
-      profile->Add("raw_rows", MetricUnit::kCount, routed_);
     }
   }
   return std::move(groups_);
@@ -514,6 +516,9 @@ arrow::Status PartGroupAggregateOperator::Merge() {
     if (!part.ok()) {
       status = part.status();
       break;
+    }
+    if (profile() != nullptr) {
+      RecordGroupCounts(*profile(), **part, layout_);
     }
     const std::size_t partitions =
         (*part)->partitioned ? GroupTable::kPartitions : (*part)->table->num_partitions();
@@ -772,7 +777,11 @@ arrow::Status PartGroupingSetsOperator::Merge() {
       break;
     }
     for (std::size_t i = 0; i < roots_.size(); ++i) {
-      ANTB1_CHECK((**part)[i]->table->num_partitions() == tables_[roots_[i]].size());
+      const auto& root = *(**part)[i];
+      ANTB1_CHECK(root.table->num_partitions() == tables_[roots_[i]].size());
+      if (profile() != nullptr) {
+        RecordGroupCounts(*profile(), root, LocalGroupLayout::kAdaptive);
+      }
     }
     status = lanes.Add(index, [this, roots = *std::move(part)](std::size_t p) -> arrow::Status {
       for (std::size_t i = 0; i < roots_.size(); ++i) {

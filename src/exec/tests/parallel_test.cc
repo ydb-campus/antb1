@@ -2,6 +2,7 @@
 // and the part operators the physical planner builds, on one thread and on a 4-thread pool.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -1227,6 +1228,30 @@ void CheckLocalGroupLayouts(arrow::internal::Executor* pool) {
   }
 }
 
+// Finish the first scheduling window before the caller examines part 0's injected OOM.
+// Later submissions use the existing pool so the merge lanes run normally.
+class CompleteFirstWindow final : public arrow::internal::Executor {
+ public:
+  CompleteFirstWindow(arrow::internal::Executor* pool, int64_t parts)
+      : pool_(pool), parts_(parts) {}
+  int GetCapacity() override { return pool_->GetCapacity(); }
+
+ protected:
+  arrow::Status SpawnReal(arrow::internal::TaskHints hints, arrow::internal::FnOnce<void()> task,
+                          arrow::StopToken stop, StopCallback&& callback) override {
+    if (spawns_++ < parts_) {
+      std::move(task)();
+      return arrow::Status::OK();
+    }
+    return pool_->Spawn(hints, std::move(task), std::move(stop), std::move(callback));
+  }
+
+ private:
+  arrow::internal::Executor* pool_;
+  int64_t parts_;
+  std::atomic<int64_t> spawns_ = 0;
+};
+
 // A low-cardinality part and the prefix of a promoted part share keys. Both handoffs must
 // reach the same destination partitions and retain the ordinary part order.
 void CheckMixedCardinalityParts(arrow::internal::Executor* pool) {
@@ -1248,11 +1273,16 @@ void CheckMixedCardinalityParts(arrow::internal::Executor* pool) {
           arrow::RecordBatch::Make(schema, 3, {Int64s({0, 1, kFirstBatch - 1})}),
           arrow::RecordBatch::Make(schema, kFirstBatch + 2, {Int64s(keys)})},
       true);
-  const PartPipeline pipeline = [table](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
-    return std::make_unique<TableScanOperator>(table, std::vector<int>{0}, part);
-  };
+  CompleteFirstWindow replay(pool, table->num_parts());
   const auto run = [&](LocalGroupLayout layout, arrow::internal::Executor* executor,
                        MemoryBudget& memory, ProfileNode& profile) {
+    bool fail_first = executor == &replay;
+    const PartPipeline pipeline = [&](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+      if (part == 0 && std::exchange(fail_first, false)) {
+        return arrow::Status::OutOfMemory("retry the first local table");
+      }
+      return std::make_unique<TableScanOperator>(table, std::vector<int>{0}, part);
+    };
     PartGroupAggregateOperator op(pipeline, table->num_parts(), 1, {k}, {count}, output,
                                   std::nullopt, layout);
     op.set_profile(&profile);
@@ -1268,7 +1298,9 @@ void CheckMixedCardinalityParts(arrow::internal::Executor* pool) {
       run(LocalGroupLayout::kSingle, nullptr, reference_memory, reference_profile);
   ASSERT_TRUE(expected.ok()) << expected.status();
   ASSERT_EQ((*expected)->num_rows(), kFirstBatch);
-  for (auto* executor : {static_cast<arrow::internal::Executor*>(nullptr), pool}) {
+  for (arrow::internal::Executor* executor :
+       std::array<arrow::internal::Executor*, 3>{nullptr, pool, &replay}) {
+    const auto previous_scans = std::ranges::count(table->scanned_parts(), 1);
     MemoryBudget memory(std::nullopt);
     ProfileNode profile;
     {
@@ -1276,6 +1308,11 @@ void CheckMixedCardinalityParts(arrow::internal::Executor* pool) {
       ASSERT_TRUE(result.ok()) << result.status();
       EXPECT_TRUE(SameRows(**result, **expected));
     }
+    // On replay the promoted part completed two scans. Only its accepted result contributes.
+    EXPECT_EQ(std::ranges::count(table->scanned_parts(), 1) - previous_scans,
+              executor == &replay ? 2 : 1);
+    EXPECT_EQ(MetricValue(profile, "local_rows"), kFirstBatch + 5);
+    EXPECT_EQ(MetricValue(profile, "local_groups"), kFirstBatch + 3);
     EXPECT_EQ(MetricValue(profile, "hybrid_local_parts"), 2);
     EXPECT_EQ(MetricValue(profile, "single_local_parts"), 1);
     EXPECT_EQ(MetricValue(profile, "partitioned_local_parts"), 1);

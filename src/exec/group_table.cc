@@ -29,6 +29,7 @@
 #include "antb1/plan/types.h"
 
 #include "double_key.h"
+#include "gather.h"
 #include "group_vector.h"
 #include "grouped_sum_alias.h"
 #include "key_routing_hash.h"
@@ -307,7 +308,7 @@ arrow::Status GroupTable::AddGroups(std::uint32_t after,
   ARROW_RETURN_NOT_OK(ResizeStates(after));
   if (!program_.has_value() || KeepsKeyChunks()) {
     if (program_) {
-      ARROW_RETURN_NOT_OK(ReserveGroupVector(chunk_groups_, chunk_groups_.size() + 1, memory_));
+      ARROW_RETURN_NOT_OK(ReserveGroupVector(chunk_ends_, chunk_ends_.size() + 1, memory_));
       for (auto& chunks : first_keys_) {
         ARROW_RETURN_NOT_OK(ReserveGroupVector(chunks, chunks.size() + 1, memory_));
       }
@@ -315,7 +316,7 @@ arrow::Status GroupTable::AddGroups(std::uint32_t after,
     for (std::size_t k = 0; k < keys.size(); ++k) {
       first_keys_[k].push_back(std::move(keys[k]));
     }
-    chunk_groups_.push_back(after - num_groups_);
+    chunk_ends_.push_back(after);
   }
   num_groups_ = after;
   return arrow::Status::OK();
@@ -338,17 +339,17 @@ arrow::Result<std::shared_ptr<arrow::UInt32Array>> GroupTable::Lookup(
     return arrow::Status::Invalid("lookup on a frozen group table");
   }
   ANTB1_CHECK(!keys_.empty());
-  ARROW_ASSIGN_OR_RAISE(auto keys, NormalizedKeys(rows));
+  ARROW_ASSIGN_OR_RAISE(auto keys, InputKeys(rows));
   return key_table_->Lookup(keys);
 }
 
-arrow::Result<arrow::compute::ExecBatch> GroupTable::NormalizedKeys(
-    const arrow::RecordBatch& rows) const {
+arrow::Result<arrow::compute::ExecBatch> GroupTable::InputKeys(const arrow::RecordBatch& rows,
+                                                               bool normalize_doubles) const {
   std::vector<arrow::Datum> keys;
   keys.reserve(keys_.size());
   for (const plan::BoundColumn& key : keys_) {
     std::shared_ptr<arrow::Array> column = rows.column(key.index);
-    if (key.type == plan::LogicalType::kDouble) {
+    if (normalize_doubles && key.type == plan::LogicalType::kDouble) {
       ARROW_ASSIGN_OR_RAISE(column, NormalizeDoubleKey(column, pool_));
     }
     keys.emplace_back(std::move(column));
@@ -374,9 +375,9 @@ arrow::Status GroupTable::ConsumeRows(const arrow::RecordBatch& rows,
     no_keys.assign(static_cast<std::size_t>(n), 0);
     group_ids = no_keys;
   } else {
-    ARROW_ASSIGN_OR_RAISE(const auto key_batch, NormalizedKeys(rows));
+    ARROW_ASSIGN_OR_RAISE(const auto key_batch, InputKeys(rows));
     if (program_ && group_ids_out == nullptr) {
-      return ConsumeProgram(rows, key_batch);
+      return ConsumeProgram(rows, key_batch, {}, {});
     }
     ARROW_ASSIGN_OR_RAISE(ids, key_table_->Consume(key_batch));
     group_ids = ids.ids;
@@ -470,65 +471,40 @@ arrow::Status GroupTable::AddPartGroups(const GroupTable& part, std::span<const 
 
 arrow::Status GroupTable::AddPartKeyRows(const GroupTable& part,
                                          std::span<const std::uint32_t> source) {
-  // Where each part group's keys are: its chunk and row there.
-  std::vector<std::uint32_t> chunk_start;
-  chunk_start.reserve(part.chunk_groups_.size());
+  // chunk_ends_ is built as groups arrive. Resolve only the requested IDs, once for all columns.
+  // Consecutive groups in a source chunk reuse the previous lookup. A partition can skip chunks
+  // and a backend can assign destination IDs out of source order.
+  MemoryReservation scratch;
+  scratch.Reset(memory_.budget());
+  std::vector<GroupKeyRow> refs;
+  ARROW_RETURN_NOT_OK(ReserveGroupVector(refs, std::min(source.size(), kMaxMergeChunk), scratch));
+  std::uint32_t chunk = 0;
   std::uint32_t start = 0;
-  for (const std::uint32_t groups : part.chunk_groups_) {
-    chunk_start.push_back(start);
-    start += groups;
-  }
-  // New groups in chunks of at most kMaxMergeChunk, like the chunks Consume makes, so that no
-  // key array (nor a Finalize range) grows with the part.
-  for (std::size_t begin = 0; begin < source.size(); begin += kMaxMergeChunk) {
-    const std::size_t end = std::min(source.size(), begin + kMaxMergeChunk);
-    // Per part chunk, the rows this slice takes from it; `order` puts them back in slice order.
-    std::vector<std::vector<std::int64_t>> rows(part.chunk_groups_.size());
-    std::vector<std::pair<std::size_t, std::size_t>> at;  // (chunk, index in rows[chunk])
-    at.reserve(end - begin);
-    for (std::size_t i = begin; i < end; ++i) {
-      const auto chunk = static_cast<std::size_t>(std::ranges::upper_bound(chunk_start, source[i]) -
-                                                  chunk_start.begin() - 1);
-      at.emplace_back(chunk, rows[chunk].size());
-      rows[chunk].push_back(static_cast<std::int64_t>(source[i] - chunk_start[chunk]));
-    }
-    std::vector<std::int64_t> offsets(rows.size(), 0);
-    std::int64_t total = 0;
-    for (std::size_t c = 0; c < rows.size(); ++c) {
-      offsets[c] = total;
-      total += static_cast<std::int64_t>(rows[c].size());
-    }
-    arrow::Int64Builder order_builder(pool_);
-    for (const auto& [chunk, index] : at) {
-      ARROW_RETURN_NOT_OK(order_builder.Append(offsets[chunk] + static_cast<std::int64_t>(index)));
-    }
-    ARROW_ASSIGN_OR_RAISE(const auto order, order_builder.Finish());
-    std::vector<std::shared_ptr<arrow::Array>> first;
-    first.reserve(keys_.size());
-    for (const auto& chunks : part.first_keys_) {
-      arrow::ArrayVector pieces;
-      for (std::size_t c = 0; c < rows.size(); ++c) {
-        if (rows[c].empty()) {
-          continue;
-        }
-        arrow::Int64Builder indices(pool_);
-        ARROW_RETURN_NOT_OK(indices.AppendValues(rows[c]));
-        ARROW_ASSIGN_OR_RAISE(const auto taken_rows, indices.Finish());
-        ARROW_ASSIGN_OR_RAISE(
-            const arrow::Datum piece,
-            arrow::compute::Take(chunks[c], taken_rows,
-                                 arrow::compute::TakeOptions::NoBoundsCheck(), kernels_.get()));
-        pieces.push_back(piece.make_array());
+  std::uint32_t end = 0;
+  while (!source.empty()) {
+    const auto slice = source.first(std::min(kMaxMergeChunk, source.size()));
+    refs.clear();
+    for (const auto group : slice) {
+      if (group < start || group >= end) {
+        const auto pos = std::ranges::upper_bound(part.chunk_ends_, group);
+        ANTB1_DCHECK(pos != part.chunk_ends_.end());
+        chunk = Narrow<std::uint32_t>(pos - part.chunk_ends_.begin());
+        start = chunk == 0 ? 0 : part.chunk_ends_[chunk - 1];
+        end = *pos;
       }
-      ARROW_ASSIGN_OR_RAISE(const auto slice, arrow::Concatenate(pieces, pool_));
-      ARROW_ASSIGN_OR_RAISE(
-          const arrow::Datum ordered,
-          arrow::compute::Take(slice, order, arrow::compute::TakeOptions::NoBoundsCheck(),
-                               kernels_.get()));
-      first.push_back(ordered.make_array());
+      refs.push_back({.chunk = chunk, .row = group - start});
+    }
+    MemoryReservation columns_memory;
+    columns_memory.Reset(memory_.budget());
+    arrow::ArrayVector first;
+    ARROW_RETURN_NOT_OK(ReserveGroupVector(first, keys_.size(), columns_memory));
+    for (const auto& chunks : part.first_keys_) {
+      ARROW_ASSIGN_OR_RAISE(auto keys, GatherGroupKeys(chunks, refs, pool_));
+      first.push_back(std::move(keys));
     }
     ARROW_RETURN_NOT_OK(
-        AddGroups(num_groups_ + static_cast<std::uint32_t>(end - begin), std::move(first)));
+        AddGroups(num_groups_ + Narrow<std::uint32_t>(slice.size()), std::move(first)));
+    source = source.subspan(slice.size());
   }
   return arrow::Status::OK();
 }
@@ -661,7 +637,7 @@ arrow::Result<std::vector<std::uint64_t>> GroupTable::PrefixHashes(std::size_t p
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::RouteRows(
     const arrow::RecordBatch& rows) const {
   ANTB1_CHECK(!keys_.empty());
-  ARROW_ASSIGN_OR_RAISE(const auto keys, NormalizedKeys(rows));
+  ARROW_ASSIGN_OR_RAISE(const auto keys, InputKeys(rows));
   ARROW_ASSIGN_OR_RAISE(const auto hashes, KeyHashes(keys));
   // The rows in partition order (a stable counting sort), one Take, then a slice per partition.
   std::vector<std::int64_t> start(partitions_ + 1, 0);
@@ -830,7 +806,7 @@ arrow::Status GroupTable::Account() {
     // ReserveGroupVector already charged these capacities, including each growth overlap.
     return arrow::Status::OK();
   }
-  auto bytes = Narrow<std::int64_t>(chunk_groups_.capacity() * sizeof(std::uint32_t));
+  auto bytes = Narrow<std::int64_t>(chunk_ends_.capacity() * sizeof(std::uint32_t));
   for (const auto& state : states_) {
     bytes += state->memory_usage();
   }
@@ -872,16 +848,17 @@ std::uint32_t GroupTable::OutputRows(std::size_t& end) const {
   // one binary array.
   std::uint32_t rows = 0;
   int64_t bytes = 0;
-  while (end < chunk_groups_.size()) {
+  while (end < chunk_ends_.size()) {
     int64_t chunk_bytes = 0;
     for (const auto& chunks : first_keys_) {
       chunk_bytes += arrow::util::TotalBufferSize(*chunks[end]);
     }
+    const auto through_chunk = chunk_ends_[end] - next_group_;
     if (end > next_chunk_ &&
-        (rows + chunk_groups_[end] > kMaxMergeChunk || bytes + chunk_bytes > kMaxJoinedKeyBytes)) {
+        (through_chunk > kMaxMergeChunk || bytes + chunk_bytes > kMaxJoinedKeyBytes)) {
       break;
     }
-    rows += chunk_groups_[end];
+    rows = through_chunk;
     bytes += chunk_bytes;
     ++end;
   }

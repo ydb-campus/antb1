@@ -164,6 +164,9 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> KeepFirstRows(
 struct PartGroups {
   std::unique_ptr<GroupTable> table;
   std::unique_ptr<PartitionedGroupTables> partitioned;
+  int64_t local_rows = 0;
+  int64_t raw_rows = 0;
+  uint32_t promoted_groups = 0;
   std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> rows;  // per partition, or empty
 };
 
@@ -184,7 +187,7 @@ class PartGrouper {
   arrow::Status Add(const Batch& batch, ProfileNode* profile);
   // Adds a batch's rows (without a selection).
   arrow::Status Add(const arrow::RecordBatch& rows, ProfileNode* profile);
-  // Partitions the part's table, records the part's metrics, and hands its groups over.
+  // Partitions the part's table and hands the groups and their counts to the consumer.
   arrow::Result<std::shared_ptr<PartGroups>> Finish(ProfileNode* profile);
 
  private:
@@ -197,8 +200,6 @@ class PartGrouper {
   int64_t decide_after_ = 0;
   bool decided_ = true;
   bool route_ = false;
-  int64_t consumed_ = 0;
-  int64_t routed_ = 0;
   std::chrono::nanoseconds dispatch_elapsed_{};
   std::chrono::nanoseconds promotion_elapsed_{};
 };
