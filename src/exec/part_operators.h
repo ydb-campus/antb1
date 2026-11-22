@@ -236,7 +236,7 @@ class PartGroupAggregateOperator final : public PartSink {
 
  private:
   std::optional<std::size_t> routing_key_;
-  BatchPartition partition_{GroupTable::kPartitions};
+  BatchPartition partition_{.count = GroupTable::kPartitions};
 
   using PartTable = std::shared_ptr<PartGroups>;
 
@@ -309,7 +309,7 @@ class PartGroupingSetsOperator final : public PartSink {
 
  private:
   std::optional<std::size_t> routing_key_;
-  BatchPartition partition_{GroupTable::kPartitions};
+  BatchPartition partition_{.count = GroupTable::kPartitions};
 
   // A part's groups, per root (in roots_ order).
   using PartRoots = std::shared_ptr<std::vector<std::shared_ptr<PartGroups>>>;

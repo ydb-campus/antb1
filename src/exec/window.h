@@ -35,7 +35,7 @@ class WindowOperator final : public Operator {
   std::unique_ptr<State> state_;
   int distribution_column_ = -1;
   const BatchPartition* input_partition_ = nullptr;
-  BatchPartition output_partition_{1};
+  BatchPartition output_partition_{.count = 1};
   bool input_open_ = false;
   bool done_ = false;
 };
