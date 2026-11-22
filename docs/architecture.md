@@ -287,14 +287,24 @@ built once per part with a `TableScanOperator` of that part, so parts share no o
 part read the same builds, made once with the pipeline. `exec::PartScheduler` runs the parts on
 `ExecContext::executor` (an Arrow `ThreadPool` the `Session` owns when it has more than one thread) and hands their
 results back strictly in part order. `exec::Drain` creates a fresh scan context per execution; part pipelines and
-late-column fetches share it so independent readers can reuse file validation. At most
-2 × threads parts are running or finished but not yet taken, or 4 × threads under a sink that merges the parts into
+late-column fetches share it so independent readers can reuse file validation. The scheduler can have up to
+2 × threads submitted parts awaiting consumption, or 4 × threads under a sink that merges the parts into
 partial states (an aggregate or a top-N, a join's probe below one included), whose finished parts mostly hold far
 less than their rows: one slow part then holds up fewer of the others (ADR 0013, amended 2026-10-22). With one
 thread, each part runs on the calling thread
 when it is reached: the same code, so a result does not depend on the thread count. The first failing part in part
 order decides the error. Parts after the point where the consumer stops (a met `LIMIT`) are never started or are
 stopped at their next batch, and their errors are dropped.
+
+Parallel grouped aggregation that can route unaggregated rows starts with one outstanding scan part per worker.
+The coordinator watches for two conditions in the parts handed to the merge lanes. At least half the input rows
+must have been routed, and at least three quarters of the locally aggregated rows must have created groups.
+An empty sample or a sample below either threshold widens the scan window to four parts per worker.
+The coordinator checks the first part immediately, then checks totals for each block of eight parts, including
+the first part in the first block. Once wide, the window narrows again after two consecutive qualifying blocks.
+The scheduler drains already-submitted parts when the cap shrinks. Memory pressure can reduce either window
+further. The merge lanes can accept up to four parts per worker ahead of completion. Both stages share the
+query's worker pool.
 
 **Skipping parts.** The physical planner reads only the parts a pipeline's WHERE can match: for each part it asks
 `plan::Table::part_stats` (for Parquet, the row group's column chunk statistics from the footer: exact min, max and

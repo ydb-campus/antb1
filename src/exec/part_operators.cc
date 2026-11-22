@@ -306,6 +306,43 @@ void RecordGroupCounts(ProfileNode& profile, const PartGroups& part, LocalGroupL
   }
 }
 
+// Scan and merge share the executor. Start with one scan per worker; retain a short lookahead
+// when the destinations receive many raw rows and local grouping removes few duplicates.
+class GroupScanWindow {
+ public:
+  [[nodiscard]] bool narrow() const { return narrow_; }
+
+  void Observe(int64_t index, int64_t local_rows, std::uint32_t local_groups, int64_t raw_rows) {
+    constexpr int64_t kSampleParts = 8;
+    local_rows_ += local_rows;
+    local_groups_ += local_groups;
+    raw_rows_ += raw_rows;
+    if (index != 0 && (index + 1) % kSampleParts != 0) {
+      return;
+    }
+    const bool qualifies =
+        raw_rows_ > 0 && raw_rows_ >= local_rows_ && 4 * local_groups_ >= 3 * local_rows_;
+    if (index == 0) {
+      narrow_ = qualifies;  // widen early; this part still contributes to the first full sample
+      return;
+    }
+    // A wide window narrows after two consecutive qualifying samples. A narrow window widens
+    // immediately if a full sample stops qualifying.
+    narrow_ = qualifies && (narrow_ || previous_qualified_);
+    previous_qualified_ = qualifies;
+    local_rows_ = 0;
+    local_groups_ = 0;
+    raw_rows_ = 0;
+  }
+
+ private:
+  bool narrow_ = true;
+  bool previous_qualified_ = false;
+  Int128 local_rows_ = 0;
+  Int128 local_groups_ = 0;
+  Int128 raw_rows_ = 0;
+};
+
 }  // namespace
 
 // ---- PartGrouper ----
@@ -491,8 +528,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
         }));
     return grouper.Finish(profile);
   };
-  // The lanes take window_ as their max_pending (Merge): one value bounds the parts ahead of the
-  // consumer and the parts it has handed on, so that neither can change without the other.
+  // Merge keeps this full backlog for destination lanes. Its scan lookahead can be smaller.
   scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
                                                           window_, ctx.budget);
   return arrow::Status::OK();
@@ -508,10 +544,15 @@ arrow::Status PartGroupAggregateOperator::Merge() {
     }
   });
   arrow::Status status;
+  const bool tune_scans = executor_ != nullptr && layout_ == LocalGroupLayout::kAdaptive &&
+                          MayRouteRows(keys_, aggregates_);
+  const auto narrow_window = Narrow<int64_t>(threads_);
+  GroupScanWindow scan_window;
   for (int64_t index = 0; !scheduler_->done(); ++index) {
+    const bool narrow = tune_scans && scan_window.narrow();
     arrow::Result<PartTable> part = [&] {
       const ProfileTimer wait(profile(), "wait");
-      return scheduler_->Next();
+      return scheduler_->Next(narrow ? narrow_window : window_);
     }();
     if (!part.ok()) {
       status = part.status();
@@ -532,6 +573,9 @@ arrow::Status PartGroupAggregateOperator::Merge() {
       lanes = std::make_unique<PartitionLanes>(partitions, executor_, window_, budget_);
     }
     ANTB1_CHECK(tables_.size() == partitions);
+    const int64_t part_local_rows = (*part)->local_rows;
+    const int64_t part_raw_rows = (*part)->raw_rows;
+    const std::uint32_t part_local_groups = tune_scans ? (*part)->table->num_groups() : 0;
     status = lanes->Add(index, [this, groups = *std::move(part)](std::size_t p) -> arrow::Status {
       // The rest of each path's cost: a part's groups re-inserted here, against its routed rows
       // inserted here for the first time. Both add into the same metric as their part-side halves,
@@ -557,6 +601,12 @@ arrow::Status PartGroupAggregateOperator::Merge() {
     });
     if (!status.ok()) {
       break;
+    }
+    if (tune_scans) {
+      if (profile() != nullptr) {
+        profile()->Add(narrow ? "narrow_scan_parts" : "wide_scan_parts", MetricUnit::kCount, 1);
+      }
+      scan_window.Observe(index, part_local_rows, part_local_groups, part_raw_rows);
     }
   }
   scheduler_->set_before_retry(nullptr);
