@@ -73,11 +73,16 @@ class PartScheduler {
   [[nodiscard]] bool done() const { return stopped_ || next_result_ >= num_parts_; }
 
   // The result of the next part in order. Invalid once done().
-  arrow::Result<T> Next() {
+  arrow::Result<T> Next() { return Next(max_window_); }
+
+  // The consumer may cap both submissions for this call. A smaller cap lets previously submitted
+  // parts drain in order; a larger one is still subject to the scheduler's memory window.
+  arrow::Result<T> Next(int64_t scan_cap) {
     if (done()) {
       return arrow::Status::Invalid("part scheduler: no parts left");
     }
-    arrow::Result<T> result = Take();
+    scan_cap = std::max<int64_t>(1, scan_cap);
+    arrow::Result<T> result = Take(scan_cap);
     ++next_result_;
     if (!result.ok()) {
       Stop();
@@ -85,11 +90,11 @@ class PartScheduler {
     }
     if (executor_ != nullptr) {
       if (budget_ != nullptr && budget_->under_pressure()) {
-        window_ = std::max<int64_t>(1, window_ / 2);
-      } else {
-        window_ = std::min(max_window_, window_ + 1);
+        window_ = std::max<int64_t>(1, std::min(window_, scan_cap) / 2);
+      } else if (window_ < max_window_) {
+        ++window_;
       }
-      if (arrow::Status submitted = Submit(); !submitted.ok()) {  // keep the window full
+      if (arrow::Status submitted = Submit(scan_cap); !submitted.ok()) {  // keep the window full
         Stop();
         return submitted;
       }
@@ -97,7 +102,7 @@ class PartScheduler {
     return result;
   }
 
-  // The parts that may be in flight now (with an executor).
+  // The memory-adaptive window, before the consumer's cap for its next call.
   [[nodiscard]] int64_t window() const { return window_; }
 
   // Called before a part that ran out of memory runs again alone, once the parts ahead are
@@ -159,11 +164,11 @@ class PartScheduler {
   };
 
   // The result of part next_result_.
-  arrow::Result<T> Take() {
+  arrow::Result<T> Take(int64_t scan_cap) {
     if (executor_ == nullptr) {
       return shared_->Run(next_result_);
     }
-    ARROW_RETURN_NOT_OK(Submit());  // at least this part
+    ARROW_RETURN_NOT_OK(Submit(scan_cap));  // at least this part
     const arrow::Future<> future = std::move(in_flight_.front());
     in_flight_.pop_front();
     ARROW_RETURN_NOT_OK(future.status());
@@ -198,8 +203,9 @@ class PartScheduler {
   // could not be submitted (it started nothing): in_flight_ holds only the futures of submitted
   // tasks, which Drop() waits for. A failed Submit's status is returned, std::bad_alloc is
   // OutOfMemory, and any other exception goes on.
-  arrow::Status Submit() {
-    while (!stopped_ && next_submit_ < num_parts_ && std::cmp_less(in_flight_.size(), window_)) {
+  arrow::Status Submit(int64_t scan_cap) {
+    const int64_t limit = std::min(window_, scan_cap);
+    while (!stopped_ && next_submit_ < num_parts_ && std::cmp_less(in_flight_.size(), limit)) {
       if (!in_flight_.empty() && budget_ != nullptr && budget_->under_pressure()) {
         break;
       }

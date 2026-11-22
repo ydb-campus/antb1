@@ -52,7 +52,9 @@ int64_t PartWindow(const ExecContext& ctx);
 // decides how long one slow part holds the others up: a part takes as long as the bytes it reads,
 // and a part several times the mean fills a window of 2 * threads with finished parts while it
 // runs, which leaves the other threads idle (docs/adr/0013-parallel-execution.md, amended
-// 2026-10-22).
+// 2026-10-22). Ordinary grouping that can route raw rows also caps scan lookahead based on the
+// share of routed rows and the measured reduction in its local tables. Its merge lanes retain
+// the full window.
 int64_t MergeWindow(const ExecContext& ctx);
 
 // Opens the part's pipeline, hands every batch with selected rows to `consume` until it returns

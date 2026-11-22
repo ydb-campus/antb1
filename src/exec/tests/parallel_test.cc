@@ -341,6 +341,26 @@ TEST(PartSchedulerTest, PartsStartWithinTheWindow) {
   ASSERT_TRUE(inline_scheduler.Next().ok());
   ASSERT_TRUE(inline_scheduler.Next().ok());
   EXPECT_EQ(started->load(), 2);
+
+  // Count submissions on the caller so the assertions are independent of worker timing. Each
+  // successful call takes one part and refills only to its cap. A lower cap drains the submitted
+  // parts in order without replaying them.
+  testing::ThrowingExecutor counted(pool.get(), -1);
+  PartScheduler<int64_t> capped(16, task, &counted, 6);
+  int64_t part = 0;
+  const auto take = [&](int64_t cap, int expected_submissions) {
+    auto result = capped.Next(cap);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(*result, part++);
+    EXPECT_EQ(counted.spawns(), expected_submissions);
+  };
+  take(2, 3);
+  take(5, 7);
+  for (int i = 0; i < 4; ++i) {
+    take(1, 7);
+  }
+  take(1, 8);
+  take(20, 14);  // the scheduler's own maximum is six
 }
 
 // The first failed part in part order decides the error, whatever finishes first; the scheduler
@@ -434,7 +454,10 @@ TEST(PartSchedulerTest, OutOfMemoryInParallelFallsBackToOnePartAtATime) {
     ++retries;
   });
   for (int64_t part = 0; part < 10; ++part) {
-    ASSERT_TRUE(hooked.Next().ok());
+    ASSERT_TRUE(hooked.Next(part < 4 ? 2 : 4).ok());
+    if (part == 4) {
+      EXPECT_EQ(hooked.window(), 3);  // widening the cap after retry still honors backoff
+    }
   }
   EXPECT_EQ(retries, 1);
 
@@ -477,6 +500,14 @@ TEST(PartSchedulerTest, PressureNarrowsTheWindow) {
     next(part++);
     EXPECT_EQ(scheduler.window(), window);
   }
+  ASSERT_TRUE(budget.Reserve(600).ok());
+  const auto capped = scheduler.Next(2);
+  ASSERT_TRUE(capped.ok()) << capped.status().ToString();
+  EXPECT_EQ(*capped, part++);
+  EXPECT_EQ(scheduler.window(), 1);  // pressure halves the effective cap of 2
+  budget.Release(600);
+  next(part++);
+  EXPECT_EQ(scheduler.window(), 2);
   while (part < 20) {
     next(part++);
   }
@@ -917,8 +948,8 @@ TEST_F(PartOperatorsTest, ErrorsFollowPartOrder) {
   }
 }
 
-// A sink that merges parts into partial states keeps 4 * threads parts ahead of the consumer; one
-// that hands on each part's rows, 2 * threads (docs/adr/0013-parallel-execution.md, amended
+// The upper bound for a sink that merges partial states is 4 * threads; for one that hands on
+// each part's rows it is 2 * threads (docs/adr/0013-parallel-execution.md, amended
 // 2026-10-22). Without an executor each part runs when it is reached.
 TEST_F(PartOperatorsTest, MergingSinksKeepAWiderWindow) {
   const auto pool = Pool();
@@ -946,7 +977,7 @@ TEST_F(PartOperatorsTest, EachSinkOpensItsWindowAheadOfAFailedFirstPart) {
     std::size_t width;
     int64_t window;
   };
-  // The two windows, in the type the scheduler takes.
+  // Grouping that can route raw rows starts with one part per worker.
   constexpr int64_t kMergeWindow = int64_t{4} * kThreads;
   constexpr int64_t kPartWindow = int64_t{2} * kThreads;
   const std::vector<Shape> shapes = {
@@ -962,6 +993,17 @@ TEST_F(PartOperatorsTest, EachSinkOpensItsWindowAheadOfAFailedFirstPart) {
            [&](plan::LogicalNodePtr input) {
              return Node(plan::GroupAggregateNode{
                  .input = std::move(input), .keys = {y}, .aggregates = {count}});
+           },
+       .width = 2,
+       .window = kThreads},
+      {.name = "grouped DOUBLE sum",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             const plan::AggregateCall sum{.kind = plan::AggKind::kSum,
+                                           .arg = Column(1, "d", LogicalType::kDouble),
+                                           .type = LogicalType::kDouble};
+             return Node(plan::GroupAggregateNode{
+                 .input = std::move(input), .keys = {y}, .aggregates = {sum}});
            },
        .width = 2,
        .window = kMergeWindow},
@@ -1016,6 +1058,24 @@ TEST_F(PartOperatorsTest, EachSinkOpensItsWindowAheadOfAFailedFirstPart) {
     std::vector<int64_t> window(static_cast<std::size_t>(std::min(shape.window, kParts)));
     std::ranges::iota(window, int64_t{0});
     EXPECT_EQ(table->scanned_parts(), window) << shape.name;
+  }
+
+  // Fail as Next() first uses the feedback from the first accepted part. With three-row batches
+  // a seven-row part routes four rows and keeps its narrow target. A seven-row batch leaves no
+  // rows to route, so sixteen parts may already have been submitted beyond part zero.
+  for (const int batch_size : {3, 7}) {
+    SCOPED_TRACE(batch_size);
+    const auto table = Table();
+    table->FailPart(1);
+    const auto grouped =
+        Node(plan::GroupAggregateNode{.input = Scan(table), .keys = {y}, .aggregates = {count}});
+    const auto failed = Run(PlanOf(grouped, 2), pool.get(), batch_size);
+    ASSERT_TRUE(failed.status().IsIOError()) << failed.status().ToString();
+    EXPECT_EQ(failed.status().message(), "part 1 is broken");
+    const int64_t scanned = 1 + (batch_size == 3 ? kThreads : kMergeWindow);
+    std::vector<int64_t> expected(Narrow<std::size_t>(scanned));
+    std::ranges::iota(expected, int64_t{0});
+    EXPECT_EQ(table->scanned_parts(), expected);
   }
 }
 
@@ -2656,6 +2716,101 @@ std::shared_ptr<MemoryTable> RoutedTable(bool split) {
   return std::make_shared<MemoryTable>(schema, std::move(batches), true);
 }
 
+// Inspect the target at selected part boundaries and compare finalized rows with serial execution.
+void CheckGroupScanLookahead(arrow::internal::Executor* executor) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  arrow::RecordBatchVector batches;
+  const auto add_parts = [&](std::size_t parts, int rows, int distinct = 4) {
+    std::vector<std::optional<int64_t>> values;
+    values.reserve(Narrow<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+      values.emplace_back(i % distinct);
+    }
+    batches.insert(batches.end(), parts, arrow::RecordBatch::Make(schema, rows, {Int64s(values)}));
+  };
+  // The first part widens immediately. It also takes the complete first sample below the local
+  // group threshold; the seven remaining parts alone would meet the threshold exactly.
+  add_parts(1, 8, 1);
+  add_parts(7, 12, 3);
+  // A single heavy part gives the second sample exactly half routed rows. The third sample
+  // has exactly three local groups per four local rows. Together they narrow the window.
+  add_parts(1, 36);
+  add_parts(7, 4);
+  add_parts(8, 12, 3);
+  add_parts(8, 0);  // empty parts widen
+  // Each isolated qualifying sample is interrupted: once by one fewer local group, then by
+  // eight parts each routing only their final row. Neither pair can narrow the window.
+  add_parts(8, 12, 3);
+  add_parts(7, 12, 3);
+  add_parts(1, 12, 2);
+  add_parts(8, 12, 3);
+  add_parts(8, 5);
+  add_parts(8, 12, 3);
+  add_parts(8, 12, 3);  // two consecutive qualifying samples narrow again
+  add_parts(1, 1);
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const plan::AggregateCall count{
+      .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
+  const auto run = [&](const std::shared_ptr<MemoryTable>& table, int64_t parts,
+                       arrow::internal::Executor* pool, ProfileNode* profile) {
+    const PartPipeline pipeline =
+        [table](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+      return std::make_unique<TableScanOperator>(table, std::vector<int>{0}, part);
+    };
+    const GroupAggregateOperator schema_source(pipeline(0).ValueOrDie(), {k}, {count});
+    PartGroupAggregateOperator op(pipeline, parts, 1, {k}, {count}, schema_source.output_schema());
+    op.set_profile(profile);
+    return Drain(op,
+                 {.batch_size = 4, .executor = pool, .threads = pool == nullptr ? 1 : kThreads});
+  };
+  const auto table = std::make_shared<MemoryTable>(schema, batches, true);
+  struct Prefix {
+    int64_t parts;
+    int64_t narrow;
+    int64_t wide;
+  };
+  for (const auto [parts, narrow, wide] :
+       {Prefix{.parts = 2, .narrow = 1, .wide = 1}, Prefix{.parts = 17, .narrow = 1, .wide = 16},
+        Prefix{.parts = 25, .narrow = 2, .wide = 23}, Prefix{.parts = 33, .narrow = 9, .wide = 24},
+        Prefix{.parts = 57, .narrow = 9, .wide = 48}, Prefix{.parts = 73, .narrow = 9, .wide = 64},
+        Prefix{.parts = 81, .narrow = 10, .wide = 71}}) {
+    SCOPED_TRACE(parts);
+    ProfileNode parallel;
+    const auto result = run(table, parts, executor, &parallel);
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(MetricValue(parallel, "narrow_scan_parts"), narrow);
+    EXPECT_EQ(MetricValue(parallel, "wide_scan_parts"), wide);
+    if (parts == table->num_parts()) {
+      ProfileNode serial;
+      const auto expected = run(table, parts, nullptr, &serial);
+      ASSERT_TRUE(expected.ok()) << expected.status();
+      EXPECT_TRUE(SameRows(**result, **expected));
+      EXPECT_EQ(MetricValue(serial, "narrow_scan_parts"), 0);
+      EXPECT_EQ(MetricValue(serial, "wide_scan_parts"), 0);
+    }
+  }
+  // The wide call that accepted part 23 submitted up to part 39. Narrow admissions on parts
+  // 24-26 let those outstanding scans drain, even with profiling disabled.
+  const auto failing = std::make_shared<MemoryTable>(schema, std::move(batches), true);
+  failing->FailPart(26);
+  const auto failed = run(failing, failing->num_parts(), executor, nullptr);
+  ASSERT_TRUE(failed.status().IsIOError()) << failed.status();
+  EXPECT_EQ(failed.status().message(), "part 26 is broken");
+  std::vector<int64_t> opened(40);
+  std::ranges::iota(opened, int64_t{0});
+  EXPECT_EQ(failing->scanned_parts(), opened);
+
+  // A narrow start needs only its first qualifying full sample to stay narrow on part nine.
+  batches.clear();
+  add_parts(9, 8, 3);
+  const auto qualifying = std::make_shared<MemoryTable>(schema, std::move(batches), true);
+  ProfileNode profile;
+  const auto result = run(qualifying, qualifying->num_parts(), executor, &profile);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(MetricValue(profile, "narrow_scan_parts"), 9);
+  EXPECT_EQ(MetricValue(profile, "wide_scan_parts"), 0);
+}
+
 // A part whose first batch hardly reduces sends its other rows straight to the partitions: the
 // groups are those of the serial GROUP BY (as a set) and the same on any number of threads, byte
 // for byte, for unique and repeated keys, DOUBLE keys (-0.0 with 0.0, one NaN), NULL keys and every
@@ -2663,6 +2818,7 @@ std::shared_ptr<MemoryTable> RoutedTable(bool split) {
 // counted exactly.
 TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
   const auto pool = Pool();
+  CheckGroupScanLookahead(pool.get());
   const auto u = Column(0, "u", LogicalType::kBigInt);
   const auto k = Column(1, "k", LogicalType::kBigInt);
   const auto d = Column(2, "d", LogicalType::kDouble);

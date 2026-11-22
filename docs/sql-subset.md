@@ -1480,6 +1480,9 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     result, which is why both are reported: a scan that stops doing either answers exactly the same;
   - `raw_parts`, `raw_rows` (a GROUP BY's parts that sent rows straight to the partitions, because their first
     rows hardly reduced);
+  - `narrow_scan_parts` and `wide_scan_parts` count accepted parts in parallel grouped aggregation when it
+    adjusts scan lookahead. The narrow target requests one outstanding part per worker and the wide target
+    requests four. Memory pressure may reduce the actual number of outstanding parts.
   - `part_time` (the part tasks' time, summed);
   - `wait` (for parts);
   - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;

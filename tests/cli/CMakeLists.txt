@@ -1624,7 +1624,7 @@ string(
   # count over the whole table: the parts hold the same key in more than one of their tables.
   # routed_path is absent here because no part of this fixture routes (no raw_parts either).
   "lanes_tail=${_d} build=${_d} groups=4357 local_groups=[0-9]+ local_path=${_d} "
-  "local_rows=[0-9]+[]]\n"
+  "local_rows=[0-9]+ narrow_scan_parts=1 wide_scan_parts=10[]]\n"
   "      Filter IsMobile = 1  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
   "self=${_d}[]]\n"
   # cols_filter_only: IsMobile is read so that the pushed predicate can be applied and by nothing
