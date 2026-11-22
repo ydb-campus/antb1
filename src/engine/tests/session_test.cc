@@ -54,6 +54,69 @@ class SessionTest : public ::testing::Test {
   std::string path_;
 };
 
+TEST_F(SessionTest, RankingAndRegroupingReuseTheSameGroupingBuckets) {
+  auto session = Session::Make().ValueOrDie();
+  // More logical partitions than hash buckets, nullable keys and peers across input parts.
+  arrow::Int64Builder tenants;
+  arrow::Int64Builder items;
+  for (int64_t i = 0; i < 768; ++i) {
+    if (i % 9 == 0) {
+      ASSERT_TRUE(tenants.AppendNull().ok());
+    } else {
+      ASSERT_TRUE(tenants.Append(i % 48).ok());
+    }
+    ASSERT_TRUE(items.Append(i % 11).ok());
+  }
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("tenant", arrow::int64()), arrow::field("item", arrow::int64())}),
+      {tenants.Finish().ValueOrDie(), items.Finish().ValueOrDie()});
+  const auto path = (dir_ / "ranked.parquet").string();
+  const auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 64).ok());
+  ASSERT_TRUE(out->Close().ok());
+  ASSERT_TRUE(session->RegisterParquet("events", {path}).ok());
+
+  for (const auto* grouping :
+       {"GROUP BY item, tenant", "GROUP BY GROUPING SETS ((item,tenant),(tenant),(item),())"}) {
+    for (const auto* value : {"COUNT(*)", "SUM(CAST(item AS DECIMAL(26,0)))"}) {
+      const std::string grouped =
+          std::format("SELECT item, tenant AS k, {} AS n FROM events {}", value, grouping);
+      // Negation preserves partition equality over these small integers. Computing it puts
+      // a boundary between the grouping and the window, giving an independent serial control.
+      const auto ranked = [&](std::string_view key) {
+        return std::format(
+            "SELECT k,item,n,RANK() OVER (PARTITION BY {} ORDER BY n DESC) AS r "
+            "FROM ({}) g",
+            key, grouped);
+      };
+      const auto compare = [&](const std::string& query, const std::string& control) {
+        const auto actual = session->Execute(query);
+        const auto expected = session->Execute(control);
+        ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+        ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+        EXPECT_TRUE(actual->table->Equals(*expected->table)) << query;
+      };
+      const auto query = ranked("k");
+      const auto control = ranked("-k");
+      const std::string ordered = " ORDER BY k,item,n,r";
+      ASSERT_NO_FATAL_FAILURE(compare(query + ordered, control + ordered));
+      const auto regroup = [](const std::string& input) {
+        return "SELECT k,r,COUNT(*) FROM (" + input + ") w WHERE r <= 4 GROUP BY k,r ORDER BY k,r";
+      };
+      ASSERT_NO_FATAL_FAILURE(compare(regroup(query), regroup(control)));
+      const auto profile = session->ExplainAnalyze(regroup(query));
+      ASSERT_TRUE(profile.ok()) << profile.status().ToString();
+      const auto text = FormatProfile(*profile, ProfileFormat::kJson);
+      EXPECT_NE(text.find("\"rank_buckets\":"), std::string::npos);
+      EXPECT_NE(text.find("\"group_buckets\":"), std::string::npos);
+      const auto serial = session->ExplainAnalyze(control);
+      ASSERT_TRUE(serial.ok()) << serial.status().ToString();
+      EXPECT_EQ(FormatProfile(*serial, ProfileFormat::kJson).find("\"rank_buckets\":"),
+                std::string::npos);
+    }
+  }
+}
+
 TEST_F(SessionTest, CountStarFromRegisteredTable) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("events", {path_}).ok());

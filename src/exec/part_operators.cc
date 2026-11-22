@@ -32,6 +32,7 @@
 
 #include "aggregate_set.h"
 #include "heavy_hitters.h"
+#include "key_routing_hash.h"
 #include "outer_groups.h"
 #include "part_pruning.h"
 #include "part_scheduler.h"
@@ -453,6 +454,20 @@ PartGroupAggregateOperator::PartGroupAggregateOperator(
 
 PartGroupAggregateOperator::~PartGroupAggregateOperator() = default;
 
+const BatchPartition* PartGroupAggregateOperator::RequestPartitioning(int column,
+                                                                      PartitionRequest request) {
+  if (column < 0 || std::cmp_greater_equal(column, keys_.size()) ||
+      requested_layout_ != LocalGroupLayout::kAdaptive || top_n_) {
+    return nullptr;
+  }
+  const auto key = static_cast<std::size_t>(column);
+  if (routing_key_ != key && (routing_key_.has_value() || request == PartitionRequest::kExisting)) {
+    return nullptr;
+  }
+  routing_key_ = key;
+  return &partition_;
+}
+
 arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
   layout_ = LocalGroupLayout::kAdaptive;
@@ -479,11 +494,14 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   opened_ = true;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
                aggregates = aggregates_, width = input_width_, profile = profile(),
-               layout = layout_](int64_t part,
-                                 const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
+               layout = layout_, routing_key = routing_key_](
+                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
     const ProfileTimer part_time(profile, "part_time");
     ARROW_ASSIGN_OR_RAISE(PartGrouper grouper,
                           PartGrouper::Make(keys, aggregates, width, part_ctx, layout));
+    if (routing_key) {
+      grouper.SetRoutingKey(routing_key);
+    }
     ARROW_RETURN_NOT_OK(
         RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
           ARROW_RETURN_NOT_OK(grouper.Add(batch, profile));
@@ -598,6 +616,7 @@ arrow::Result<Batch> PartGroupAggregateOperator::Next() {
     }
     std::vector<std::shared_ptr<arrow::RecordBatch>>& rows = rows_[next_table_];
     if (next_chunk_ < rows.size()) {
+      partition_.bucket = next_table_;
       return Batch{.data = std::move(rows[next_chunk_++]), .selection = {}};
     }
     rows = {};  // gives the memory back
@@ -699,6 +718,36 @@ PartGroupingSetsOperator::PartGroupingSetsOperator(
 
 PartGroupingSetsOperator::~PartGroupingSetsOperator() = default;
 
+const BatchPartition* PartGroupingSetsOperator::RequestPartitioning(int column,
+                                                                    PartitionRequest request) {
+  if (column < 0 || std::cmp_greater_equal(column, keys_.size())) {
+    return nullptr;
+  }
+  const auto key = static_cast<std::size_t>(column);
+  if (routing_key_ != key && (routing_key_.has_value() || request == PartitionRequest::kExisting)) {
+    return nullptr;
+  }
+  routing_key_ = key;
+  return &partition_;
+}
+
+namespace {
+
+// Position of the output distribution key in this set's compact key tuple.
+// Sets omitting it still aggregate across the input and emit a NULL key.
+std::optional<std::size_t> SetRoutingKey(const std::vector<std::size_t>& set,
+                                         std::optional<std::size_t> key) {
+  if (key) {
+    const auto it = std::ranges::find(set, *key);
+    if (it != set.end()) {
+      return static_cast<std::size_t>(it - set.begin());
+    }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
 arrow::Status PartGroupingSetsOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
   pool_ = ctx.pool;
@@ -710,18 +759,22 @@ arrow::Status PartGroupingSetsOperator::Open(ExecContext& ctx) {
   opened_ = true;
   std::vector<std::vector<plan::BoundColumn>> root_keys;
   root_keys.reserve(roots_.size());
+  std::vector<std::optional<std::size_t>> root_routing;
   for (const std::size_t r : roots_) {
+    root_routing.push_back(SetRoutingKey(shape_->sets[r], routing_key_));
     root_keys.push_back(SetKeys(keys_, shape_->sets[r]));
   }
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys_of = std::move(root_keys),
-               aggregates = aggregates_, width = input_width_, profile = profile()](
-                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartRoots> {
+               routing = std::move(root_routing), aggregates = aggregates_, width = input_width_,
+               profile = profile()](int64_t part,
+                                    const std::atomic<bool>& stop) -> arrow::Result<PartRoots> {
     const ProfileTimer part_time(profile, "part_time");
     std::vector<PartGrouper> groupers;
     groupers.reserve(keys_of.size());
     for (const std::vector<plan::BoundColumn>& keys : keys_of) {
       ARROW_ASSIGN_OR_RAISE(PartGrouper grouper,
                             PartGrouper::Make(keys, aggregates, width, part_ctx));
+      grouper.SetRoutingKey(routing[groupers.size()]);
       groupers.push_back(std::move(grouper));
     }
     ARROW_RETURN_NOT_OK(
@@ -898,6 +951,7 @@ arrow::Status PartGroupingSetsOperator::Probe() {
     estimate_[s] =
         std::min<int64_t>(root_groups[r], Int128ToInt64(scaled).value_or(root_groups[r]));
     if (reduce_[s] != 0) {
+      table->set_routing_key(SetRoutingKey(shape.sets[s], routing_key_));
       ARROW_RETURN_NOT_OK(table->Partition());
       partial_[s][largest[r]] = std::move(table);  // the probe is that partition's first merge
     }
@@ -970,8 +1024,10 @@ arrow::Status PartGroupingSetsOperator::DeriveBatch(const std::vector<std::size_
           uniques.emplace(std::move(snapshot));
         }
         if (reduce_[s] == 0) {
-          ARROW_ASSIGN_OR_RAISE(buckets[s][p], SplitByKeys(Projected(uniques, s, root.num_groups()),
-                                                           GroupTable::kPartitions, pool_));
+          ARROW_ASSIGN_OR_RAISE(
+              buckets[s][p],
+              SplitByKeys(Projected(uniques, s, root.num_groups()), GroupTable::kPartitions, pool_,
+                          SetRoutingKey(shape.sets[s], routing_key_)));
           continue;
         }
         ARROW_ASSIGN_OR_RAISE(
@@ -980,6 +1036,7 @@ arrow::Status PartGroupingSetsOperator::DeriveBatch(const std::vector<std::size_
                                          GroupTable::kPartitions, {.estimate = false}));
         ARROW_RETURN_NOT_OK(table->MergeProjected(root, Projected(uniques, s, root.num_groups()),
                                                   EveryGroup(root)));
+        table->set_routing_key(SetRoutingKey(shape.sets[s], routing_key_));
         ARROW_RETURN_NOT_OK(table->Partition());
         partial_[s][p] = std::move(table);
       }
@@ -1105,6 +1162,14 @@ arrow::Result<Batch> PartGroupingSetsOperator::Next() {
       }
       std::vector<std::shared_ptr<arrow::RecordBatch>>& rows = rows_[s][next_partition_];
       if (next_batch_ < rows.size()) {
+        // NULL in the source and NULL introduced by a grouping set are peers for a window.
+        if (routing_key_) {
+          partition_.bucket =
+              SetRoutingKey(shape.sets[s], routing_key_).has_value()
+                  ? next_partition_
+                  : FinishGroupKeyHash(MixGroupKeyHash(kGroupKeySeed, kNullGroupKeyHash)) &
+                        (GroupTable::kPartitions - 1);
+        }
         return Batch{.data = rows[next_batch_++], .selection = {}};
       }
       if (shape.last_entries[s] == next_entry_) {

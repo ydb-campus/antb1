@@ -37,6 +37,17 @@ ProjectOperator::ProjectOperator(std::unique_ptr<Operator> input, std::vector<in
       constants_(std::move(constants)),
       schema_(ColumnsOf(*input_->output_schema(), columns_, constants_)) {}
 
+const BatchPartition* ProjectOperator::RequestPartitioning(int column, PartitionRequest request) {
+  if (column < 0 || std::cmp_greater_equal(column, columns_.size())) {
+    return nullptr;
+  }
+  const auto field = static_cast<std::size_t>(column);
+  if (field < constants_.size() && constants_[field] != nullptr) {
+    return nullptr;
+  }
+  return input_->RequestPartitioning(columns_[field], request);
+}
+
 arrow::Status ProjectOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   if (!constants_.empty() && constants_.size() != columns_.size()) {

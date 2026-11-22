@@ -20,6 +20,7 @@ class WindowOperator final : public Operator {
   WindowOperator& operator=(WindowOperator&&) = delete;
   ~WindowOperator() override;
   const std::shared_ptr<arrow::Schema>& output_schema() const override { return schema_; }
+  const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override;
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override;
@@ -32,6 +33,9 @@ class WindowOperator final : public Operator {
   std::vector<plan::WindowCall> calls_;
   std::shared_ptr<arrow::Schema> schema_;
   std::unique_ptr<State> state_;
+  int distribution_column_ = -1;
+  const BatchPartition* input_partition_ = nullptr;
+  BatchPartition output_partition_{1};
   bool input_open_ = false;
   bool done_ = false;
 };

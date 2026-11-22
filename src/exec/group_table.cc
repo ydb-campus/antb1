@@ -129,6 +129,14 @@ arrow::Status HashGroupRows(const arrow::compute::ExecBatch& keys, const RowAt& 
   return arrow::Status::OK();
 }
 
+arrow::Result<std::vector<std::uint64_t>> RoutingHashes(const arrow::compute::ExecBatch& keys,
+                                                        std::optional<std::size_t> key) {
+  if (key && keys.values.size() > 1) {
+    return KeyHashes(arrow::compute::ExecBatch({keys.values.at(*key)}, keys.length));
+  }
+  return KeyHashes(keys);
+}
+
 }  // namespace
 
 arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBatch& keys) {
@@ -165,11 +173,12 @@ arrow::compute::ExecBatch ProjectKeys(const arrow::compute::ExecBatch& keys,
 }
 
 arrow::Result<KeyBuckets> SplitByKeys(const arrow::compute::ExecBatch& keys, std::size_t partitions,
-                                      arrow::MemoryPool* pool) {
+                                      arrow::MemoryPool* pool,
+                                      std::optional<std::size_t> routing_key) {
   ANTB1_CHECK(std::has_single_bit(partitions));
   KeyBuckets out;
   out.rows.resize(partitions);
-  ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> hashes, KeyHashes(keys));
+  ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> hashes, RoutingHashes(keys, routing_key));
   for (std::uint32_t row = 0; row < hashes.size(); ++row) {
     out.rows[static_cast<std::size_t>(hashes[row]) & (partitions - 1)].push_back(row);
   }
@@ -638,7 +647,7 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::Rout
     const arrow::RecordBatch& rows) const {
   ANTB1_CHECK(!keys_.empty());
   ARROW_ASSIGN_OR_RAISE(const auto keys, InputKeys(rows));
-  ARROW_ASSIGN_OR_RAISE(const auto hashes, KeyHashes(keys));
+  ARROW_ASSIGN_OR_RAISE(const auto hashes, RoutingHashes(keys, routing_key_));
   // The rows in partition order (a stable counting sort), one Take, then a slice per partition.
   std::vector<std::int64_t> start(partitions_ + 1, 0);
   for (const std::uint64_t hash : hashes) {
@@ -703,7 +712,8 @@ arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uin
   const auto& uniques = snapshot.batch;
   arrow::compute::ExecBatch prefix_keys = uniques;
   prefix_keys.values.resize(prefix);
-  ARROW_ASSIGN_OR_RAISE(std::vector<std::uint64_t> hashes, KeyHashes(prefix_keys));
+  ARROW_ASSIGN_OR_RAISE(std::vector<std::uint64_t> hashes,
+                        RoutingHashes(prefix_keys, routing_key_));
   if (prefix < keys_.size() && !heavy.empty()) {
     ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> all, KeyHashes(uniques));
     for (std::size_t g = 0; g < hashes.size(); ++g) {

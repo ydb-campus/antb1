@@ -184,6 +184,7 @@ class PartGrouper {
                                          const std::vector<plan::AggregateCall>& aggregates,
                                          int input_width, const ExecContext& part_ctx,
                                          LocalGroupLayout layout = LocalGroupLayout::kAdaptive);
+  void SetRoutingKey(std::optional<std::size_t> key) { groups_->table->set_routing_key(key); }
   arrow::Status Add(const Batch& batch, ProfileNode* profile);
   // Adds a batch's rows (without a selection).
   arrow::Status Add(const arrow::RecordBatch& rows, ProfileNode* profile);
@@ -228,11 +229,15 @@ class PartGroupAggregateOperator final : public PartSink {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
   }
+  const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override;
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override;
 
  private:
+  std::optional<std::size_t> routing_key_;
+  BatchPartition partition_{GroupTable::kPartitions};
+
   using PartTable = std::shared_ptr<PartGroups>;
 
   std::shared_ptr<const PartPipeline> pipeline_;
@@ -297,11 +302,15 @@ class PartGroupingSetsOperator final : public PartSink {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
   }
+  const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override;
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override;
 
  private:
+  std::optional<std::size_t> routing_key_;
+  BatchPartition partition_{GroupTable::kPartitions};
+
   // A part's groups, per root (in roots_ order).
   using PartRoots = std::shared_ptr<std::vector<std::shared_ptr<PartGroups>>>;
 

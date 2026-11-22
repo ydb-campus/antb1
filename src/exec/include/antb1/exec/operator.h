@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -59,6 +60,16 @@ struct Batch {
   [[nodiscard]] int64_t selected_rows() const;
 };
 
+// A producer accepting a request before Open keeps all rows equal on the requested
+// column in one bucket, including NULLs. Each successful Next updates bucket for its
+// batch. Different values may share a bucket. The descriptor lives with the producer.
+struct BatchPartition {
+  std::size_t count;
+  std::size_t bucket = 0;
+};
+
+enum class PartitionRequest : std::uint8_t { kExisting, kAllowRouting };
+
 class Operator {
  public:
   virtual ~Operator() = default;
@@ -70,6 +81,9 @@ class Operator {
 
   // The schema of every batch's data. Field names are internal: the engine names the result.
   [[nodiscard]] virtual const std::shared_ptr<arrow::Schema>& output_schema() const = 0;
+  virtual const BatchPartition* RequestPartitioning(int /*column*/, PartitionRequest /*request*/) {
+    return nullptr;
+  }
   // Prepares a (re)run; opens the inputs first.
   virtual arrow::Status Open(ExecContext& ctx) = 0;
   // The next batch, or an end() batch once the stream is exhausted.

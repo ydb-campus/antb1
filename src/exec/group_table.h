@@ -56,7 +56,8 @@ struct KeyBuckets {
   std::vector<std::vector<std::uint32_t>> rows;
 };
 arrow::Result<KeyBuckets> SplitByKeys(const arrow::compute::ExecBatch& keys, std::size_t partitions,
-                                      arrow::MemoryPool* pool);
+                                      arrow::MemoryPool* pool,
+                                      std::optional<std::size_t> routing_key = std::nullopt);
 
 // The groups of a GROUP BY: a key table over the keys (key_table.h; NULL is a key value; DOUBLE
 // keys are normalized first, so -0.0 groups with 0.0 and every NaN with every other NaN), one
@@ -122,6 +123,8 @@ class GroupTable {
   // Splits the groups into partitions by a hash of their (normalized) keys, after the last
   // Consume of a part table: kPartitions partitions, or one without keys.
   arrow::Status Partition();
+  // Adaptive part tables can route by one component shared with a downstream operator.
+  void set_routing_key(std::optional<std::size_t> key) { routing_key_ = key; }
   // Partition by the hash of the first `prefix` keys, except for the groups whose prefix hash is
   // in `heavy` (sorted), which go by the hash of all keys (the two-level aggregation,
   // docs/adr/0014-two-level-aggregation.md). A pure function of each group's keys, so every part
@@ -249,6 +252,7 @@ class GroupTable {
 
   std::optional<MemoryReservation> local_metadata_;  // owned by a dispatched lane through handoff
   MemoryReservation memory_;  // outlives the state and key metadata containers it charges
+  std::optional<std::size_t> routing_key_;
   std::vector<plan::BoundColumn> keys_;
   std::vector<plan::AggregateCall> aggregates_;
   arrow::MemoryPool* pool_;

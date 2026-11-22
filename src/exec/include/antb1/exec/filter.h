@@ -74,6 +74,9 @@ class FilterOperator final : public Operator {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return input_->output_schema();
   }
+  const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override {
+    return input_->RequestPartitioning(column, request);
+  }
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override { return input_->Close(); }

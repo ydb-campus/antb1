@@ -435,6 +435,18 @@ the builds, outermost first and each after the builds its input probes, then the
 | `UnionAllOperator` | `UnionAll` | the batches of each input in input order, on the consumer's thread (an input that is a part pipeline runs its own parts); an input is opened when the previous one is exhausted and closed before the next one opens, so one input's resources at a time and none of an input a `Limit` never reaches; each batch rebuilt in the union's schema (input 0's names, nullable fields) with its selection kept, no row copied; the first failing input in order decides the error ([ADR 0036](adr/0036-union-all.md)) |
 | `SetOperationOperator` | `SetOperation` | one `GroupTable` keyed on every column, the inputs read in full in written order, one open at a time as in `UnionAllOperator`; the rows of a starter (an input that can bring a row into the result: `plan::SetStarters`) insert their groups, every other input's only look theirs up (`KeyTable::Lookup`) and add none; per group and input a presence bit, or a count where the formula reads one (`plan::SetCounted`), charged to the budget; after the last input the formula gives each group its copies, in chunks: under a DISTINCT root each kept group once with its keys as first seen among the starters, selected over the table's chunks; under an ALL root each group repeated by its copies with its normalized keys, in batches of at most 64Ki rows; the first failing input in order decides the error ([ADR 0039](adr/0039-set-operations.md)) |
 
+A grouped producer can distribute its output on one requested grouping column. Its part tables
+still compare every grouping key. Raw rows, partial groups and derived grouping sets use the
+same routing hash when the set includes the column. A set omitting it completes its normal
+aggregation and sends its result batches to the bucket for NULL. Projections remap a requested
+column and filters preserve the distribution. Unsupported operators decline the request.
+
+An ordered rank window can reuse this layout when all its calls partition on that column.
+It sorts disjoint ranges of row references on the query executor, compares the actual window
+keys inside each bucket, and writes ranks in input row order. It passes the distribution to a
+subsequent GROUP BY on the same column, which consumes each batch directly into its bucket's
+aggregate table. The profile counts populated buckets as `rank_buckets` and `group_buckets`.
+
 The aggregate states (`src/exec/include/antb1/exec/aggregate_state.h`) implement `Consume(values, selection)`,
 `Merge` and `Finalize`. `COUNT(*)` is the true count of the selection; `COUNT(col)`, `SUM` and `AVG` walk the runs
 of rows that are both selected and non-NULL (one bitmap AND); integer `SUM` and `AVG` accumulate in `antb1::Int128`

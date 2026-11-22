@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -46,7 +47,10 @@ class GroupAggregateOperator final : public Operator {
   std::vector<plan::AggregateCall> aggregates_;
   std::shared_ptr<arrow::Schema> schema_;
   arrow::MemoryPool* pool_ = nullptr;
-  std::unique_ptr<GroupTable> table_;  // from Open to the end of the output
+  MemoryBudget* budget_ = nullptr;
+  const BatchPartition* partition_ = nullptr;
+  std::vector<std::unique_ptr<GroupTable>> tables_;
+  std::size_t output_ = 0;
   bool opened_ = false;
   bool done_ = false;
 };
