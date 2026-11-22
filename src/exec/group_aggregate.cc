@@ -10,6 +10,7 @@
 #include <arrow/api.h>
 
 #include "antb1/exec/operator.h"
+#include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
@@ -46,21 +47,32 @@ GroupAggregateOperator::~GroupAggregateOperator() = default;
 arrow::Status GroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   done_ = false;
-  table_.reset();
-  ARROW_ASSIGN_OR_RAISE(
-      table_, GroupTable::Make(keys_, aggregates_, input_->output_schema()->num_fields(), pool_,
-                               ctx.budget));
+  budget_ = ctx.budget;
+  output_ = 0;
+  partition_ = nullptr;
+  for (const auto& key : keys_) {
+    partition_ = input_->RequestPartitioning(key.index, PartitionRequest::kExisting);
+    if (partition_ != nullptr) {
+      break;
+    }
+  }
+  tables_.clear();
+  tables_.resize(partition_ != nullptr ? partition_->count : 1);
+  ARROW_ASSIGN_OR_RAISE(tables_.front(),
+                        GroupTable::Make(keys_, aggregates_, input_->output_schema()->num_fields(),
+                                         pool_, ctx.budget));
   opened_ = true;
   return input_->Open(ctx);
 }
 
 arrow::Status GroupAggregateOperator::Close() {
-  table_.reset();
+  tables_.clear();
+  opened_ = false;
   return input_->Close();
 }
 
 arrow::Result<Batch> GroupAggregateOperator::Next() {
-  if (!opened_ || table_ == nullptr) {
+  if (!opened_ || output_ == tables_.size()) {
     return done_ ? arrow::Result<Batch>(Batch{})
                  : arrow::Status::Invalid("group aggregate: Next() before Open()");
   }
@@ -72,21 +84,41 @@ arrow::Result<Batch> GroupAggregateOperator::Next() {
       }
       ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(in, pool_));
       if (rows->num_rows() > 0) {
-        ARROW_RETURN_NOT_OK(table_->Consume(*rows));
+        auto& table = tables_[partition_ != nullptr ? partition_->bucket : 0];
+        if (table == nullptr) {
+          ARROW_ASSIGN_OR_RAISE(
+              table, GroupTable::Make(keys_, aggregates_, input_->output_schema()->num_fields(),
+                                      pool_, budget_));
+        }
+        ARROW_RETURN_NOT_OK(table->Consume(*rows));
       }
     }
     done_ = true;
     // Every group's finalize errors before the first chunk, which a LIMIT may stop after.
-    ARROW_RETURN_NOT_OK(table_->CheckFinalize());
+    int64_t occupied = 0;
+    for (const auto& table : tables_) {
+      if (table != nullptr) {
+        ARROW_RETURN_NOT_OK(table->CheckFinalize());
+        occupied += table->num_groups() != 0 ? 1 : 0;
+      }
+    }
+    if (partition_ != nullptr && profile() != nullptr) {
+      profile()->Add("group_buckets", MetricUnit::kCount, occupied);
+    }
   }
   // Chunks of new groups, joined (GroupTable::NextChunk): their keys as first seen, the aggregates
   // of those groups.
-  ARROW_ASSIGN_OR_RAISE(auto chunk, table_->NextChunk(schema_));
-  if (chunk == nullptr) {
-    table_.reset();  // gives the memory back
-    return Batch{};
+  for (; output_ < tables_.size(); ++output_) {
+    auto& table = tables_[output_];
+    if (table != nullptr) {
+      ARROW_ASSIGN_OR_RAISE(auto chunk, table->NextChunk(schema_));
+      if (chunk != nullptr) {
+        return Batch{.data = std::move(chunk), .selection = {}};
+      }
+      table.reset();
+    }
   }
-  return Batch{.data = std::move(chunk), .selection = {}};
+  return Batch{};
 }
 
 }  // namespace antb1::exec
