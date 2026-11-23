@@ -1,5 +1,6 @@
 #include "../window.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -17,6 +18,7 @@
 #include "antb1/exec/aggregate_state.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
+#include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
@@ -149,6 +151,77 @@ TEST_F(WindowTest, RowsPrefixesCarryStateAcrossChunksAndResetPartitions) {
     EXPECT_EQ(minima[i], i == 65537 ? std::nullopt : std::optional<int64_t>(i == 0 ? 7 : 3));
     EXPECT_EQ(maxima[i], i == 65537 ? std::nullopt : std::optional<int64_t>(i < 65537 ? 7 : 3));
   }
+}
+
+// Exercise the executor path deterministically on the test thread.
+class InlineWindowExecutor final : public arrow::internal::Executor {
+ public:
+  int GetCapacity() override { return 4; }
+
+ protected:
+  arrow::Status SpawnReal(arrow::internal::TaskHints, arrow::internal::FnOnce<void()> task,
+                          arrow::StopToken, StopCallback&&) override {
+    std::move(task)();
+    return arrow::Status::OK();
+  }
+};
+
+TEST_F(WindowTest, BucketWorkersWriteNullablePrefixesToTheirOriginalBatchPositions) {
+  constexpr int64_t kRows = (4 * 65536) + 13;
+  arrow::Int64Builder keys;
+  arrow::Int64Builder values;
+  arrow::Int64Builder sequence;
+  ASSERT_TRUE(keys.Reserve(kRows).ok());
+  ASSERT_TRUE(values.Reserve(kRows).ok());
+  ASSERT_TRUE(sequence.Reserve(kRows).ok());
+  for (int64_t i = 0; i < kRows; ++i) {
+    if (i % 97 == 0) {
+      keys.UnsafeAppendNull();
+    } else {
+      keys.UnsafeAppend(i % 53);
+    }
+    if (i % 97 == 0 || i % 11 == 0) {
+      values.UnsafeAppendNull();
+    } else {
+      values.UnsafeAppend(i % 271);
+    }
+    sequence.UnsafeAppend(i);
+  }
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64()),
+                     arrow::field("seq", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(
+      schema, kRows,
+      {keys.Finish().ValueOrDie(), values.Finish().ValueOrDie(), sequence.Finish().ValueOrDie()});
+  auto sum = Prefix(AggKind::kSum, LogicalType::kBigInt, LogicalType::kHugeInt);
+  auto max = Prefix(AggKind::kMax, LogicalType::kBigInt, LogicalType::kBigInt);
+  sum.order_by = {{.column = Column(2, "seq", LogicalType::kBigInt), .descending = true}};
+  max.order_by = sum.order_by;
+  const auto run = [&](arrow::internal::Executor* executor, ProfileNode& profile) {
+    auto source = std::make_unique<ScriptedSource>(
+        schema, std::vector<Batch>{{.data = batch->Slice(0, 100003), .selection = {}},
+                                   {.data = batch->Slice(100003), .selection = {}}});
+    WindowOperator op(std::move(source), {sum, max});
+    op.set_profile(&profile);
+    ExecContext ctx{
+        .batch_size = 509, .executor = executor, .threads = executor == nullptr ? 1 : 4};
+    return Drain(op, ctx);
+  };
+  ProfileNode serial_profile;
+  const auto serial = run(nullptr, serial_profile);
+  ASSERT_TRUE(serial.ok()) << serial.status();
+  InlineWindowExecutor executor;
+  ProfileNode profile;
+  const auto bucketed = run(&executor, profile);
+  ASSERT_TRUE(bucketed.ok()) << bucketed.status();
+  EXPECT_TRUE((*serial)->Equals(**bucketed));
+  const auto metrics = profile.metrics();
+  const auto direct = std::ranges::find(metrics, "direct_prefix_columns", &ProfileMetric::name);
+  ASSERT_NE(direct, metrics.end());
+  EXPECT_EQ(direct->value, 2);
+  const auto packed = std::ranges::find(metrics, "packed_sort_rows", &ProfileMetric::name);
+  ASSERT_NE(packed, metrics.end());
+  EXPECT_GT(packed->value, 0);
 }
 
 TEST_F(WindowTest, RankPeersAcrossMasksBatchesAndSpecificationsKeepRowIdentity) {

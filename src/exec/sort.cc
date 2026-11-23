@@ -27,6 +27,8 @@
 
 #include "decimal.h"
 #include "gather.h"
+#include "packed_order.h"
+#include "pool_vector.h"
 
 namespace antb1::exec {
 namespace {
@@ -309,6 +311,262 @@ RowComparator::Prefix RowComparator::PrefixOf(const KeyArrays& keys, int64_t row
   return Prefix{.bits = key.descending ? ~bits : bits, .group = 1};
 }
 
+PackedOrder::PackedOrder(const RowComparator& comparator,
+                         std::span<const RowComparator::KeyArrays> batches, std::size_t first_key)
+    : comparator_(comparator), resume_(first_key) {
+  unsigned compact_bits = 64;
+  for (std::size_t i = first_key; i < comparator.keys_.size(); ++i) {
+    const auto id = comparator.schema()->field(comparator.keys_[i].column)->type()->id();
+    const bool small = id == arrow::Type::INT16 || id == arrow::Type::UINT16;
+    const bool dictionary = id == arrow::Type::BINARY && i == first_key;
+    const bool wide = id == arrow::Type::INT64 || id == arrow::Type::TIMESTAMP ||
+                      id == arrow::Type::DECIMAL64 || id == arrow::Type::DECIMAL128;
+    const bool only_key = first_key + 1 == comparator.keys_.size();
+    const unsigned width = dictionary ? 8U : small ? 16U : wide && only_key ? 64U : 32U;
+    if (width > compact_bits ||
+        (!dictionary && !small && !wide && id != arrow::Type::INT32 && id != arrow::Type::DATE32)) {
+      compact_count_ = 0;
+      break;
+    }
+    compact_bits -= width;
+    const auto base = id == arrow::Type::UINT16 || dictionary
+                          ? std::uint64_t{0}
+                          : (std::uint64_t{1} << 63) - (std::uint64_t{1} << (width - 1));
+    const auto mask = width == 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << width) - 1;
+    compact_[compact_count_++] = {i, base, mask, compact_bits, id};
+  }
+  unsigned remaining = 128;
+  while (!batches.empty() && resume_ < comparator.keys_.size() && remaining > 0) {
+    const auto& key = comparator.keys_[resume_];
+    const auto& type = comparator.schema()->field(key.column)->type();
+    const bool wide = type->id() == arrow::Type::DECIMAL128;
+    const bool binary = type->id() == arrow::Type::BINARY;
+    const unsigned width = binary ? 64U : Narrow<unsigned>(type->bit_width());
+    const bool nullable = std::ranges::any_of(batches, [&](const auto& batch) {
+      return batch[resume_]->data()->buffers[0] != nullptr && batch[resume_]->null_count() != 0;
+    });
+    UInt128 tag = 0;
+    if (nullable) {
+      tag = UInt128{1} << --remaining;
+    }
+    const unsigned taken = std::min(width, remaining);
+    remaining -= taken;
+    // SignedPrefix widens a signed integer before flipping its sign bit. For a narrow field,
+    // move that sign flip into the field's native width before retaining its low bits.
+    const bool narrow_signed = width < 64 && type->id() != arrow::Type::UINT16;
+    ANTB1_DCHECK(count_ < fields_.size());
+    fields_[count_++] = {.index = resume_,
+                         .mask = taken == 128 ? ~UInt128{0} : (UInt128{1} << taken) - 1,
+                         .null_tag = key.nulls_first ? 0 : tag,
+                         .valid_tag = key.nulls_first ? tag : 0,
+                         .sign_flip = narrow_signed ? std::uint64_t{1} << (width - 1) : 0,
+                         .discard = width - taken,
+                         .shift = remaining,
+                         .wide_decimal = wide};
+    if (taken < width || binary) {
+      break;
+    }
+    ++resume_;
+  }
+}
+
+PackedOrder::Entry PackedOrder::Encode(const RowComparator::KeyArrays& arrays,
+                                       SortBuffer::RowRef ref) const {
+  UInt128 packed = 0;
+  for (std::size_t i = 0; i < count_; ++i) {
+    const auto& field = fields_[i];
+    const auto& key = comparator_.keys_[field.index];
+    const auto& array = *arrays[field.index];
+    if ((field.valid_tag | field.null_tag) != 0 && array.IsNull(ref.row)) {
+      packed |= field.null_tag;
+      continue;
+    }
+    packed |= field.valid_tag;
+    if (field.mask == 0) {
+      continue;  // The last bit was the NULL marker.
+    }
+    UInt128 value;
+    if (field.wide_decimal) {
+      const arrow::Decimal128 v(
+          static_cast<const arrow::Decimal128Array&>(array).GetValue(ref.row));
+      value = ((static_cast<UInt128>(v.high_bits()) << 64) | v.low_bits()) ^ (UInt128{1} << 127);
+    } else {
+      value = key.prefix(array, ref.row) ^ field.sign_flip;
+    }
+    if (key.descending) {
+      value = ~value;
+    }
+    packed |= ((value >> field.discard) & field.mask) << field.shift;
+  }
+  return {.high = static_cast<std::uint64_t>(packed >> 64),
+          .low = static_cast<std::uint64_t>(packed),
+          .ref = ref};
+}
+
+void PackedOrder::Sort(std::span<Entry> entries,
+                       std::span<const RowComparator::KeyArrays> batches) const {
+  const auto sort = [&]<bool complete>() {
+    std::ranges::sort(entries, [&](const Entry& a, const Entry& b) {
+      if (a.high != b.high) {
+        return a.high < b.high;
+      }
+      if (a.low != b.low) {
+        return a.low < b.low;
+      }
+      if constexpr (!complete) {
+        const int c = comparator_.Compare(batches[a.ref.chunk], a.ref.row, batches[b.ref.chunk],
+                                          b.ref.row, resume_);
+        if (c != 0) {
+          return c < 0;
+        }
+      }
+      return a.ref.chunk < b.ref.chunk || (a.ref.chunk == b.ref.chunk && a.ref.row < b.ref.row);
+    });
+  };
+  if (exact()) {
+    sort.template operator()<true>();
+  } else {
+    sort.template operator()<false>();
+  }
+}
+
+bool PackedOrder::CompactKey(const RowComparator::KeyArrays& arrays, SortBuffer::RowRef row,
+                             std::span<const std::string_view> dictionary,
+                             std::uint64_t& packed) const {
+  packed = 0;
+  for (std::size_t i = 0; i < compact_count_; ++i) {
+    const auto& field = compact_[i];
+    const auto& key = comparator_.keys_[field.index];
+    const auto& array = *arrays[field.index];
+    std::uint64_t token;
+    if (array.IsNull(row.row)) {
+      token = key.nulls_first ? 0 : field.mask;
+    } else {
+      // Unsigned subtraction puts the candidate range at [0, mask]. Both endpoints
+      // are reserved for NULL. Wraparound or a value above the range fails the check.
+      if (field.type == arrow::Type::BINARY) {
+        const auto value = static_cast<const arrow::BinaryArray&>(array).GetView(row.row);
+        const auto found = std::ranges::lower_bound(dictionary, value);
+        if (found == dictionary.end() || *found != value) {
+          return false;
+        }
+        token = static_cast<std::uint64_t>(found - dictionary.begin()) + 1;
+      } else if (field.type == arrow::Type::DECIMAL128) {
+        const arrow::Decimal128 v(
+            static_cast<const arrow::Decimal128Array&>(array).GetValue(row.row));
+        const auto low = v.low_bits();
+        constexpr auto sign = std::uint64_t{1} << 63;
+        if (v.high_bits() != ((low & sign) == 0 ? 0 : -1)) {
+          return false;
+        }
+        token = (low ^ sign) - field.base;
+      } else {
+        token = key.prefix(array, row.row) - field.base;
+      }
+      if (token == 0 || token >= field.mask) {
+        return false;
+      }
+      if (key.descending) {
+        token = field.mask - token;
+      }
+    }
+    packed |= token << field.shift;
+  }
+  return true;
+}
+
+namespace {
+
+// Ordinary sort prepays its scratch with SortBuffer::sort_memory(). Window scratch is
+// optional and charged directly to the query pool; a refusal leaves the caller's rows intact.
+template <class T, class Fn>
+arrow::Result<bool> WithSortScratch(std::size_t size, arrow::MemoryPool* pool, const Fn& fn) {
+  if (pool == nullptr) {
+    std::vector<T> scratch(size);
+    return fn(std::span<T>(scratch));
+  }
+  PoolVector<T> scratch(pool);
+  const auto reserved = scratch.Resize(size);
+  if (reserved.IsOutOfMemory()) {
+    return false;
+  }
+  ARROW_RETURN_NOT_OK(reserved);
+  return fn(std::span<T>(scratch.data(), size));
+}
+
+}  // namespace
+
+arrow::Result<bool> PackedOrder::TrySort(std::span<SortBuffer::RowRef> rows,
+                                         std::span<const RowComparator::KeyArrays> batches,
+                                         arrow::MemoryPool* pool) const {
+  if (rows.size() < kMinRows || empty()) {
+    return false;
+  }
+  // A small leading string domain can coexist with numeric fields in the same word.
+  // Sample bounded metadata, then require every non-NULL value to match before sorting.
+  std::array<std::string_view, 16> strings;
+  std::size_t used = 0;
+  bool compact = compact_count_ > 0;
+  if (compact && compact_[0].type == arrow::Type::BINARY) {
+    const auto stride = std::max<std::size_t>(1, rows.size() / 128);
+    for (std::size_t i = 0; i < rows.size(); i += stride) {
+      const auto ref = rows[i];
+      const auto& values =
+          static_cast<const arrow::BinaryArray&>(*batches[ref.chunk][compact_[0].index]);
+      if (values.IsNull(ref.row)) {
+        continue;
+      }
+      const auto value = values.GetView(ref.row);
+      const std::span<const std::string_view> known(strings.data(), used);
+      if (!std::ranges::contains(known, value)) {
+        if (used == strings.size()) {
+          compact = false;
+          break;
+        }
+        strings[used++] = value;
+      }
+    }
+    std::ranges::sort(std::span(strings).first(used));
+  }
+  if (compact) {
+    struct CompactEntry {
+      std::uint64_t key;
+      SortBuffer::RowRef ref;
+    };
+    ARROW_ASSIGN_OR_RAISE(
+        const bool sorted,
+        WithSortScratch<CompactEntry>(rows.size(), pool, [&](std::span<CompactEntry> entries) {
+          for (std::size_t i = 0; i < rows.size(); ++i) {
+            const auto ref = rows[i];
+            if (!CompactKey(batches[ref.chunk], ref, {strings.data(), used}, entries[i].key)) {
+              return false;
+            }
+            entries[i].ref = ref;
+          }
+          std::ranges::sort(entries, [](const CompactEntry& a, const CompactEntry& b) {
+            if (a.key != b.key) {
+              return a.key < b.key;
+            }
+            return a.ref.chunk < b.ref.chunk ||
+                   (a.ref.chunk == b.ref.chunk && a.ref.row < b.ref.row);
+          });
+          std::ranges::transform(entries, rows.begin(), &CompactEntry::ref);
+          return true;
+        }));
+    if (sorted) {
+      return true;
+    }
+  }
+  return WithSortScratch<Entry>(rows.size(), pool, [&](std::span<Entry> entries) {
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      entries[i] = Encode(batches[rows[i].chunk], rows[i]);
+    }
+    Sort(entries, batches);
+    std::ranges::transform(entries, rows.begin(), &Entry::ref);
+    return true;
+  });
+}
+
 // ---- SortBuffer ----
 
 SortBuffer::SortBuffer(RowComparator comparator, std::optional<int64_t> keep)
@@ -433,6 +691,26 @@ int64_t SortBuffer::sort_memory() const {
 arrow::Status SortBuffer::Sort(arrow::MemoryPool* pool) {
   if (keep_.has_value()) {
     return Compact(pool);
+  }
+  // A leading string stops the composite prefix at the same eight bytes the existing sorter
+  // already uses. Keep that sorter for these keys, especially when many prefixes collide.
+  if (std::cmp_greater_equal(rows_, PackedOrder::kMinRows) && !chunk_keys_.front().empty() &&
+      chunk_keys_.front().front()->type_id() != arrow::Type::BINARY &&
+      (chunk_keys_.front().size() > 1 ||
+       chunk_keys_.front().front()->type_id() == arrow::Type::DECIMAL128)) {
+    const PackedOrder layout(comparator_, chunk_keys_);
+    static_assert(sizeof(PackedOrder::Entry) <= 3 * sizeof(std::uint64_t));
+    order_.clear();
+    order_.reserve(Narrow<std::size_t>(rows_));
+    for (std::size_t c = 0; c < chunks_.size(); ++c) {
+      for (int64_t row = 0; row < chunks_[c]->num_rows(); ++row) {
+        order_.push_back({Narrow<std::uint32_t>(c), Narrow<std::uint32_t>(row)});
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(sorted_, layout.TrySort(order_, chunk_keys_, nullptr));
+    if (sorted_) {
+      return arrow::Status::OK();
+    }
   }
   // Rows with the prefix of their first key: most comparisons are two integer compares, and the
   // full comparison runs only for equal prefixes.
