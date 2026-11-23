@@ -165,7 +165,7 @@ arrow::Result<std::vector<DirectColumn>> MakeDirectColumns(
     for (std::size_t j = 0; j < input.size(); ++j) {
       column.first[j] = pieces;
       const auto length = Narrow<std::size_t>(input[j]->num_rows());
-      pieces += 1 + (length - 1) / column.batch_rows;
+      pieces += 1 + ((length - 1) / column.batch_rows);
     }
     ARROW_RETURN_NOT_OK(column.pieces.Resize(pieces));
     ARROW_RETURN_NOT_OK(Reserve(column.buffers, pieces, scratch));
@@ -179,9 +179,11 @@ arrow::Result<std::vector<DirectColumn>> MakeDirectColumns(
         ARROW_ASSIGN_OR_RAISE(auto validity,
                               arrow::AllocateBuffer(Narrow<int64_t>((length + 7) / 8), ctx.pool));
         std::memset(validity->mutable_data(), 0xff, Narrow<std::size_t>(validity->size()));
-        column.pieces[column.buffers.size()] = {values->mutable_data(), validity->mutable_data(),
-                                                0};
-        column.buffers.push_back({std::move(values), std::move(validity), Narrow<int64_t>(length)});
+        column.pieces[column.buffers.size()] = {
+            .values = values->mutable_data(), .validity = validity->mutable_data(), .nulls = 0};
+        column.buffers.push_back({.values = std::move(values),
+                                  .validity = std::move(validity),
+                                  .size = Narrow<int64_t>(length)});
       }
     }
     if (!call.arguments.empty()) {
@@ -247,9 +249,9 @@ arrow::Result<OrderedLayout> OrderRows(const plan::WindowCall& call,
   ARROW_RETURN_NOT_OK(layout.offsets.Resize(input.size()));
   ARROW_RETURN_NOT_OK(layout.permutation.Resize(rows));
   ARROW_RETURN_NOT_OK(layout.starts.Resize(rows));
-  const std::size_t count_buckets = buckets.source != nullptr ? buckets.source->count
-                                    : local                   ? GroupTable::kPartitions
-                                                              : 1;
+  const std::size_t local_buckets = local ? GroupTable::kPartitions : 1;
+  const std::size_t count_buckets =
+      buckets.source != nullptr ? buckets.source->count : local_buckets;
   PoolVector<std::uint8_t> bucket_ids(ctx.pool);
   if (local) {
     ARROW_RETURN_NOT_OK(bucket_ids.Resize(rows));
@@ -372,10 +374,10 @@ arrow::Result<OrderedLayout> OrderRows(const plan::WindowCall& call,
     }
     for (auto& column : direct) {
       WindowPrefixState state;
-      WindowPrefixTarget target{{column.first.data(), column.first.size()},
-                                {column.pieces.data(), column.pieces.size()},
-                                column.width,
-                                column.batch_rows};
+      WindowPrefixTarget target{.first = {column.first.data(), column.first.size()},
+                                .pieces = {column.pieces.data(), column.pieces.size()},
+                                .width = column.width,
+                                .batch_rows = column.batch_rows};
       ARROW_RETURN_NOT_OK(
           WindowPrefixes(column.call, {column.arguments.data(), column.arguments.size()},
                          {layout.permutation.data() + begin, end - begin},
@@ -414,7 +416,8 @@ arrow::Status PrepareOrdered(Specification& spec, const std::vector<plan::Window
   // as peers. Other first keys route an entire SQL partition to the same worker.
   const bool local = !rank && buckets.source == nullptr && !first.partition_by.empty() &&
                      first.partition_by.front().type != plan::LogicalType::kDouble &&
-                     ctx.executor != nullptr && ctx.threads > 1 && rows >= 4 * kChunkRows;
+                     ctx.executor != nullptr && ctx.threads > 1 &&
+                     rows >= std::size_t{4} * kChunkRows;
   MemoryReservation direct_memory;
   direct_memory.Reset(ctx.budget);
   std::vector<DirectColumn> direct;
@@ -446,9 +449,9 @@ arrow::Status PrepareOrdered(Specification& spec, const std::vector<plan::Window
       for (std::size_t j = 0; j < column.pieces.size(); ++j) {
         const auto& buffers = column.buffers[j];
         const int64_t nulls = column.pieces[j].nulls;
-        chunks.push_back(arrow::MakeArray(
-            arrow::ArrayData::Make(plan::ToArrow(column.call.type), buffers.size,
-                                   {nulls ? buffers.validity : nullptr, buffers.values}, nulls)));
+        chunks.push_back(arrow::MakeArray(arrow::ArrayData::Make(
+            plan::ToArrow(column.call.type), buffers.size,
+            {nulls > 0 ? buffers.validity : nullptr, buffers.values}, nulls)));
       }
     }
     return arrow::Status::OK();
@@ -845,7 +848,7 @@ arrow::Result<Batch> WindowOperator::NextBatch() {
   while (true) {
     const auto piece_rows =
         std::min(Narrow<std::size_t>(s.ctx.batch_size), static_cast<std::size_t>(kChunkRows));
-    count = std::min(count, piece_rows - s.row % piece_rows);
+    count = std::min(count, piece_rows - (s.row % piece_rows));
     ARROW_RETURN_NOT_OK(s.refs.Resize(count));
     MemoryReservation scratch;
     scratch.Reset(s.ctx.budget);
@@ -862,7 +865,7 @@ arrow::Result<Batch> WindowOperator::NextBatch() {
     for (const auto& spec : s.specifications) {
       if (!spec.direct.empty()) {
         for (std::size_t i = 0; i < spec.calls.size(); ++i) {
-          const auto& chunk = spec.direct[i][spec.direct_first[s.chunk] + s.row / piece_rows];
+          const auto& chunk = spec.direct[i][spec.direct_first[s.chunk] + (s.row / piece_rows)];
           const auto offset = Narrow<int64_t>(s.row % piece_rows);
           if (offset == 0 && Narrow<int64_t>(count) == chunk->length()) {
             columns[width + spec.calls[i]] = chunk;

@@ -159,8 +159,9 @@ class InlineWindowExecutor final : public arrow::internal::Executor {
   int GetCapacity() override { return 4; }
 
  protected:
-  arrow::Status SpawnReal(arrow::internal::TaskHints, arrow::internal::FnOnce<void()> task,
-                          arrow::StopToken, StopCallback&&) override {
+  arrow::Status SpawnReal(arrow::internal::TaskHints /*hints*/,
+                          arrow::internal::FnOnce<void()> task, arrow::StopToken /*stop_token*/,
+                          StopCallback&& /*stop_callback*/) override {
     std::move(task)();
     return arrow::Status::OK();
   }

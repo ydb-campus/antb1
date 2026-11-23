@@ -56,18 +56,17 @@ class DirectWriter {
     }
     piece_ = &target_.pieces[piece];
   }
-  arrow::Status Reserve(int64_t) { return arrow::Status::OK(); }
   arrow::Status AppendNull() {
     auto& byte = piece_->validity[slot_ / 8];
     std::atomic_ref<std::uint8_t>(byte).fetch_and(static_cast<std::uint8_t>(~(1U << (slot_ % 8))),
                                                   std::memory_order_relaxed);
-    std::memset(piece_->values + slot_ * target_.width, 0, target_.width);
+    std::memset(piece_->values + (slot_ * target_.width), 0, target_.width);
     std::atomic_ref<int64_t>(piece_->nulls).fetch_add(1, std::memory_order_relaxed);
     return arrow::Status::OK();
   }
   template <class T>
   arrow::Status Append(const T& value) {
-    auto* dst = piece_->values + slot_ * target_.width;
+    auto* dst = piece_->values + (slot_ * target_.width);
     if constexpr (std::is_same_v<T, arrow::Decimal128> || std::is_same_v<T, arrow::Decimal64>) {
       value.ToBytes(dst);
     } else if constexpr (std::is_arithmetic_v<T>) {
@@ -78,7 +77,6 @@ class DirectWriter {
     }
     return arrow::Status::OK();
   }
-  arrow::Result<std::shared_ptr<arrow::Array>> Finish() { return std::shared_ptr<arrow::Array>{}; }
 
  private:
   WindowPrefixTarget& target_;
@@ -91,7 +89,9 @@ arrow::Result<std::shared_ptr<arrow::Array>> EmitPrefixes(std::span<const RowRef
                                                           std::span<const std::uint8_t> starts,
                                                           WindowPrefixState& state,
                                                           Builder& builder, const Step& step) {
-  ARROW_RETURN_NOT_OK(builder.Reserve(Narrow<int64_t>(rows.size())));
+  if constexpr (!std::is_same_v<Builder, DirectWriter>) {
+    ARROW_RETURN_NOT_OK(builder.Reserve(Narrow<int64_t>(rows.size())));
+  }
   for (std::size_t i = 0; i < rows.size(); ++i) {
     if (starts[i] != 0) {
       state = {};
@@ -101,7 +101,11 @@ arrow::Result<std::shared_ptr<arrow::Array>> EmitPrefixes(std::span<const RowRef
     }
     ARROW_RETURN_NOT_OK(step(rows[i], builder));
   }
-  return builder.Finish();
+  if constexpr (std::is_same_v<Builder, DirectWriter>) {
+    return std::shared_ptr<arrow::Array>{};
+  } else {
+    return builder.Finish();
+  }
 }
 
 template <class Builder, class Step>

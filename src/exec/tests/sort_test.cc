@@ -838,7 +838,7 @@ TEST_F(SortTest, PackedCompositeSortMatchesStableComparatorAcrossBatches) {
     if (i == 4) {
       ASSERT_TRUE(large.AppendNull().ok());
     } else {
-      ASSERT_TRUE(large.Append(arrow::Decimal128(i % 3 - 1, static_cast<uint64_t>(i % 5))).ok());
+      ASSERT_TRUE(large.Append(arrow::Decimal128((i % 3) - 1, static_cast<uint64_t>(i % 5))).ok());
     }
   }
   const auto batch = WithIds({small, id, text, real, large.Finish().ValueOrDie()});
@@ -852,7 +852,7 @@ TEST_F(SortTest, PackedCompositeSortMatchesStableComparatorAcrossBatches) {
     std::vector<SortBuffer::RowRef> reference;
     for (std::uint32_t c = 0; c < 2; ++c) {
       for (std::uint32_t r = 0; r < (c == 0 ? 4U : 6U); ++r) {
-        const SortBuffer::RowRef ref{c, r};
+        const SortBuffer::RowRef ref{.chunk = c, .row = r};
         entries.push_back(layout.Encode(arrays[c], ref));
         reference.push_back(ref);
       }
@@ -911,7 +911,7 @@ TEST_F(SortTest, PackedKeysVerifyRangesAndDictionariesBeforeSorting) {
     const std::vector<RowComparator::KeyArrays> arrays{cmp.KeysOf(*batch)};
     std::vector<SortBuffer::RowRef> rows;
     for (std::uint32_t r = 0; r < kRows; ++r) {
-      rows.push_back({0, r});
+      rows.push_back({.chunk = 0, .row = r});
     }
     auto expected = rows;
     std::ranges::stable_sort(expected, [&](auto a, auto b) {
