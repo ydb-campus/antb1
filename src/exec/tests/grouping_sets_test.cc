@@ -20,6 +20,7 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
@@ -345,7 +346,8 @@ TEST_F(GroupingSetsTest, MergeProjectedAddsManyGroupsInBoundedChunks) {
 // row by default), s VARCHAR ('a' + (row % 5), NULL every 13th), d DATE (row % 3), m DECIMAL(10,2)
 // (row
 // * 1.25), x DOUBLE (row * 0.1, rounding by order when summed), v BIGINT (row).
-std::shared_ptr<MemoryTable> Table(bool split, int64_t parts = 12, int64_t key_period = 7) {
+std::shared_ptr<MemoryTable> Table(bool split, int64_t parts = 12, int64_t key_period = 7,
+                                   int64_t date_period = 3) {
   const auto schema =
       arrow::schema({arrow::field("a", arrow::int64()), arrow::field("s", arrow::binary()),
                      arrow::field("d", arrow::date32()),
@@ -366,7 +368,7 @@ std::shared_ptr<MemoryTable> Table(bool split, int64_t parts = 12, int64_t key_p
       s.push_back(row % 13 == 0
                       ? std::nullopt
                       : std::optional(std::string(1, static_cast<char>('a' + (row % 5)))));
-      d.emplace_back(static_cast<int32_t>(row % 3));
+      d.emplace_back(static_cast<int32_t>(row % date_period));
       m.emplace_back(std::to_string(row * 125));
       EXPECT_TRUE(x.Append(static_cast<double>(row) * 0.1).ok());
       v.emplace_back(row);
@@ -575,6 +577,36 @@ plan::LogicalNodePtr GroupingSets(const plan::LogicalNodePtr& input,
                                      .sets = std::move(sets),
                                      .aggregates = std::move(calls),
                                      .grouping = std::move(grouping)});
+}
+
+TEST_F(GroupingSetsTest, UncheckedWideDecimalKeepsOverflowBeforeCancellation) {
+  const auto type = LogicalType::Decimal(37, 0);
+  const std::string magnitude = "9" + std::string(37, '0');
+  const auto schema = arrow::schema(
+      {arrow::field("key", arrow::int64()), arrow::field("value", plan::ToArrow(type))});
+  const auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {testing::Int64s({1, 2, 1}),
+                                testing::Decimals(type, {magnitude, magnitude, "-" + magnitude})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+  const auto scan = Node(plan::ScanNode{.table = table,
+                                        .table_name = "t",
+                                        .fields = {0, 1},
+                                        .ids = {plan::ColumnId{1}, plan::ColumnId{2}}});
+  auto key = Column(0, "key", LogicalType::kBigInt);
+  key.id = plan::ColumnId{1};
+  auto value = Column(1, "value", type);
+  value.id = plan::ColumnId{2};
+  for (const auto kind : {AggKind::kSum, AggKind::kAvg}) {
+    const auto root = GroupingSets(
+        scan, {key}, {{0}, {}},
+        {{.kind = kind,
+          .arg = value,
+          .type = kind == AggKind::kSum ? LogicalType::Decimal(38, 0) : LogicalType::kDouble}});
+    const auto result = RunPlan(root, nullptr);
+    ASSERT_FALSE(result.ok());
+    EXPECT_TRUE(result.status().message().contains("overflow")) << result.status();
+  }
 }
 
 struct Case {
@@ -989,6 +1021,43 @@ TEST_F(GroupingSetsTest, SetsMergeInBatchesUnderAMemoryLimit) {
       EXPECT_TRUE(split) << "no limit split the second level and still finished";
     }
   }
+}
+
+TEST_F(GroupingSetsTest, LargeColocatedSubtotalsFitOneAtATime) {
+  const auto table = Table(/*split=*/true, /*parts=*/80, /*key_period=*/7, /*date_period=*/1);
+  const std::vector<plan::BoundColumn> keys = {ColD(), ColV(), ColA(), ColS(), ColM()};
+  const std::vector<plan::AggregateCall> calls = {{.kind = AggKind::kCountStar}};
+  // All rows route together and the unique second key makes each subtotal as large as the root.
+  const Sets sets = {{0, 1, 2, 3, 4}, {0, 1, 2, 3}, {0, 1, 2, 4}, {0, 1, 3, 4},
+                     {0, 1, 2},       {0, 1, 3},    {0, 1, 4},    {0, 1}};
+  const auto run = [&](const Sets& selected, MemoryBudget& budget) -> arrow::Result<int64_t> {
+    const auto root = GroupingSets(Scan(table), keys, selected, calls);
+    plan::LogicalPlan plan{.root = root, .output = {}};
+    plan.output.assign(OutputWidth(*root),
+                       plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
+    ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(plan));
+    EXPECT_NE(op->RequestPartitioning(0, PartitionRequest::kAllowRouting), nullptr);
+    ExecContext ctx{.pool = &budget, .budget = &budget};
+    ARROW_RETURN_NOT_OK(op->Open(ctx));
+    int64_t rows = 0;
+    for (;;) {
+      ARROW_ASSIGN_OR_RAISE(auto batch, op->Next());
+      if (batch.end()) {
+        break;
+      }
+      rows += batch.data->num_rows();
+    }
+    ARROW_RETURN_NOT_OK(op->Close());
+    return rows;
+  };
+  MemoryBudget unlimited(std::nullopt, arrow::default_memory_pool());
+  const auto one = run({sets[0], sets[1]}, unlimited);
+  ASSERT_TRUE(one.ok()) << one.status();
+  MemoryBudget limited(unlimited.max_memory() + (unlimited.max_memory() / 4),
+                       arrow::default_memory_pool());
+  const auto all = run(sets, limited);
+  ASSERT_TRUE(all.ok()) << all.status();
+  EXPECT_EQ(*all, (*one / 2) * Narrow<int64_t>(sets.size()));
 }
 
 // The finest key is unique. Dropping it leaves a few combinations of nullable keys per

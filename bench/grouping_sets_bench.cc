@@ -450,8 +450,7 @@ arrow::Result<int64_t> Operate(Profile p, Operated mode, int threads, exec::Memo
     }
     op = std::make_unique<exec::PartGroupingSetsOperator>(
         pipeline, count, keys + 1, Prefix(keys), std::move(sets), InputCalls(keys),
-        std::vector<plan::GroupingCall>{}, [p] { return RowsOf(Input(p)); },
-        mode == Operated::kPerSet);
+        std::vector<plan::GroupingCall>{}, mode == Operated::kPerSet);
   }
   ARROW_ASSIGN_OR_RAISE(auto pool, arrow::internal::ThreadPool::Make(threads));
   exec::ExecContext ctx{

@@ -149,6 +149,37 @@ TEST_F(SessionTest, WideDecimalRollupUsesTheVerifiedJoinMultiplicity) {
   }
 }
 
+TEST_F(SessionTest, RollupChecksEveryWideDecimalCoalesceArm) {
+  auto session = Session::Make().ValueOrDie();
+  const auto type = arrow::decimal128(26, 0);
+  arrow::Decimal128Builder amounts(type);
+  arrow::Int64Builder keys;
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_TRUE(keys.Append(i % 2).ok());
+    ASSERT_TRUE(amounts.Append(arrow::Decimal128(i)).ok());
+  }
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64()), arrow::field("raw", type)});
+  const auto data =
+      arrow::Table::Make(schema, {keys.Finish().ValueOrDie(), amounts.Finish().ValueOrDie()});
+  const auto path = (dir_ / "decimal.parquet").string();
+  const auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*data, arrow::default_memory_pool(), out, 8).ok());
+  ASSERT_TRUE(out->Close().ok());
+  ASSERT_TRUE(session->RegisterParquet("samples", {path}).ok());
+  // The product and zero have proven bounds. A same-type cast of the file column does not.
+  for (const bool checked : {true, false}) {
+    const auto sql = std::format(
+        "SELECT k, SUM(x) FROM (SELECT k, COALESCE(CAST(k AS DECIMAL(20,0)) * "
+        "CAST(k AS DECIMAL(6,0)), {}) AS x FROM samples) s GROUP BY ROLLUP(k)",
+        checked ? "0" : "CAST(raw AS DECIMAL(26,0))");
+    const auto profile = session->ExplainAnalyze(sql);
+    ASSERT_TRUE(profile.ok()) << profile.status();
+    const auto json = FormatProfile(*profile, ProfileFormat::kJson);
+    const auto visits = std::format("\"local_rows\":{}", checked ? 8 : 16);
+    EXPECT_TRUE(json.contains(visits + ",") || json.contains(visits + "}")) << json;
+  }
+}
+
 TEST_F(SessionTest, WideDecimalRollupKeepsIntermediateOverflowBeforeCancellation) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("events", {path_}).ok());

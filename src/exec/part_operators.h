@@ -298,9 +298,8 @@ class PartGroupingSetsOperator final : public PartSink {
                            std::vector<plan::BoundColumn> keys,
                            std::vector<std::vector<std::size_t>> sets,
                            std::vector<plan::AggregateCall> aggregates,
-                           std::vector<plan::GroupingCall> grouping,
-                           std::function<std::optional<int64_t>()> input_row_bound,
-                           bool per_set = false);
+                           std::vector<plan::GroupingCall> grouping, bool per_set = false,
+                           std::function<std::optional<int64_t>()> checked_decimal_rows = {});
   ~PartGroupingSetsOperator() override;
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
@@ -344,7 +343,7 @@ class PartGroupingSetsOperator final : public PartSink {
   std::vector<plan::AggregateCall> aggregates_;
   std::vector<std::vector<std::size_t>> sets_;
   std::vector<plan::GroupingCall> grouping_calls_;
-  std::function<std::optional<int64_t>()> input_row_bound_;
+  std::function<std::optional<int64_t>()> checked_decimal_rows_;
   bool per_set_;
   GroupingSetsShape shape_;
   std::vector<std::size_t> roots_;                           // the root sets

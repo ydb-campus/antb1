@@ -748,8 +748,8 @@ constexpr int64_t kMinGroupBytes = 64;
 PartGroupingSetsOperator::PartGroupingSetsOperator(
     PartPipeline pipeline, int64_t num_parts, int input_width, std::vector<plan::BoundColumn> keys,
     std::vector<std::vector<std::size_t>> sets, std::vector<plan::AggregateCall> aggregates,
-    std::vector<plan::GroupingCall> grouping,
-    std::function<std::optional<int64_t>()> input_row_bound, bool per_set)
+    std::vector<plan::GroupingCall> grouping, bool per_set,
+    std::function<std::optional<int64_t>()> checked_decimal_rows)
     : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       input_width_(input_width),
@@ -757,7 +757,7 @@ PartGroupingSetsOperator::PartGroupingSetsOperator(
       aggregates_(std::move(aggregates)),
       sets_(std::move(sets)),
       grouping_calls_(std::move(grouping)),
-      input_row_bound_(std::move(input_row_bound)),
+      checked_decimal_rows_(std::move(checked_decimal_rows)),
       per_set_(per_set),
       schema_(GroupingSetsSchema(keys_, aggregates_, grouping_calls_.size())) {}
 
@@ -803,8 +803,8 @@ arrow::Status PartGroupingSetsOperator::Open(ExecContext& ctx) {
   merged_ = false;
   opened_ = true;
   // BuildsFirstOperator has prepared the probe pipeline's join tables by this point.
-  shape_ =
-      PlanGroupingSets(sets_, !per_set_ && MergesExactly(keys_, aggregates_, input_row_bound_()));
+  const auto max_rows = checked_decimal_rows_ ? checked_decimal_rows_() : std::nullopt;
+  shape_ = PlanGroupingSets(sets_, !per_set_ && MergesExactly(keys_, aggregates_, max_rows));
   roots_.clear();
   set_schemas_.clear();
   grouping_.clear();
@@ -988,6 +988,7 @@ arrow::Status PartGroupingSetsOperator::Probe() {
       }
     }
   }
+  const bool limited = budget_ != nullptr && budget_->limit().has_value();
   const auto probe = [&](std::size_t s, const GroupTable& source,
                          const std::vector<std::size_t>& columns) -> arrow::Status {
     const std::size_t r = shape.sources[s];
@@ -1005,9 +1006,14 @@ arrow::Status PartGroupingSetsOperator::Probe() {
     const Int128 scaled = Int128{groups} * root_groups[r] / std::max<int64_t>(root.num_groups(), 1);
     estimate_[s] =
         std::min<int64_t>(root_groups[r], Int128ToInt64(scaled).value_or(root_groups[r]));
+    const bool reduces = groups * 4 <= int64_t{root.num_groups()};
     if (derivation_[s] == Derivation::kLocal) {
-      partial_[s][largest[r]] = std::move(table);
-    } else if (groups * 4 <= int64_t{root.num_groups()}) {
+      // A non-reducing probe can be as large as its root. Under a limit keep its estimate
+      // and build the table once its batch is admitted.
+      if (!limited || reduces) {
+        partial_[s][largest[r]] = std::move(table);
+      }
+    } else if (reduces) {
       ARROW_RETURN_NOT_OK(table->Partition());
       partial_[s][largest[r]] = std::move(table);  // the probe is that partition's first merge
     } else {
@@ -1038,8 +1044,11 @@ arrow::Status PartGroupingSetsOperator::Probe() {
     }
   }
   if (!chain_rollup_) {
-    ARROW_RETURN_NOT_OK(
-        ForEach(executor_, probes.size(), [&](std::size_t i) { return probe_root(probes[i]); }));
+    // Limit simultaneous probe tables too: several large colocated sets may share one bucket.
+    const bool local_probes = std::ranges::any_of(
+        probes, [&](std::size_t s) { return derivation_[s] == Derivation::kLocal; });
+    ARROW_RETURN_NOT_OK(ForEach(limited && local_probes ? nullptr : executor_, probes.size(),
+                                [&](std::size_t i) { return probe_root(probes[i]); }));
   }
   // The bytes of a group, as the roots hold them: the budget's charge after the first level, and
   // at least kMinGroupBytes, so that an estimate is never 0 and a limit always weighs every set.

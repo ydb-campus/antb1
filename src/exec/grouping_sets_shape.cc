@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -21,6 +22,58 @@
 
 namespace antb1::exec {
 namespace {
+
+bool CheckedDecimalColumn(const plan::LogicalNode& node, plan::ColumnId id);
+
+bool CheckedDecimalExpr(const plan::LogicalNode& input, const plan::Expr& expr) {
+  if (const auto* col = std::get_if<plan::ColumnExpr>(&expr.node)) {
+    return CheckedDecimalColumn(input, col->id);
+  }
+  if (const auto* cast = std::get_if<plan::CastExpr>(&expr.node)) {
+    // Convert range-checks a conversion to a different DECIMAL type. A same-type cast passes
+    // through the original array and inherits its proof.
+    return cast->operand->type != expr.type || CheckedDecimalExpr(input, *cast->operand);
+  }
+  if (const auto* branch = std::get_if<plan::CaseExpr>(&expr.node)) {
+    const auto checked = [&](const plan::ExprPtr& value) {
+      return !value || value->type != expr.type || CheckedDecimalExpr(input, *value);
+    };
+    return checked(branch->otherwise) && std::ranges::all_of(branch->thens, checked);
+  }
+  // DecimalArith and its compiled equivalent check the result against the declared width.
+  return std::holds_alternative<plan::ArithExpr>(expr.node) ||
+         std::holds_alternative<plan::ConstantExpr>(expr.node);
+}
+
+bool CheckedDecimalColumn(const plan::LogicalNode& node, plan::ColumnId id) {
+  if (id == plan::kNoColumnId) {
+    return false;
+  }
+  if (const auto* compute = std::get_if<plan::ComputeNode>(&node)) {
+    const auto it = std::ranges::find(compute->ids, id);
+    return it == compute->ids.end()
+               ? CheckedDecimalColumn(*compute->input, id)
+               : CheckedDecimalExpr(
+                     *compute->input,
+                     *compute->exprs[Narrow<std::size_t>(it - compute->ids.begin())]);
+  }
+  if (const auto* project = std::get_if<plan::ProjectNode>(&node)) {
+    const auto it = std::ranges::find(project->ids, id);
+    if (it == project->ids.end()) {
+      return false;
+    }
+    const auto index = Narrow<std::size_t>(it - project->ids.begin());
+    return (!project->constants.empty() && project->constants[index].has_value()) ||
+           CheckedDecimalColumn(*project->input, project->columns[index].id);
+  }
+  if (const auto* filter = std::get_if<plan::FilterNode>(&node)) {
+    return CheckedDecimalColumn(*filter->input, id);
+  }
+  if (const auto* join = std::get_if<plan::JoinNode>(&node)) {
+    return CheckedDecimalColumn(*join->left, id) || CheckedDecimalColumn(*join->right, id);
+  }
+  return false;
+}
 
 bool MergesExactly(const plan::AggregateCall& call, std::optional<int64_t> max_rows) {
   const std::optional<plan::LogicalType> input =
@@ -100,6 +153,17 @@ std::vector<GroupingSetsShape::RollupLevel> NestedRollup(
 }
 
 }  // namespace
+
+bool WideDecimalInputsChecked(const plan::GroupingSetsNode& node) {
+  return std::ranges::all_of(node.aggregates, [&](const plan::AggregateCall& call) {
+    if ((call.kind != plan::AggKind::kSum && call.kind != plan::AggKind::kAvg) ||
+        !call.arg.has_value() || call.arg->type != plan::LogicalType::kDecimal ||
+        call.arg->type.width() <= plan::LogicalType::kMaxNarrowDecimalWidth) {
+      return true;
+    }
+    return CheckedDecimalColumn(*node.input, call.arg->id);
+  });
+}
 
 bool MergesExactly(const std::vector<plan::BoundColumn>& keys,
                    const std::vector<plan::AggregateCall>& calls, std::optional<int64_t> max_rows) {

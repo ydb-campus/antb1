@@ -20,6 +20,10 @@
 
 namespace antb1::exec {
 
+// Whether the producers of every wide decimal SUM/AVG argument guarantee its declared precision.
+// A scan can deliver an out-of-precision decimal128. A row-count bound alone cannot justify reuse.
+bool WideDecimalInputsChecked(const plan::GroupingSetsNode& node);
+
 // Whether every set of an aggregation by `keys` with `calls` may be merged from the groups of a set
 // that contains it and still equal the GROUP BY of that set exactly, whatever the order of the
 // merge: no DOUBLE key (a merge keeps the normalized value, not the one first seen), and only calls
@@ -27,7 +31,8 @@ namespace antb1::exec {
 // but HUGEINT and of a DECIMAL of at most 18 digits (a 128-bit sum that never overflows); AVG of a
 // DATE or a TIMESTAMP; MIN and MAX of anything but DOUBLE (whose -0.0 and NaN keep the value seen
 // first). COUNT(DISTINCT), a DOUBLE sum, and the variance family do not. A wider decimal sum is
-// also exact if the guaranteed input row bound times the largest unscaled magnitude fits in
+// also exact if the guaranteed input row bound (supplied only for checked inputs) times the
+// largest unscaled magnitude fits in
 // DECIMAL(38,s).
 bool MergesExactly(const std::vector<plan::BoundColumn>& keys,
                    const std::vector<plan::AggregateCall>& calls,

@@ -449,7 +449,9 @@ For a rollup over a part pipeline, wide decimal SUM and AVG can reuse the finest
 all intermediate sums fit in 38 digits. The exact scan row count bounds the number of inputs
 through filters, computations, projections and joins that emit at most one row per probe row.
 For a join that can emit multiple matches, the operator checks uniqueness in the prepared build.
-The row bound times the largest absolute unscaled input must fit at the original scale. Without
+The decimal argument must come from a checked producer such as arithmetic or a range-checked cast.
+A CASE or COALESCE carries that proof only when every result arm fits. A raw scan can deliver values
+outside the declared precision. The row bound times the proven magnitude must fit at the original scale. Without
 that proof, each grouping set accumulates its own wide decimal state in the original order.
 
 A grouped producer can distribute its output on one requested grouping column. Its part tables
@@ -459,7 +461,8 @@ root bucket, so it can be emitted directly after the local merge. Exact nested g
 subtotal from its immediate finer level using the existing aggregate states and key chunks. The
 part operator measures the first subtotal in the largest root bucket. When it reduces the group count at
 least fourfold and all levels fit the same budgeted batch, each bucket builds them in dependency order.
-Other batches read their subtotals from the finest groups. When the active buckets leave workers idle,
+Under a memory limit, non-reducing colocated probes keep only their size estimates until their
+batch is selected. Other batches read their subtotals from the finest groups. When the active buckets leave workers idle,
 workers can build different subtotals from the same immutable chunks. Each subtotal table has one
 writer. Batches that need a shared key snapshot keep one task per bucket. A set omitting the
 routing column completes its normal aggregation and sends its result batches to the bucket for
