@@ -910,6 +910,7 @@ TEST_F(SortTest, PackedKeysVerifyRangesAndDictionariesBeforeSorting) {
             .ValueOrDie();
     const std::vector<RowComparator::KeyArrays> arrays{cmp.KeysOf(*batch)};
     std::vector<SortBuffer::RowRef> rows;
+    rows.reserve(kRows);
     for (std::uint32_t r = 0; r < kRows; ++r) {
       rows.push_back({.chunk = 0, .row = r});
     }
