@@ -1,5 +1,6 @@
 #include "../window.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -17,6 +18,7 @@
 #include "antb1/exec/aggregate_state.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
+#include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
@@ -148,6 +150,142 @@ TEST_F(WindowTest, RowsPrefixesCarryStateAcrossChunksAndResetPartitions) {
     EXPECT_EQ(valid_counts[i], static_cast<int64_t>(i < 65535 ? i + 1 : i < 65537 ? i : i - 65537));
     EXPECT_EQ(minima[i], i == 65537 ? std::nullopt : std::optional<int64_t>(i == 0 ? 7 : 3));
     EXPECT_EQ(maxima[i], i == 65537 ? std::nullopt : std::optional<int64_t>(i < 65537 ? 7 : 3));
+  }
+}
+
+// Exercise the executor path deterministically on the test thread.
+class InlineWindowExecutor final : public arrow::internal::Executor {
+ public:
+  int GetCapacity() override { return 4; }
+
+ protected:
+  arrow::Status SpawnReal(arrow::internal::TaskHints /*hints*/,
+                          arrow::internal::FnOnce<void()> task, arrow::StopToken /*stop_token*/,
+                          StopCallback&& /*stop_callback*/) override {
+    std::move(task)();
+    return arrow::Status::OK();
+  }
+};
+
+TEST_F(WindowTest, BucketWorkersWriteNullablePrefixesToTheirOriginalBatchPositions) {
+  constexpr int64_t kRows = (4 * 65536) + 13;
+  arrow::Int64Builder keys;
+  arrow::Int64Builder values;
+  arrow::Int64Builder sequence;
+  ASSERT_TRUE(keys.Reserve(kRows).ok());
+  ASSERT_TRUE(values.Reserve(kRows).ok());
+  ASSERT_TRUE(sequence.Reserve(kRows).ok());
+  for (int64_t i = 0; i < kRows; ++i) {
+    if (i % 97 == 0) {
+      keys.UnsafeAppendNull();
+    } else {
+      keys.UnsafeAppend(i % 53);
+    }
+    if (i % 97 == 0 || i % 11 == 0) {
+      values.UnsafeAppendNull();
+    } else {
+      values.UnsafeAppend(i % 271);
+    }
+    sequence.UnsafeAppend(i);
+  }
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64()),
+                     arrow::field("seq", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(
+      schema, kRows,
+      {keys.Finish().ValueOrDie(), values.Finish().ValueOrDie(), sequence.Finish().ValueOrDie()});
+  auto sum = Prefix(AggKind::kSum, LogicalType::kBigInt, LogicalType::kHugeInt);
+  auto max = Prefix(AggKind::kMax, LogicalType::kBigInt, LogicalType::kBigInt);
+  sum.order_by = {{.column = Column(2, "seq", LogicalType::kBigInt), .descending = true}};
+  max.order_by = sum.order_by;
+  const auto run = [&](arrow::internal::Executor* executor, ProfileNode& profile) {
+    auto source = std::make_unique<ScriptedSource>(
+        schema, std::vector<Batch>{{.data = batch->Slice(0, 100003), .selection = {}},
+                                   {.data = batch->Slice(100003), .selection = {}}});
+    WindowOperator op(std::move(source), {sum, max});
+    op.set_profile(&profile);
+    ExecContext ctx{
+        .batch_size = 509, .executor = executor, .threads = executor == nullptr ? 1 : 4};
+    return Drain(op, ctx);
+  };
+  ProfileNode serial_profile;
+  const auto serial = run(nullptr, serial_profile);
+  ASSERT_TRUE(serial.ok()) << serial.status();
+  InlineWindowExecutor executor;
+  ProfileNode profile;
+  const auto bucketed = run(&executor, profile);
+  ASSERT_TRUE(bucketed.ok()) << bucketed.status();
+  EXPECT_TRUE((*serial)->Equals(**bucketed));
+  const auto metrics = profile.metrics();
+  const auto direct = std::ranges::find(metrics, "direct_prefix_columns", &ProfileMetric::name);
+  ASSERT_NE(direct, metrics.end());
+  EXPECT_EQ(direct->value, 2);
+  const auto packed = std::ranges::find(metrics, "packed_sort_rows", &ProfileMetric::name);
+  ASSERT_NE(packed, metrics.end());
+  EXPECT_GT(packed->value, 0);
+}
+
+// All batches come from one bucket. Other buckets in the advertised distribution are empty.
+class OneBucketSource final : public Operator {
+ public:
+  OneBucketSource(const std::shared_ptr<arrow::Schema>& schema, std::vector<Batch> batches)
+      : source_(schema, std::move(batches)) {}
+  const std::shared_ptr<arrow::Schema>& output_schema() const override {
+    return source_.output_schema();
+  }
+  const BatchPartition* RequestPartitioning(int column, PartitionRequest /*request*/) override {
+    return column == 0 ? &partition_ : nullptr;
+  }
+  arrow::Status Open(ExecContext& ctx) override { return source_.Open(ctx); }
+  arrow::Result<Batch> Next() override { return source_.Next(); }
+  arrow::Status Close() override { return source_.Close(); }
+
+ private:
+  ScriptedSource source_;
+  BatchPartition partition_{.count = 32, .bucket = 13};
+};
+
+TEST_F(WindowTest, OversizedRankBucketsSplitOnlyBetweenCompletePartitions) {
+  constexpr int64_t kRows = (2 * 65536) + 11;
+  InlineWindowExecutor executor;
+  for (const bool mixed : {true, false}) {
+    arrow::Int64Builder keys;
+    arrow::Int64Builder scores;
+    ASSERT_TRUE(keys.Reserve(kRows).ok());
+    ASSERT_TRUE(scores.Reserve(kRows).ok());
+    for (int64_t i = 0; i < kRows; ++i) {
+      if (mixed && i % 257 < 128) {
+        keys.UnsafeAppendNull();
+      } else {
+        keys.UnsafeAppend(1);
+      }
+      scores.UnsafeAppend(i % 31);
+    }
+    const auto schema =
+        arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+    const auto batch = arrow::RecordBatch::Make(
+        schema, kRows, {keys.Finish().ValueOrDie(), scores.Finish().ValueOrDie()});
+    const std::vector<Batch> batches{{.data = batch->Slice(0, 47003), .selection = {}},
+                                     {.data = batch->Slice(47003), .selection = {}}};
+    WindowOperator serial(std::make_unique<ScriptedSource>(schema, batches), {Rank()});
+    ExecContext one;
+    const auto expected = Drain(serial, one);
+    ASSERT_TRUE(expected.ok()) << expected.status();
+    WindowOperator distributed(std::make_unique<OneBucketSource>(schema, batches), {Rank()});
+    ProfileNode profile;
+    distributed.set_profile(&profile);
+    ExecContext ctx{.executor = &executor, .threads = 4};
+    const auto actual = Drain(distributed, ctx);
+    ASSERT_TRUE(actual.ok()) << actual.status();
+    EXPECT_TRUE((*expected)->Equals(**actual));
+    const auto metrics = profile.metrics();
+    const auto splits = std::ranges::find(metrics, "rank_bucket_splits", &ProfileMetric::name);
+    if (mixed) {
+      ASSERT_NE(splits, metrics.end());
+      EXPECT_EQ(splits->value, 1);
+    } else {
+      EXPECT_EQ(splits, metrics.end());
+    }
   }
 }
 

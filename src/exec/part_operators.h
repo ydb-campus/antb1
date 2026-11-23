@@ -282,7 +282,7 @@ class PartGroupAggregateOperator final : public PartSink {
 // lane, every root's partition p in lane p. Then the second level, in batches of the other sets
 // (NextBatch: as many as fit half of the memory budget's free bytes by the probe's estimate, all of
 // them without a limit), each in one pass and one barrier: each partition merges its root groups
-// into a table per set of the batch (MergeProjected), in parallel over the partitions; after the
+// into a table per set of the batch, reusing adjacent levels for a reducing rollup. After the
 // barrier, each of those sets' final tables gathers one of its own partitions from every
 // partition's table, in partition order, in parallel over the sets and their partitions. A batch
 // is emitted before the next is built, and a root stays until the last set merged from it is. The
@@ -296,9 +296,10 @@ class PartGroupingSetsOperator final : public PartSink {
  public:
   PartGroupingSetsOperator(PartPipeline pipeline, int64_t num_parts, int input_width,
                            std::vector<plan::BoundColumn> keys,
-                           const std::vector<std::vector<std::size_t>>& sets,
+                           std::vector<std::vector<std::size_t>> sets,
                            std::vector<plan::AggregateCall> aggregates,
-                           const std::vector<plan::GroupingCall>& grouping, bool per_set = false);
+                           std::vector<plan::GroupingCall> grouping, bool per_set = false,
+                           std::function<std::optional<int64_t>()> checked_decimal_rows = {});
   ~PartGroupingSetsOperator() override;
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
@@ -327,7 +328,7 @@ class PartGroupingSetsOperator final : public PartSink {
   // The other sets to merge next, by their entries from `from_entry` on: as many as fit half of the
   // budget's free bytes by their estimates, at least one; all of them without a limit.
   [[nodiscard]] std::vector<std::size_t> NextBatch(std::size_t from_entry) const;
-  // The second level for `batch`: its sets' tables from their roots', in one pass and one barrier.
+  // Builds partial tables per bucket, then combines them for sets spanning multiple buckets.
   arrow::Status DeriveBatch(const std::vector<std::size_t>& batch);
   // A root partition's groups projected to `set`'s keys.
   [[nodiscard]] arrow::compute::ExecBatch Projected(const std::optional<KeySnapshot>& uniques,
@@ -340,7 +341,11 @@ class PartGroupingSetsOperator final : public PartSink {
   int input_width_;
   std::vector<plan::BoundColumn> keys_;
   std::vector<plan::AggregateCall> aggregates_;
-  std::unique_ptr<GroupingSetsShape> shape_;
+  std::vector<std::vector<std::size_t>> sets_;
+  std::vector<plan::GroupingCall> grouping_calls_;
+  std::function<std::optional<int64_t>()> checked_decimal_rows_;
+  bool per_set_;
+  GroupingSetsShape shape_;
   std::vector<std::size_t> roots_;                           // the root sets
   std::vector<std::shared_ptr<arrow::Schema>> set_schemas_;  // per distinct set: its table's
   std::vector<std::vector<std::int64_t>> grouping_;          // per distinct set: GROUPING values
@@ -353,10 +358,12 @@ class PartGroupingSetsOperator final : public PartSink {
   // Per distinct set, per partition: its rows, kept to the set's last entry.
   std::vector<std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>>> rows_;
   std::vector<bool> emitted_;  // per distinct set: whether an entry has emitted it
-  // The second level's state (Probe, DeriveBatch), per distinct set: its way (1: reduced first),
+  // The second level's state (Probe, DeriveBatch), per distinct set: its merge strategy,
   // its estimated groups, its probe's first merge until merged, whether merged, and per root the
   // sets left to merge from it.
-  std::vector<std::uint8_t> reduce_;
+  enum class Derivation : std::uint8_t { kReduce, kSplit, kLocal };
+  bool chain_rollup_ = false;  // the first subtotal reduced the sampled root bucket at least 4:1
+  std::vector<Derivation> derivation_;
   std::vector<int64_t> estimate_;
   std::vector<std::vector<std::unique_ptr<GroupTable>>> partial_;
   std::vector<bool> derived_;

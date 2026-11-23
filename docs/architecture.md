@@ -436,7 +436,7 @@ the builds, outermost first and each after the builds its input probes, then the
 | `GroupAggregateOperator` | `GroupAggregate` over other input | through an `exec::GroupTable`, materializes the selected rows, maps their keys to group ids with Arrow's `Grouper` (DOUBLE keys normalized first), feeds one `GroupedAggregateState` per call; after the input, emits one row per group: the keys as first seen, then the aggregates; without keys (`GROUP BY` of constants only) every row is in one group |
 | `GroupingSetsOperator` | `GroupingSets` over other input | as `PartGroupingSetsOperator` on one thread: a `GroupTable` per root set fed from the input, every other set merged from its root's groups (`GroupTable::MergeProjected`), the sets emitted in list order |
 | `WindowOperator` | `Window` with whole-partition aggregate calls (W2) | retains the pruned selected input once; shares a `GroupTable` and row-to-group IDs for compatible partition keys; finalizes each group once in bounded chunks, releases aggregate state, then gathers results back to the original rows; serial after upstream part pipelines, with every retained buffer and container charged to the query budget; empty input emits no row; a barrier to filter, top-N, sharing and decorrelation rewrites ([ADR 0043](adr/0043-window-functions.md)) |
-| `SortOperator` | `Sort`, or `Limit` over `Sort` over other input | reads its whole input into a `SortBuffer`, sorts row references stably with `RowComparator` (DuckDB's order: NULLs last by default, NaN above every number, VARCHAR by bytes; each row carries an order-preserving 64-bit prefix of its first key, so most comparisons are integer compares) and emits the rows in batches, gathered column by column with typed builders from the arrays it took of each chunk as it arrived (asking a batch for a column locks the batch); with a limit it keeps only `limit + offset` rows while it reads (top-N) and emits the window ([ADR 0011](adr/0011-sorting-and-top-n.md)) |
+| `SortOperator` | `Sort`, or `Limit` over `Sort` over other input | reads its whole input into a `SortBuffer`, sorts row references stably with `RowComparator` (DuckDB's order: NULLs last by default, NaN above every number, VARCHAR by bytes; large multi-key sorts with a fixed-width leading field can pack several keys into an integer comparison) and emits the rows in batches, gathered column by column with typed builders from the arrays it took of each chunk as it arrived (asking a batch for a column locks the batch); with a limit it keeps only `limit + offset` rows while it reads (top-N) and emits the window ([ADR 0011](adr/0011-sorting-and-top-n.md)) |
 | `LimitOperator` | `Limit` | skips `offset` rows, passes on at most `limit` rows (narrowing selections, not copying) and then never pulls its input again |
 | `HashJoinOperator` | a `Join`: its probe, in the part pipeline of the input it does not build on, or over that input | for every probe batch, `JoinTable::Find` of its selected rows' keys (`FindEvery` for a nested loop, an inner, left or full join without keys, ADR 0040: every build row is a candidate of every selected row, and its residuals decide, on the paths below); an inner join with a build of unique keys, windows of `batch_size` rows of the probe batch (slices, not copies) selected where they matched, the build's columns gathered by match and NULL elsewhere (`exec::GatherRows`); otherwise a batch of up to `batch_size` (probe row, match) pairs, the probe's columns taken and the build's gathered; then the residuals in order, each on the rows the ones before kept (NULL is false); rows in probe order, each one's matches in the build's (part, row) order; a left join the same, with a row without a match padded with NULLs of the build's types, and the probe's selection kept on the 1:1 path; a semi, anti or null-aware anti join, windows of `batch_size` rows of the probe batch selected where it keeps a row, without a lookup when it keeps every row or none; the residuals of a semi, anti or left join on the candidate pairs, every pair evaluated (a row's first candidate only, for a semi or anti join whose residuals read no build column but its keys: ADR 0022's E2c), a left join padding a row none of whose candidates passed after its last candidate; a one-row join, windows of the probe batch with its build's values sliced; a null-aware mark join (ADR 0041's SQ7a), windows of the probe batch with a BOOLEAN appended: FALSE throughout over an empty build, NULL throughout over a build of NULL keys alone, else TRUE where the row matched and NULL or FALSE where it did not (NULL for a NULL key or a build that holds one); a mark join (SQ8a) the same, two-valued: FALSE throughout over a build that holds no row, else TRUE where a candidate passed every residual (evaluated as a semi join's) and FALSE elsewhere, never NULL; over a serial input it prepares its own `JoinBuild` at its first `Next`; when its build empties the join it never opens its input; a FULL join (ADR 0037's OJ2) probes as a left join does and marks the build rows its pairs match, and the build rows no mark selects come out after the whole probe, their probe columns NULL: from the `RightJoin` sink over a part pipeline, or from the operator itself over a serial probe, which then prepares its own marks |
 | `PartRightJoinOperator` | a `Join` that emits its build rows (`plan::EmitsBuildRows`): a semi or anti join building on its left input, or a FULL join | the sink of the join's own probe pipeline: its parts run on the executor and their probes mark the build rows they match; a semi or anti join's parts hand on no row, a FULL join's their pairs and padded rows, handed on in part order; once every part is in, the build rows the marks select (or do not, plus the NULL-key rows), in `JoinTable::rows()` order, in batches of `batch_size`, behind a FULL join's NULL probe columns (`BuildRowEmitter`); the same rows in the same order on any number of threads ([ADR 0026](adr/0026-join-performance.md), ADR 0037's OJ2) |
@@ -445,17 +445,50 @@ the builds, outermost first and each after the builds its input probes, then the
 | `UnionAllOperator` | `UnionAll` | the batches of each input in input order, on the consumer's thread (an input that is a part pipeline runs its own parts); an input is opened when the previous one is exhausted and closed before the next one opens, so one input's resources at a time and none of an input a `Limit` never reaches; each batch rebuilt in the union's schema (input 0's names, nullable fields) with its selection kept, no row copied; the first failing input in order decides the error ([ADR 0036](adr/0036-union-all.md)) |
 | `SetOperationOperator` | `SetOperation` | one `GroupTable` keyed on every column, the inputs read in full in written order, one open at a time as in `UnionAllOperator`; the rows of a starter (an input that can bring a row into the result: `plan::SetStarters`) insert their groups, every other input's only look theirs up (`KeyTable::Lookup`) and add none; per group and input a presence bit, or a count where the formula reads one (`plan::SetCounted`), charged to the budget; after the last input the formula gives each group its copies, in chunks: under a DISTINCT root each kept group once with its keys as first seen among the starters, selected over the table's chunks; under an ALL root each group repeated by its copies with its normalized keys, in batches of at most 64Ki rows; the first failing input in order decides the error ([ADR 0039](adr/0039-set-operations.md)) |
 
+For a rollup over a part pipeline, wide decimal SUM and AVG can reuse the finest groups when
+all intermediate sums fit in 38 digits. The exact scan row count bounds the number of inputs
+through filters, computations, projections and joins that emit at most one row per probe row.
+For a join that can emit multiple matches, the operator checks uniqueness in the prepared build.
+The decimal argument must come from a checked producer such as arithmetic or a range-checked cast.
+A CASE or COALESCE carries that proof only when every result arm fits. A raw scan can deliver values
+outside the declared precision. The row bound times the proven magnitude must fit at the original scale. Without
+that proof, each grouping set accumulates its own wide decimal state in the original order.
+
 A grouped producer can distribute its output on one requested grouping column. Its part tables
 still compare every grouping key. Raw rows, partial groups and derived grouping sets use the
-same routing hash when the set includes the column. A set omitting it completes its normal
-aggregation and sends its result batches to the bucket for NULL. Projections remap a requested
-column and filters preserve the distribution. Unsupported operators decline the request.
+same routing hash when the set includes the column. Each such subtotal is complete in its
+root bucket, so it can be emitted directly after the local merge. Exact nested grouping sets can derive each
+subtotal from its immediate finer level using the existing aggregate states and key chunks. The
+part operator measures the first subtotal in the largest root bucket. When it reduces the group count at
+least fourfold and all levels fit the same budgeted batch, each bucket builds them in dependency order.
+Under a memory limit, non-reducing colocated probes keep only their size estimates until their
+batch is selected. Other batches read their subtotals from the finest groups. When the active buckets leave workers idle,
+workers can build different subtotals from the same immutable chunks. Each subtotal table has one
+writer. Batches that need a shared key snapshot keep one task per bucket. A set omitting the
+routing column completes its normal aggregation and sends its result batches to the bucket for
+NULL. Projections remap a requested column and filters preserve the distribution. Unsupported
+operators decline the request.
 
 An ordered rank window can reuse this layout when all its calls partition on that column.
 It sorts disjoint ranges of row references on the query executor, compares the actual window
 keys inside each bucket, and writes ranks in input row order. It passes the distribution to a
 subsequent GROUP BY on the same column, which consumes each batch directly into its bucket's
-aggregate table. The profile counts populated buckets as `rank_buckets` and `group_buckets`.
+aggregate table. When a mixed rank bucket is large and workers are available, a sample of its
+partition keys selects a pivot. The worker ranges on either side contain whole SQL partitions.
+The profile counts populated buckets as `rank_buckets` and `group_buckets`, and extra sort
+ranges as `rank_bucket_splits`.
+
+Large ordered windows, full sorts and top-N compactions can pack several sort fields into one
+64-bit key when every value fits. Wider keys use up to 128 bits. Equal prefixes resume comparison
+at the first unresolved field, and input row identity breaks ties. Ordinary sorts with a leading
+VARCHAR keep their existing first-key sorter. The window profile counts rows sorted with packed
+keys as `packed_sort_rows`.
+
+For large partitioned running aggregates, the window can hash the first partition column into
+local buckets. Each worker sorts a bucket and computes complete SQL partitions. Fixed-width
+prefix results go straight to their final input-row positions in batch-sized Arrow buffers.
+The profile counts those columns as `direct_prefix_columns`. A memory refusal during bucket
+preparation can retry the sort and prefix evaluation using the single-range layout.
 
 The aggregate states (`src/exec/include/antb1/exec/aggregate_state.h`) implement `Consume(values, selection)`,
 `Merge` and `Finalize`. `COUNT(*)` is the true count of the selection; `COUNT(col)`, `SUM` and `AVG` walk the runs

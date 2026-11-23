@@ -55,6 +55,8 @@ class RowComparator {
   [[nodiscard]] bool prefix_is_exact() const { return keys_.front().exact; }
 
  private:
+  friend class PackedOrder;
+
   using CompareValues = int (*)(const arrow::Array& a, int64_t i, const arrow::Array& b, int64_t j);
   using PrefixBits = std::uint64_t (*)(const arrow::Array& a, int64_t i);
   struct Key {

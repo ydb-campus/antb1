@@ -20,6 +20,7 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
@@ -74,6 +75,23 @@ TEST(GroupingSetsShapeTest, RootsAreTheSetsNoOtherSetContains) {
   EXPECT_EQ(fallback.sources, (std::vector<std::size_t>{0, 1, 2}));
 }
 
+TEST(GroupingSetsShapeTest, AdjacentRollupLevelsUseTheirParentsKeyPositions) {
+  const std::vector<std::vector<std::size_t>> sets = {{2}, {0, 1, 2, 3}, {}, {1, 2}, {2}};
+  const auto shape = PlanGroupingSets(sets, true);
+  ASSERT_EQ(shape.rollup.size(), 3U);
+  EXPECT_EQ(shape.rollup[0].parent, 1U);
+  EXPECT_EQ(shape.rollup[0].set, 3U);
+  EXPECT_EQ(shape.rollup[0].columns, (std::vector<std::size_t>{1, 2}));
+  EXPECT_EQ(shape.rollup[1].parent, 3U);
+  EXPECT_EQ(shape.rollup[1].set, 0U);
+  EXPECT_EQ(shape.rollup[1].columns, (std::vector<std::size_t>{1}));
+  EXPECT_EQ(shape.rollup[2].parent, 0U);
+  EXPECT_EQ(shape.rollup[2].set, 2U);
+  EXPECT_TRUE(shape.rollup[2].columns.empty());
+  EXPECT_TRUE(PlanGroupingSets(sets, false).rollup.empty());
+  EXPECT_TRUE(PlanGroupingSets({{0, 1}, {1}, {0}, {}}, true).rollup.empty());
+}
+
 TEST(GroupingSetsShapeTest, DuplicateSetsAreAggregatedOnceAndEmittedPerEntry) {
   // ROLLUP (a, a) over one key: (), (a), (a).
   const GroupingSetsShape shape = PlanGroupingSets({{}, {0}, {0}}, true);
@@ -126,6 +144,26 @@ TEST(GroupingSetsShapeTest, OnlyOrderIndependentCallsMergeExactly) {
   EXPECT_TRUE(MergesExactly({}, {}));
 }
 
+TEST(GroupingSetsShapeTest, WideDecimalReuseRequiresABoundForEveryCheckedSum) {
+  const auto sum = [](std::uint8_t width) {
+    return plan::AggregateCall{.kind = AggKind::kSum,
+                               .arg = Column(0, "x", LogicalType::Decimal(width, 2)),
+                               .type = LogicalType::Decimal(38, 2)};
+  };
+  constexpr int64_t kLimit = 1'000'000'000'000;
+  EXPECT_TRUE(MergesExactly({}, {sum(26)}, kLimit));
+  EXPECT_FALSE(MergesExactly({}, {sum(26)}, kLimit + 1));
+  EXPECT_FALSE(MergesExactly({}, {sum(26)}, std::nullopt));
+  auto avg = sum(26);
+  avg.kind = AggKind::kAvg;
+  avg.type = LogicalType::kDouble;
+  EXPECT_TRUE(MergesExactly({}, {avg}, kLimit));
+  EXPECT_FALSE(MergesExactly({}, {avg}, kLimit + 1));
+  EXPECT_TRUE(MergesExactly({}, {sum(26), sum(38)}, 1));
+  EXPECT_FALSE(MergesExactly({}, {sum(26), sum(38)}, 2));
+  EXPECT_FALSE(MergesExactly({Column(1, "k", LogicalType::kDouble)}, {sum(26)}, 1));
+}
+
 // ---- GroupTable::MergeProjected ----
 
 // Groups 0 .. n - 1 of a table.
@@ -136,6 +174,42 @@ std::vector<std::uint32_t> All(std::size_t n) {
 }
 
 class GroupingSetsTest : public testing::ExecTest {};
+
+TEST_F(GroupingSetsTest, SubtotalBorrowsKeyChunksUnderMemoryPressure) {
+  constexpr int64_t kMiB = int64_t{1024} * 1024;
+  constexpr int64_t kLimit = 64 * kMiB;
+  MemoryBudget budget(kLimit, arrow::default_memory_pool());
+  const auto a = Column(0, "a", LogicalType::kBigInt);
+  const auto b = Column(1, "b", LogicalType::kVarchar);
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}};
+  auto source = GroupTable::Make({a, b}, calls, 2, &budget, &budget);
+  auto subtotal = GroupTable::Make({a}, calls, 2, &budget, &budget);
+  ASSERT_TRUE(source.ok() && subtotal.ok());
+  const auto schema =
+      arrow::schema({arrow::field("a", arrow::int64()), arrow::field("b", arrow::binary())});
+  for (int part = 0; part < 4; ++part) {
+    std::vector<std::optional<std::string>> strings;
+    strings.reserve(64);
+    for (int i = 0; i < 64; ++i) {
+      strings.emplace_back(std::format("{}-{}{}", part, i, std::string(8192, 'x')));
+    }
+    const auto rows = arrow::RecordBatch::Make(
+        schema, 64,
+        {testing::Int64s(std::vector<std::optional<int64_t>>(64, 1)), testing::Strings(strings)});
+    ASSERT_TRUE((*source)->Consume(*rows).ok());
+  }
+  // Leave less space than the two MiB of string keys. Only the integer key is projected.
+  MemoryReservation held;
+  held.Reset(&budget);
+  ASSERT_TRUE(held.Resize(kLimit - budget.bytes_allocated() - kMiB).ok());
+  const std::vector<std::size_t> columns{0};
+  const auto merged = (*subtotal)->MergeProjectedChunks(**source, columns);
+  ASSERT_TRUE(merged.ok()) << merged.ToString();
+  const auto rows = (*subtotal)->NextChunk(SetSchema({a, b}, columns, calls));
+  ASSERT_TRUE(rows.ok() && *rows != nullptr);
+  EXPECT_TRUE((*rows)->column(1)->Equals(*testing::Int64s({256})));
+}
 
 // Many groups of the source become one group here; the keys of a new group are the first source
 // group's; every call merges; without keys every group folds into the one group. More new groups
@@ -269,9 +343,11 @@ TEST_F(GroupingSetsTest, MergeProjectedAddsManyGroupsInBoundedChunks) {
 // ---- the operators ----
 
 // A table of `parts` parts of 50 rows (every fourth part empty): a BIGINT (row % 7, NULL every 11th
-// row), s VARCHAR ('a' + (row % 5), NULL every 13th), d DATE (row % 3), m DECIMAL(10,2) (row
+// row by default), s VARCHAR ('a' + (row % 5), NULL every 13th), d DATE (row % 3), m DECIMAL(10,2)
+// (row
 // * 1.25), x DOUBLE (row * 0.1, rounding by order when summed), v BIGINT (row).
-std::shared_ptr<MemoryTable> Table(bool split, int64_t parts = 12) {
+std::shared_ptr<MemoryTable> Table(bool split, int64_t parts = 12, int64_t key_period = 7,
+                                   int64_t date_period = 3) {
   const auto schema =
       arrow::schema({arrow::field("a", arrow::int64()), arrow::field("s", arrow::binary()),
                      arrow::field("d", arrow::date32()),
@@ -288,11 +364,11 @@ std::shared_ptr<MemoryTable> Table(bool split, int64_t parts = 12) {
     std::vector<std::optional<int64_t>> v;
     for (int64_t i = 0; i < rows; ++i) {
       const int64_t row = (part * 50) + i;
-      a.push_back(row % 11 == 0 ? std::nullopt : std::optional<int64_t>(row % 7));
+      a.push_back(row % 11 == 0 ? std::nullopt : std::optional<int64_t>(row % key_period));
       s.push_back(row % 13 == 0
                       ? std::nullopt
                       : std::optional(std::string(1, static_cast<char>('a' + (row % 5)))));
-      d.emplace_back(static_cast<int32_t>(row % 3));
+      d.emplace_back(static_cast<int32_t>(row % date_period));
       m.emplace_back(std::to_string(row * 125));
       EXPECT_TRUE(x.Append(static_cast<double>(row) * 0.1).ok());
       v.emplace_back(row);
@@ -503,6 +579,36 @@ plan::LogicalNodePtr GroupingSets(const plan::LogicalNodePtr& input,
                                      .grouping = std::move(grouping)});
 }
 
+TEST_F(GroupingSetsTest, UncheckedWideDecimalKeepsOverflowBeforeCancellation) {
+  const auto type = LogicalType::Decimal(37, 0);
+  const std::string magnitude = "9" + std::string(37, '0');
+  const auto schema = arrow::schema(
+      {arrow::field("key", arrow::int64()), arrow::field("value", plan::ToArrow(type))});
+  const auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {testing::Int64s({1, 2, 1}),
+                                testing::Decimals(type, {magnitude, magnitude, "-" + magnitude})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+  const auto scan = Node(plan::ScanNode{.table = table,
+                                        .table_name = "t",
+                                        .fields = {0, 1},
+                                        .ids = {plan::ColumnId{1}, plan::ColumnId{2}}});
+  auto key = Column(0, "key", LogicalType::kBigInt);
+  key.id = plan::ColumnId{1};
+  auto value = Column(1, "value", type);
+  value.id = plan::ColumnId{2};
+  for (const auto kind : {AggKind::kSum, AggKind::kAvg}) {
+    const auto root = GroupingSets(
+        scan, {key}, {{0}, {}},
+        {{.kind = kind,
+          .arg = value,
+          .type = kind == AggKind::kSum ? LogicalType::Decimal(38, 0) : LogicalType::kDouble}});
+    const auto result = RunPlan(root, nullptr);
+    ASSERT_FALSE(result.ok());
+    EXPECT_TRUE(result.status().message().contains("overflow")) << result.status();
+  }
+}
+
 struct Case {
   std::string name;
   std::vector<plan::BoundColumn> keys;
@@ -517,6 +623,11 @@ std::vector<Case> Cases() {
       {.name = "rollup",
        .keys = {ColA(), ColS(), ColD()},
        .sets = {{0, 1, 2}, {0, 1}, {0}, {}},
+       .calls = ExactCalls(),
+       .grouping = grouping},
+      {.name = "reordered rollup",
+       .keys = {ColA(), ColD(), ColV()},
+       .sets = {{1}, {0, 1, 2}, {}, {0, 1}, {1}},
        .calls = ExactCalls(),
        .grouping = grouping},
       {.name = "cube",
@@ -736,8 +847,73 @@ TEST_F(GroupingSetsTest, EachSetIsMergedOnceOrReducedFirst) {
       if (metric.name == "direct_sets") {
         direct = metric.value;
       }
+      if (metric.name == "subtotal_lanes") {
+        EXPECT_EQ(metric.value, 1);
+      }
     }
     EXPECT_EQ(direct, std::optional<int64_t>(1));
+  }
+}
+
+TEST_F(GroupingSetsTest, ReducingRollupMergesAdjacentLevelsWithinEachBucket) {
+  const auto table = Table(/*split=*/true, 120);
+  const std::vector<plan::BoundColumn> keys = {ColA(), ColD(), ColV()};
+  for (const bool routed : {false, true}) {
+    const Sets sets =
+        routed ? Sets{{1}, {0, 1, 2}, {}, {0, 1}, {1}} : Sets{{}, {0, 1, 2}, {1}, {1}};
+    const auto expected = Expected(keys, sets, ExactCalls(), {}, PlannedAggregate(table, nullptr));
+    plan::LogicalPlan plan{.root = GroupingSets(Scan(table), keys, sets, ExactCalls()),
+                           .output = {}};
+    plan.output.assign(OutputWidth(*plan.root),
+                       plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan, &profile);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    if (routed) {
+      ASSERT_NE((*op)->RequestPartitioning(1, PartitionRequest::kAllowRouting), nullptr);
+    }
+    ExecContext ctx;
+    const auto result = Drain(**op, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(RowsOf(**result), expected);
+    std::optional<int64_t> chained;
+    for (const auto& metric : profile.metrics()) {
+      if (metric.name == "chained_sets") {
+        chained = metric.value;
+      }
+    }
+    EXPECT_EQ(chained, routed ? 2 : 1);
+  }
+}
+
+TEST_F(GroupingSetsTest, IndependentSubtotalsCanShareSparseRootBuckets) {
+  const auto pool = Pool();
+  const auto table = Table(/*split=*/true, 12);
+  const std::vector<plan::BoundColumn> keys = {ColD(), ColA(), ColV()};
+  // The first subtotal retains the unique value, so independent workers can use the root.
+  const Sets sets = {{0, 1, 2}, {0, 2}, {0}, {}};
+  const auto expected = Expected(keys, sets, ExactCalls(), {}, PlannedAggregate(table, nullptr));
+  for (const int threads : {1, kThreads}) {
+    plan::LogicalPlan plan{.root = GroupingSets(Scan(table), keys, sets, ExactCalls()),
+                           .output = {}};
+    plan.output.assign(OutputWidth(*plan.root),
+                       plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan, &profile);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    // The three dates occupy fewer buckets than the four-worker pool can service.
+    ASSERT_NE((*op)->RequestPartitioning(0, PartitionRequest::kAllowRouting), nullptr);
+    ExecContext ctx{.executor = threads == 1 ? nullptr : pool.get(), .threads = threads};
+    const auto result = Drain(**op, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(RowsOf(**result), expected);
+    std::optional<int64_t> lanes;
+    for (const auto& metric : profile.metrics()) {
+      if (metric.name == "subtotal_lanes") {
+        lanes = metric.value;
+      }
+    }
+    EXPECT_EQ(lanes, threads == 1 ? 1 : 3);
   }
 }
 
@@ -769,18 +945,25 @@ TEST_F(GroupingSetsTest, APartsFailureFailsTheQuery) {
   }
 }
 
-// Runs `sets` of (v, a, d) over 40 parts on `executor` against `budget`; `batches`: the profile's
-// count of the second level's batches. The budget outlives the operator and the rows.
-arrow::Result<std::shared_ptr<arrow::Table>> RunUnder(const std::shared_ptr<MemoryTable>& table,
-                                                      const Sets& sets, MemoryBudget& budget,
-                                                      arrow::internal::Executor* executor,
-                                                      std::optional<int64_t>& batches) {
-  const std::vector<plan::BoundColumn> keys = {ColV(), ColA(), ColD()};
+struct BatchCounts {
+  int64_t batches = 0;
+  int64_t chained = 0;
+};
+
+// The budget outlives the operator and the rows. Capture the finished run's scheduling metrics.
+arrow::Result<std::shared_ptr<arrow::Table>> RunUnder(
+    const std::shared_ptr<MemoryTable>& table, const Sets& sets, MemoryBudget& budget,
+    arrow::internal::Executor* executor, BatchCounts& counts,
+    const std::vector<plan::BoundColumn>& keys = {ColV(), ColA(), ColD()},
+    std::optional<int> routing = std::nullopt) {
   plan::LogicalPlan plan{.root = GroupingSets(Scan(table), keys, sets, ExactCalls()), .output = {}};
   plan.output.assign(OutputWidth(*plan.root),
                      plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
   ProfileNode root;
   ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(plan, &root));
+  if (routing.has_value()) {
+    EXPECT_NE(op->RequestPartitioning(*routing, PartitionRequest::kAllowRouting), nullptr);
+  }
   ExecContext ctx{.pool = &budget,
                   .executor = executor,
                   .threads = executor == nullptr ? 1 : kThreads,
@@ -788,7 +971,10 @@ arrow::Result<std::shared_ptr<arrow::Table>> RunUnder(const std::shared_ptr<Memo
   auto result = Drain(*op, ctx);
   for (const ProfileMetric& metric : root.metrics()) {
     if (metric.name == "set_batches") {
-      batches = metric.value;
+      counts.batches = metric.value;
+    }
+    if (metric.name == "chained_sets") {
+      counts.chained = metric.value;
     }
   }
   return result;
@@ -808,10 +994,10 @@ TEST_F(GroupingSetsTest, SetsMergeInBatchesUnderAMemoryLimit) {
          {static_cast<arrow::internal::Executor*>(nullptr),
           static_cast<arrow::internal::Executor*>(pool.get())}) {
       MemoryBudget unlimited(std::nullopt, arrow::default_memory_pool());
-      std::optional<int64_t> one;
+      BatchCounts one;
       const auto whole = RunUnder(table, sets, unlimited, executor, one);
       ASSERT_TRUE(whole.ok()) << whole.status().ToString();
-      EXPECT_EQ(one, std::optional<int64_t>(1));
+      EXPECT_EQ(one.batches, 1);
       // The limit, from the unlimited peak down, until the sets no longer fit one batch: a run
       // there must finish, in several batches, with the same rows. The estimate counts a root
       // group's bytes, not a table's fixed cost, which over these few groups is most of it: a limit
@@ -820,13 +1006,13 @@ TEST_F(GroupingSetsTest, SetsMergeInBatchesUnderAMemoryLimit) {
       for (int64_t limit = unlimited.max_memory(); limit > unlimited.max_memory() / 4 && !split;
            limit = limit * 19 / 20) {
         MemoryBudget budget(limit, arrow::default_memory_pool());
-        std::optional<int64_t> batches;
-        const auto limited = RunUnder(table, sets, budget, executor, batches);
+        BatchCounts counts;
+        const auto limited = RunUnder(table, sets, budget, executor, counts);
         if (!limited.ok()) {
           ASSERT_TRUE(limited.status().IsOutOfMemory()) << limited.status().ToString();
           continue;
         }
-        if (batches.value_or(1) > 1) {
+        if (counts.batches > 1) {
           split = true;
           EXPECT_TRUE((*limited)->Equals(**whole));
           EXPECT_LE(budget.max_memory(), limit);
@@ -837,6 +1023,73 @@ TEST_F(GroupingSetsTest, SetsMergeInBatchesUnderAMemoryLimit) {
   }
 }
 
+TEST_F(GroupingSetsTest, LargeColocatedSubtotalsFitOneAtATime) {
+  const auto table = Table(/*split=*/true, /*parts=*/80, /*key_period=*/7, /*date_period=*/1);
+  const std::vector<plan::BoundColumn> keys = {ColD(), ColV(), ColA(), ColS(), ColM()};
+  const std::vector<plan::AggregateCall> calls = {{.kind = AggKind::kCountStar}};
+  // All rows route together and the unique second key makes each subtotal as large as the root.
+  const Sets sets = {{0, 1, 2, 3, 4}, {0, 1, 2, 3}, {0, 1, 2, 4}, {0, 1, 3, 4},
+                     {0, 1, 2},       {0, 1, 3},    {0, 1, 4},    {0, 1}};
+  const auto run = [&](const Sets& selected, MemoryBudget& budget) -> arrow::Result<int64_t> {
+    const auto root = GroupingSets(Scan(table), keys, selected, calls);
+    plan::LogicalPlan plan{.root = root, .output = {}};
+    plan.output.assign(OutputWidth(*root),
+                       plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
+    ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(plan));
+    EXPECT_NE(op->RequestPartitioning(0, PartitionRequest::kAllowRouting), nullptr);
+    ExecContext ctx{.pool = &budget, .budget = &budget};
+    ARROW_RETURN_NOT_OK(op->Open(ctx));
+    int64_t rows = 0;
+    for (;;) {
+      ARROW_ASSIGN_OR_RAISE(auto batch, op->Next());
+      if (batch.end()) {
+        break;
+      }
+      rows += batch.data->num_rows();
+    }
+    ARROW_RETURN_NOT_OK(op->Close());
+    return rows;
+  };
+  MemoryBudget unlimited(std::nullopt, arrow::default_memory_pool());
+  const auto one = run({sets[0], sets[1]}, unlimited);
+  ASSERT_TRUE(one.ok()) << one.status();
+  MemoryBudget limited(unlimited.max_memory() + (unlimited.max_memory() / 4),
+                       arrow::default_memory_pool());
+  const auto all = run(sets, limited);
+  ASSERT_TRUE(all.ok()) << all.status();
+  EXPECT_EQ(*all, (*one / 2) * Narrow<int64_t>(sets.size()));
+}
+
+// The finest key is unique. Dropping it leaves a few combinations of nullable keys per
+// date bucket. Several levels retain those combinations until their last key is removed.
+TEST_F(GroupingSetsTest, ReducingRollupFallsBackWhenItsLevelsNeedSeparateBatches) {
+  const auto table = Table(/*split=*/true, /*parts=*/384, /*key_period=*/701);
+  const std::vector<plan::BoundColumn> keys = {ColD(), ColA(), ColD(), ColA(), ColD(), ColV()};
+  const Sets sets = {{}, {0}, {0, 1}, {0, 1, 2}, {0, 1, 2, 3}, {0, 1, 2, 3, 4}, {0, 1, 2, 3, 4, 5},
+                     {}};
+  MemoryBudget unlimited(std::nullopt, arrow::default_memory_pool());
+  BatchCounts counts;
+  const auto all = RunUnder(table, sets, unlimited, nullptr, counts, keys, 0);
+  ASSERT_TRUE(all.ok()) << all.status().ToString();
+  ASSERT_EQ(counts.chained, 5);
+  ASSERT_EQ(counts.batches, 1);
+  // Each retry is a fresh execution. A successful split must preserve all rows and duplicates.
+  for (int64_t limit = unlimited.max_memory(); limit > unlimited.max_memory() / 4;
+       limit = limit * 49 / 50) {
+    MemoryBudget budget(limit, arrow::default_memory_pool());
+    counts = {};
+    const auto result = RunUnder(table, sets, budget, nullptr, counts, keys, 0);
+    if (!result.ok()) {
+      ASSERT_TRUE(result.status().IsOutOfMemory()) << result.status().ToString();
+    } else if (counts.batches > 1) {
+      EXPECT_EQ(counts.chained, 0);
+      EXPECT_EQ(RowsOf(**result), RowsOf(**all));
+      return;
+    }
+  }
+  FAIL() << "no budget split the reducing rollup";
+}
+
 // A later batch that runs out of memory fails the query after the earlier batches' rows, and leaves
 // the operator closed: a further Next() fails rather than read half-made tables, and Close() is
 // clean. The limit is found by lowering it until a run fails after its first rows.
@@ -845,7 +1098,7 @@ TEST_F(GroupingSetsTest, ALaterBatchOutOfMemoryFailsTheQuery) {
   const Sets sets = {{0, 1, 2}, {0}, {1}, {2}, {}, {0, 1}, {1, 2}};
   const std::vector<plan::BoundColumn> keys = {ColV(), ColA(), ColD()};
   MemoryBudget unlimited(std::nullopt, arrow::default_memory_pool());
-  std::optional<int64_t> ignored;
+  BatchCounts ignored;
   ASSERT_TRUE(RunUnder(table, sets, unlimited, nullptr, ignored).ok());
   // Try ten-percent steps first. Some layouts have a narrower interval between the first
   // successful output and a later batch failure, so retry with one-percent steps if needed.

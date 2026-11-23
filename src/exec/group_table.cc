@@ -572,6 +572,30 @@ arrow::Status GroupTable::MergeProjected(const GroupTable& source,
   return Update([&] { return MergeProjectedGroups(source, keys, from); });
 }
 
+arrow::Status GroupTable::MergeProjectedChunks(const GroupTable& source,
+                                               std::span<const std::size_t> columns) {
+  ANTB1_CHECK(source.KeepsKeyChunks());
+  ANTB1_CHECK(source.next_group_ == 0);
+  PoolVector<std::uint32_t> ids(pool_);
+  arrow::compute::ExecBatch keys;
+  keys.values.reserve(columns.size());
+  std::uint32_t first = 0;
+  for (std::size_t chunk = 0; chunk < source.chunk_ends_.size(); ++chunk) {
+    const std::uint32_t end = source.chunk_ends_[chunk];
+    ARROW_RETURN_NOT_OK(ids.Resize(end - first));
+    const std::span groups(ids.data(), ids.size());
+    std::ranges::iota(groups, first);
+    keys.length = end - first;
+    keys.values.clear();
+    for (const auto column : columns) {
+      keys.values.emplace_back(source.first_keys_[column][chunk]);
+    }
+    ARROW_RETURN_NOT_OK(MergeProjected(source, keys, groups));
+    first = end;
+  }
+  return arrow::Status::OK();
+}
+
 arrow::Status GroupTable::MergeProjectedGroups(const GroupTable& source,
                                                const arrow::compute::ExecBatch& keys,
                                                std::span<const std::uint32_t> from) {

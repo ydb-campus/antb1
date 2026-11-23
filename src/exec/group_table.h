@@ -165,6 +165,10 @@ class GroupTable {
   // groups of one source can run on different threads.
   arrow::Status MergeProjected(const GroupTable& source, const arrow::compute::ExecBatch& keys,
                                std::span<const std::uint32_t> from);
+  // Merge every group before source starts emitting its first-seen key chunks. The projected
+  // columns must have exact grouping semantics (no DOUBLE). Borrows the existing key arrays.
+  arrow::Status MergeProjectedChunks(const GroupTable& source,
+                                     std::span<const std::size_t> columns);
   // Adds the one group of a table without keys if it has none: the empty grouping set has a row
   // even over no input, as a global aggregation does.
   arrow::Status EnsureGroup();

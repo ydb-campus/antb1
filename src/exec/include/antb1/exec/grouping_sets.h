@@ -15,11 +15,10 @@ namespace antb1::exec {
 class GroupTable;          // src/exec/group_table.h
 struct GroupingSetsShape;  // src/exec/grouping_sets_shape.h
 
-// ROLLUP, CUBE and GROUPING SETS (plan::GroupingSetsNode; docs/adr/0038-grouping-sets.md), in two
-// levels where every call merges exactly (MergesExactly in grouping_sets_shape.h): each set that no
-// other set contains is aggregated from the input into a GroupTable of its own, as
-// GroupAggregateOperator aggregates; then every other set is merged from the groups of the smallest
-// such set that contains it (GroupTable::MergeProjected), with no finalization between. Otherwise,
+// ROLLUP, CUBE and GROUPING SETS (plan::GroupingSetsNode; docs/adr/0038-grouping-sets.md).
+// For exact merges, each maximal set aggregates the input into its own GroupTable. In a nested
+// family each subtotal merges the aggregate states of the immediate finer set. Other grouping
+// sets merge from the smallest maximal set containing them. With order-sensitive aggregates
 // or with `per_set`, every distinct set is aggregated from the input into a table of its own. Each
 // set's rows are then the rows GroupAggregateOperator would give for it. Every set's finalize
 // errors are raised before the first batch. Output (GroupingSetsSchema): every key, NULL where a

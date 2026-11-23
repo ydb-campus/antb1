@@ -5,14 +5,17 @@
 #include <cstdint>
 #include <format>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
 
 #include "antb1/common/check.h"
+#include "antb1/common/int128.h"
 #include "antb1/common/narrow.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -20,12 +23,73 @@
 namespace antb1::exec {
 namespace {
 
-bool MergesExactly(const plan::AggregateCall& call) {
+bool CheckedDecimalColumn(const plan::LogicalNode& node, plan::ColumnId id);
+
+bool CheckedDecimalExpr(const plan::LogicalNode& input, const plan::Expr& expr) {
+  if (const auto* col = std::get_if<plan::ColumnExpr>(&expr.node)) {
+    return CheckedDecimalColumn(input, col->id);
+  }
+  if (const auto* cast = std::get_if<plan::CastExpr>(&expr.node)) {
+    // Convert range-checks a conversion to a different DECIMAL type. A same-type cast passes
+    // through the original array and inherits its proof.
+    return cast->operand->type != expr.type || CheckedDecimalExpr(input, *cast->operand);
+  }
+  if (const auto* branch = std::get_if<plan::CaseExpr>(&expr.node)) {
+    const auto checked = [&](const plan::ExprPtr& value) {
+      return !value || value->type != expr.type || CheckedDecimalExpr(input, *value);
+    };
+    return checked(branch->otherwise) && std::ranges::all_of(branch->thens, checked);
+  }
+  // DecimalArith and its compiled equivalent check the result against the declared width.
+  return std::holds_alternative<plan::ArithExpr>(expr.node) ||
+         std::holds_alternative<plan::ConstantExpr>(expr.node);
+}
+
+bool CheckedDecimalColumn(const plan::LogicalNode& node, plan::ColumnId id) {
+  if (id == plan::kNoColumnId) {
+    return false;
+  }
+  if (const auto* compute = std::get_if<plan::ComputeNode>(&node)) {
+    const auto it = std::ranges::find(compute->ids, id);
+    return it == compute->ids.end()
+               ? CheckedDecimalColumn(*compute->input, id)
+               : CheckedDecimalExpr(
+                     *compute->input,
+                     *compute->exprs[Narrow<std::size_t>(it - compute->ids.begin())]);
+  }
+  if (const auto* project = std::get_if<plan::ProjectNode>(&node)) {
+    const auto it = std::ranges::find(project->ids, id);
+    if (it == project->ids.end()) {
+      return false;
+    }
+    const auto index = Narrow<std::size_t>(it - project->ids.begin());
+    return (!project->constants.empty() && project->constants[index].has_value()) ||
+           CheckedDecimalColumn(*project->input, project->columns[index].id);
+  }
+  if (const auto* filter = std::get_if<plan::FilterNode>(&node)) {
+    return CheckedDecimalColumn(*filter->input, id);
+  }
+  if (const auto* join = std::get_if<plan::JoinNode>(&node)) {
+    return CheckedDecimalColumn(*join->left, id) || CheckedDecimalColumn(*join->right, id);
+  }
+  return false;
+}
+
+bool MergesExactly(const plan::AggregateCall& call, std::optional<int64_t> max_rows) {
   const std::optional<plan::LogicalType> input =
       call.arg.has_value() ? std::optional(call.arg->type) : std::nullopt;
-  const auto exact_sum = [](plan::LogicalType type) {
-    return (plan::IsInteger(type) && type != plan::LogicalType::kHugeInt) ||
-           (type == plan::LogicalType::kDecimal && type.width() <= 18);
+  const auto exact_sum = [max_rows](plan::LogicalType type) {
+    if (type != plan::LogicalType::kDecimal) {
+      return plan::IsInteger(type) && type != plan::LogicalType::kHugeInt;
+    }
+    if (type.width() <= plan::LogicalType::kMaxNarrowDecimalWidth) {
+      return true;
+    }
+    // The absolute sum bounds every intermediate in any merge order, including cancellation.
+    // Divide first: multiplying a wide unscaled value by the row count can itself overflow.
+    return max_rows.has_value() && *max_rows >= 0 &&
+           *max_rows <= (PowerOfTen(plan::LogicalType::kMaxDecimalWidth) - 1) /
+                            (PowerOfTen(type.width()) - 1);
   };
   switch (call.kind) {
     case plan::AggKind::kCountStar:
@@ -56,15 +120,59 @@ bool Contains(const std::vector<std::size_t>& outer, const std::vector<std::size
   return std::ranges::includes(outer, inner);
 }
 
+std::vector<std::size_t> KeyPositions(const std::vector<std::size_t>& parent,
+                                      const std::vector<std::size_t>& child) {
+  std::vector<std::size_t> columns;
+  columns.reserve(child.size());
+  for (const auto key : child) {
+    columns.push_back(Narrow<std::size_t>(std::ranges::lower_bound(parent, key) - parent.begin()));
+  }
+  return columns;
+}
+
+std::vector<GroupingSetsShape::RollupLevel> NestedRollup(
+    const std::vector<std::vector<std::size_t>>& sets) {
+  if (sets.size() < 3) {
+    return {};
+  }
+  std::vector<std::size_t> order(sets.size());
+  std::ranges::iota(order, 0U);
+  std::ranges::sort(order, [&](auto a, auto b) { return sets[a].size() > sets[b].size(); });
+  std::vector<GroupingSetsShape::RollupLevel> levels;
+  levels.reserve(order.size() - 1);
+  for (std::size_t i = 1; i < order.size(); ++i) {
+    const auto parent = order[i - 1];
+    const auto set = order[i];
+    if (!Contains(sets[parent], sets[set])) {
+      return {};
+    }
+    levels.push_back(
+        {.set = set, .parent = parent, .columns = KeyPositions(sets[parent], sets[set])});
+  }
+  return levels;
+}
+
 }  // namespace
 
+bool WideDecimalInputsChecked(const plan::GroupingSetsNode& node) {
+  return std::ranges::all_of(node.aggregates, [&](const plan::AggregateCall& call) {
+    if ((call.kind != plan::AggKind::kSum && call.kind != plan::AggKind::kAvg) ||
+        !call.arg.has_value() || call.arg->type != plan::LogicalType::kDecimal ||
+        call.arg->type.width() <= plan::LogicalType::kMaxNarrowDecimalWidth) {
+      return true;
+    }
+    return CheckedDecimalColumn(*node.input, call.arg->id);
+  });
+}
+
 bool MergesExactly(const std::vector<plan::BoundColumn>& keys,
-                   const std::vector<plan::AggregateCall>& calls) {
+                   const std::vector<plan::AggregateCall>& calls, std::optional<int64_t> max_rows) {
   return std::ranges::none_of(
              keys,
              [](const plan::BoundColumn& key) { return key.type == plan::LogicalType::kDouble; }) &&
-         std::ranges::all_of(calls,
-                             [](const plan::AggregateCall& call) { return MergesExactly(call); });
+         std::ranges::all_of(calls, [max_rows](const plan::AggregateCall& call) {
+           return MergesExactly(call, max_rows);
+         });
 }
 
 GroupingSetsShape PlanGroupingSets(const std::vector<std::vector<std::size_t>>& sets, bool exact) {
@@ -106,10 +214,10 @@ GroupingSetsShape PlanGroupingSets(const std::vector<std::vector<std::size_t>>& 
     }
     ANTB1_CHECK(source.has_value());  // a non-root set lies in a larger set, so in some root
     shape.sources[s] = *source;
-    const std::vector<std::size_t>& keys = shape.sets[*source];
-    for (const std::size_t key : shape.sets[s]) {
-      shape.columns[s].push_back(Narrow<std::size_t>(std::ranges::find(keys, key) - keys.begin()));
-    }
+    shape.columns[s] = KeyPositions(shape.sets[*source], shape.sets[s]);
+  }
+  if (exact) {
+    shape.rollup = NestedRollup(shape.sets);
   }
   shape.last_entries.assign(n, 0);
   for (std::size_t e = 0; e < shape.entries.size(); ++e) {

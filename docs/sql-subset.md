@@ -1487,9 +1487,13 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - `wait` (for parts);
   - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;
-  - a `PartGroupingSets`' `derive` (the second level), `direct_sets` (the sets merged straight from their root, not
-    reduced per partition first) and `set_batches` (the second level's batches: more than one only under a memory
-    limit, [ADR 0038](adr/0038-grouping-sets.md));
+  - `PartGroupingSets` records `derive` for time spent deriving coarser sets. `colocated_sets` counts sets
+    completed inside their root buckets. `direct_sets` counts sets that split root groups across destination
+    buckets for a single merge. `set_batches` counts batches of derived sets. A memory limit can require
+    multiple batches. `subtotal_lanes` is the maximum number of tasks assigned to each active bucket
+    in a batch. Independent subtotals can use spare workers when few buckets hold input groups.
+    For a nested rollup, `chained_sets` counts subtotals built from another subtotal within the batch.
+    [ADR 0038](adr/0038-grouping-sets.md)
   - a `HashJoin`'s `find` (looking up the keys; none where a join keeps every row or none without looking: a one-row
     join, an anti join over a build without rows, a null-aware anti join over an empty build input or one with a NULL
     key, and an anti join on its left input over a build with no key at all, whose probe is never opened), `gather` (the

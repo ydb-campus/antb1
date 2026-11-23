@@ -77,26 +77,33 @@ arrow::Status GroupingSetsOperator::Aggregate() {
       }
     }
   }
-  // The second level: every other set from all of its root's groups, the root's keys taken once.
-  for (std::size_t r = 0; r < shape.sets.size(); ++r) {
-    if (!shape.root(r) || tables_[r]->num_groups() == 0) {
-      continue;
+  if (!shape.rollup.empty()) {
+    for (const auto& level : shape.rollup) {
+      ARROW_RETURN_NOT_OK(
+          tables_[level.set]->MergeProjectedChunks(*tables_[level.parent], level.columns));
     }
-    std::vector<std::uint32_t> every(tables_[r]->num_groups());
-    std::ranges::iota(every, 0U);
-    std::optional<KeySnapshot> uniques;
-    for (std::size_t s = 0; s < shape.sets.size(); ++s) {
-      if (shape.sources[s] != r || s == r) {
+  } else {
+    // The second level: every other set from all of its root's groups, the root's keys taken once.
+    for (std::size_t r = 0; r < shape.sets.size(); ++r) {
+      if (!shape.root(r) || tables_[r]->num_groups() == 0) {
         continue;
       }
-      if (!uniques.has_value() && !shape.sets[r].empty()) {
-        ARROW_ASSIGN_OR_RAISE(auto snapshot, tables_[r]->uniques());
-        uniques.emplace(std::move(snapshot));
+      std::vector<std::uint32_t> every(tables_[r]->num_groups());
+      std::ranges::iota(every, 0U);
+      std::optional<KeySnapshot> uniques;
+      for (std::size_t s = 0; s < shape.sets.size(); ++s) {
+        if (shape.sources[s] != r || s == r) {
+          continue;
+        }
+        if (!uniques.has_value() && !shape.sets[r].empty()) {
+          ARROW_ASSIGN_OR_RAISE(auto snapshot, tables_[r]->uniques());
+          uniques.emplace(std::move(snapshot));
+        }
+        const arrow::compute::ExecBatch keys =
+            uniques.has_value() ? ProjectKeys(uniques->batch, shape.columns[s])
+                                : arrow::compute::ExecBatch({}, static_cast<int64_t>(every.size()));
+        ARROW_RETURN_NOT_OK(tables_[s]->MergeProjected(*tables_[r], keys, every));
       }
-      const arrow::compute::ExecBatch keys =
-          uniques.has_value() ? ProjectKeys(uniques->batch, shape.columns[s])
-                              : arrow::compute::ExecBatch({}, static_cast<int64_t>(every.size()));
-      ARROW_RETURN_NOT_OK(tables_[s]->MergeProjected(*tables_[r], keys, every));
     }
   }
   for (std::size_t s = 0; s < shape.sets.size(); ++s) {

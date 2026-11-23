@@ -20,6 +20,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../packed_order.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -820,6 +821,107 @@ TEST_F(SortTest, PrefixesAgreeWithTheComparator) {
           }
         }
       }
+    }
+  }
+}
+
+TEST_F(SortTest, PackedCompositeSortMatchesStableComparatorAcrossBatches) {
+  const auto small = testing::ArrayOf<arrow::Int16Builder, int16_t>(
+      arrow::int16(), {-32768, -1, 0, 32767, std::nullopt, -1, 0, -1, -1, -1});
+  const auto id = Int64s({0, -1, std::numeric_limits<int64_t>::min(), 7,
+                          std::numeric_limits<int64_t>::max(), -1, 0, -1, -1, -1});
+  const auto text = Strings({"a", "abcdefghz", "", "b", std::nullopt, "abcdefgh", "a", "abcdefghx",
+                             std::string("abcdefgh\0", 9), "abcdefgh"});
+  const auto real = Doubles({kNaN, -0.0, -kInf, 0.0, std::nullopt, kInf, -kNaN, -1, 0, kInf});
+  arrow::Decimal128Builder large(plan::ToArrow(LogicalType::kHugeInt));
+  for (int64_t i = 0; i < 10; ++i) {
+    if (i == 4) {
+      ASSERT_TRUE(large.AppendNull().ok());
+    } else {
+      ASSERT_TRUE(large.Append(arrow::Decimal128((i % 3) - 1, static_cast<uint64_t>(i % 5))).ok());
+    }
+  }
+  const auto batch = WithIds({small, id, text, real, large.Finish().ValueOrDie()});
+  const auto head = batch->Slice(0, 4);
+  const auto tail = batch->Slice(4);
+  const auto check = [&](const std::vector<SortKey>& spec, std::size_t first) {
+    const auto cmp = RowComparator::Make(batch->schema(), spec).ValueOrDie();
+    const std::vector<RowComparator::KeyArrays> arrays{cmp.KeysOf(*head), cmp.KeysOf(*tail)};
+    const PackedOrder layout(cmp, arrays, first);
+    std::vector<PackedOrder::Entry> entries;
+    std::vector<SortBuffer::RowRef> reference;
+    for (std::uint32_t c = 0; c < 2; ++c) {
+      for (std::uint32_t r = 0; r < (c == 0 ? 4U : 6U); ++r) {
+        const SortBuffer::RowRef ref{.chunk = c, .row = r};
+        entries.push_back(layout.Encode(arrays[c], ref));
+        reference.push_back(ref);
+      }
+    }
+    std::ranges::stable_sort(reference, [&](auto a, auto b) {
+      return cmp.Compare(arrays[a.chunk], a.row, arrays[b.chunk], b.row, first) < 0;
+    });
+    std::ranges::reverse(entries);
+    layout.Sort(entries, arrays);
+    for (std::size_t i = 0; i < reference.size(); ++i) {
+      EXPECT_EQ(entries[i].ref.chunk, reference[i].chunk);
+      EXPECT_EQ(entries[i].ref.row, reference[i].row);
+    }
+  };
+  for (unsigned flags = 0; flags < 4; ++flags) {
+    const bool desc = (flags & 1U) != 0;
+    const bool nulls = (flags & 2U) != 0;
+    const auto a = Key(1, LogicalType::kSmallInt, desc, nulls);
+    const auto b = Key(2, LogicalType::kBigInt, !desc, !nulls);
+    const auto c = Key(3, LogicalType::kVarchar, desc, nulls);
+    const auto e = Key(4, LogicalType::kDouble, desc, !nulls);
+    const auto f = Key(5, LogicalType::kHugeInt, !desc, nulls);
+    check({a, b, e}, 0);
+    check({a, c, b}, 0);
+    check({c, e}, 0);
+    check({a, b, f}, 2);
+    check({a, e, b}, 1);
+    check({a, a, a, a, a, a, a, a, b}, 0);
+  }
+}
+
+TEST_F(SortTest, PackedKeysVerifyRangesAndDictionariesBeforeSorting) {
+  constexpr std::uint32_t kRows = 4096;
+  std::vector<std::optional<std::string>> labels(kRows);
+  std::vector<std::optional<int64_t>> numbers(kRows);
+  for (std::uint32_t i = 0; i < kRows; ++i) {
+    if (i % 11 != 0) {
+      labels[i] = i % 3 == 0 ? std::string("same\0prefix", 11) : "same";
+    }
+    if (i % 7 != 0) {
+      numbers[i] = static_cast<int64_t>(i % 257) - 200;
+    }
+  }
+  for (unsigned scenario = 0; scenario < 3; ++scenario) {
+    if (scenario == 1) {
+      labels.back() = "seen only in the last row";
+    } else if (scenario == 2) {
+      labels.back() = "same";
+      numbers.back() = std::numeric_limits<int64_t>::min();
+    }
+    const auto batch = WithIds({Strings(labels), Int64s(numbers)});
+    const auto cmp =
+        RowComparator::Make(batch->schema(), {Key(1, LogicalType::kVarchar, true, true),
+                                              Key(2, LogicalType::kBigInt, false, false)})
+            .ValueOrDie();
+    const std::vector<RowComparator::KeyArrays> arrays{cmp.KeysOf(*batch)};
+    std::vector<SortBuffer::RowRef> rows;
+    rows.reserve(kRows);
+    for (std::uint32_t r = 0; r < kRows; ++r) {
+      rows.push_back({.chunk = 0, .row = r});
+    }
+    auto expected = rows;
+    std::ranges::stable_sort(expected, [&](auto a, auto b) {
+      return cmp.Compare(arrays[0], a.row, arrays[0], b.row) < 0;
+    });
+    const PackedOrder layout(cmp, arrays);
+    ASSERT_TRUE(layout.TrySort(rows, arrays, arrow::default_memory_pool()).ValueOrDie());
+    for (std::uint32_t i = 0; i < kRows; ++i) {
+      ASSERT_EQ(rows[i].row, expected[i].row) << scenario << " at " << i;
     }
   }
 }
