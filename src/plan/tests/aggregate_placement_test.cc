@@ -1,5 +1,6 @@
 #include "../aggregate_placement.h"
 
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -630,6 +631,60 @@ TEST(AggregatePlacementTest, ValuesOverAJoinBack) {
   EXPECT_EQ(computed_key.find("GroupAggregate keys=[\"f.few\"]"), std::string::npos)
       << computed_key;
   EXPECT_NE(computed_key.find("Compute (f.few % 2)"), std::string::npos) << computed_key;
+}
+
+TEST(AggregatePlacementTest, UnionCostRejectsSinglePartSkewAndHighCardinality) {
+  const auto planned = [](std::vector<int64_t> parts, int64_t groups, int64_t build_rows) {
+    Catalog catalog;
+    const int64_t total = std::accumulate(parts.begin(), parts.end(), int64_t{0});
+    const auto schema =
+        arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+    auto fact = std::make_shared<testing::FakeTable>(schema, total);
+    fact->WithParts(std::move(parts));
+    auto dimension = std::make_shared<testing::FakeTable>(schema, build_rows);
+    dimension->WithStats(0, 1, {.min = 0, .max = groups - 1, .null_count = 0, .rows = build_rows});
+    EXPECT_TRUE(catalog.Register("sales", fact).ok());
+    EXPECT_TRUE(catalog.Register("labels", dimension).ok());
+    auto bound = BindSql(
+        "SELECT labels.v,COUNT(*) FROM (SELECT k FROM sales UNION ALL SELECT k "
+        "FROM sales) f JOIN labels ON f.k=labels.k GROUP BY labels.v",
+        catalog);
+    EXPECT_TRUE(bound.ok()) << bound.status();
+    if (!bound.ok()) {
+      return false;
+    }
+    LogicalPlan fallback;
+    const auto result = Optimize(
+        *bound, {.threads = 14, .memory_limit = int64_t{32} * 1024 * 1024 * 1024}, &fallback);
+    EXPECT_TRUE(result.ok()) << result.status();
+    return fallback.root != nullptr;
+  };
+  EXPECT_FALSE(planned({1000000}, 7, 300000));  // Rebuilding the dimension gains no parallelism.
+  EXPECT_FALSE(planned({999997, 1, 1, 1}, 7, 32));  // One part limits the parallel work.
+  EXPECT_FALSE(planned({250000, 250000, 250000, 250000}, 512000, 512000));
+  EXPECT_TRUE(planned({250000, 250000, 250000, 250000}, 7, 32));
+}
+
+TEST(AggregatePlacementTest, ConditionalPreSumNeedsAnEightfoldReductionAcrossTheArms) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  for (const int64_t domain : {100, 101, 800}) {
+    Catalog catalog;
+    auto fact = std::make_shared<testing::FakeTable>(schema, 800);
+    fact->WithStats(0, 0, {.min = 0, .max = domain - 1, .null_count = 0, .rows = 800});
+    ASSERT_TRUE(catalog.Register("items", fact).ok());
+    ASSERT_TRUE(catalog.Register("labels", std::make_shared<testing::FakeTable>(schema, 4)).ok());
+    const auto bound = BindSql(
+        "SELECT d.v,SUM(CASE WHEN d.v=1 THEN f.v END) FROM "
+        "(SELECT k,v FROM items UNION ALL SELECT k,v FROM items) f "
+        "JOIN labels d ON d.k=f.k GROUP BY d.v",
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    LogicalPlan fallback;
+    const auto result = Optimize(*bound, {.memory_limit = 1024 * 1024}, &fallback);
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(fallback.root != nullptr, domain == 100);
+  }
 }
 
 }  // namespace

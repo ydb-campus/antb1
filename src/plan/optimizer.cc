@@ -23,6 +23,7 @@
 
 #include "aggregate_placement.h"
 #include "arithmetic_rewrite.h"
+#include "union_aggregate.h"
 #include "union_branches.h"
 #include "unnesting.h"
 
@@ -904,7 +905,11 @@ LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstim
 
 }  // namespace
 
-arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options) {
+arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options,
+                                    LogicalPlan* memory_fallback) {
+  if (memory_fallback != nullptr) {
+    *memory_fallback = {};
+  }
   if (plan.root == nullptr) {
     return plan;
   }
@@ -919,8 +924,9 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   // the aggregated side no longer has to carry.
   const ColumnId last = MaxColumnId(*root);
   SharingEstimates estimates;
+  ColumnId last_exchanged = last;
   root = PreserveSharedAggregates(root, estimates, [&](const PushdownState& state) {
-    ColumnId last_exchanged = last;
+    last_exchanged = last;
     return ExchangeAggregates(root, last_exchanged, state.preserve);
   });
   // Integer arithmetic as DuckDB computes it (rule 6): after every rule that reads expressions, so
@@ -939,6 +945,16 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   // SqlErrorDetail, so it exits 70 and cannot pass for a refusal (ADR 0005, ADR 0023).
   if (FirstDependentJoin(root) != nullptr) {
     return arrow::Status::NotImplemented("the unnesting pass left a dependent join in the plan");
+  }
+  const auto rewritten = PreserveSharedAggregates(root, estimates, [&](const PushdownState& state) {
+    ColumnId last_union = last_exchanged;
+    return RewriteUnionAggregates(root, options, last_union, state.preserve);
+  });
+  if (rewritten != root) {
+    if (memory_fallback != nullptr && options.memory_limit.has_value()) {
+      *memory_fallback = ResolvePositions({.root = root, .output = plan.output});
+    }
+    root = Prune(rewritten, Needed(output.begin(), output.end()));
   }
   return ResolvePositions({.root = std::move(root), .output = plan.output});
 }

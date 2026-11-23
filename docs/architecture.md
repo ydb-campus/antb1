@@ -237,6 +237,16 @@ steps (only step 7 uses more than one thread):
    When a consumer loses reuse, the optimizer retries with the affected producers protected. It keeps the original
    pushdown when a filter eliminates a union branch or crosses an aggregate that can raise a numeric or temporal
    range error. Both planning stages use the same input-row and result-size criteria for aggregate reuse.
+   For a single-key inner join probing direct scan projections under `UNION ALL`, a grouped aggregate
+   can also move into the branches. Conditional sums with a build-side predicate and a narrow fact
+   measure first group each branch by its join key when the estimated partial count, bounded from the
+   footers, is at most one eighth of the probe rows. Conditions sharing a measure reuse one partial.
+   The ordinary join still applies its multiplicity and NULL semantics. Otherwise branch-local joins
+   and mergeable aggregates need a 20% estimated saving after duplicate builds, part tasks and both
+   levels of merging. The estimate credits at most four workers per branch and accounts for its largest
+   part. Both placements bound SUM magnitudes and screen their group-state workspace against the session
+   budget. Under a finite limit, an out-of-memory error releases the candidate and retries the original
+   plan once before returning any rows.
    Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
