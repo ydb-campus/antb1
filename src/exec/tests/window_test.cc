@@ -225,6 +225,70 @@ TEST_F(WindowTest, BucketWorkersWriteNullablePrefixesToTheirOriginalBatchPositio
   EXPECT_GT(packed->value, 0);
 }
 
+// All batches come from one bucket. Other buckets in the advertised distribution are empty.
+class OneBucketSource final : public Operator {
+ public:
+  OneBucketSource(const std::shared_ptr<arrow::Schema>& schema, std::vector<Batch> batches)
+      : source_(schema, std::move(batches)) {}
+  const std::shared_ptr<arrow::Schema>& output_schema() const override {
+    return source_.output_schema();
+  }
+  const BatchPartition* RequestPartitioning(int column, PartitionRequest /*request*/) override {
+    return column == 0 ? &partition_ : nullptr;
+  }
+  arrow::Status Open(ExecContext& ctx) override { return source_.Open(ctx); }
+  arrow::Result<Batch> Next() override { return source_.Next(); }
+  arrow::Status Close() override { return source_.Close(); }
+
+ private:
+  ScriptedSource source_;
+  BatchPartition partition_{.count = 32, .bucket = 13};
+};
+
+TEST_F(WindowTest, OversizedRankBucketsSplitOnlyBetweenCompletePartitions) {
+  constexpr int64_t kRows = (2 * 65536) + 11;
+  InlineWindowExecutor executor;
+  for (const bool mixed : {true, false}) {
+    arrow::Int64Builder keys;
+    arrow::Int64Builder scores;
+    ASSERT_TRUE(keys.Reserve(kRows).ok());
+    ASSERT_TRUE(scores.Reserve(kRows).ok());
+    for (int64_t i = 0; i < kRows; ++i) {
+      if (mixed && i % 257 < 128) {
+        keys.UnsafeAppendNull();
+      } else {
+        keys.UnsafeAppend(1);
+      }
+      scores.UnsafeAppend(i % 31);
+    }
+    const auto schema =
+        arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+    const auto batch = arrow::RecordBatch::Make(
+        schema, kRows, {keys.Finish().ValueOrDie(), scores.Finish().ValueOrDie()});
+    const std::vector<Batch> batches{{.data = batch->Slice(0, 47003), .selection = {}},
+                                     {.data = batch->Slice(47003), .selection = {}}};
+    WindowOperator serial(std::make_unique<ScriptedSource>(schema, batches), {Rank()});
+    ExecContext one;
+    const auto expected = Drain(serial, one);
+    ASSERT_TRUE(expected.ok()) << expected.status();
+    WindowOperator distributed(std::make_unique<OneBucketSource>(schema, batches), {Rank()});
+    ProfileNode profile;
+    distributed.set_profile(&profile);
+    ExecContext ctx{.executor = &executor, .threads = 4};
+    const auto actual = Drain(distributed, ctx);
+    ASSERT_TRUE(actual.ok()) << actual.status();
+    EXPECT_TRUE((*expected)->Equals(**actual));
+    const auto metrics = profile.metrics();
+    const auto splits = std::ranges::find(metrics, "rank_bucket_splits", &ProfileMetric::name);
+    if (mixed) {
+      ASSERT_NE(splits, metrics.end());
+      EXPECT_EQ(splits->value, 1);
+    } else {
+      EXPECT_EQ(splits, metrics.end());
+    }
+  }
+}
+
 TEST_F(WindowTest, RankPeersAcrossMasksBatchesAndSpecificationsKeepRowIdentity) {
   const auto schema =
       arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});

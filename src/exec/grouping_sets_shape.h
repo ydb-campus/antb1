@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -25,9 +26,12 @@ namespace antb1::exec {
 // whose partial states add exactly -- COUNT(*), COUNT(x), sums of counts; SUM and AVG of an integer
 // but HUGEINT and of a DECIMAL of at most 18 digits (a 128-bit sum that never overflows); AVG of a
 // DATE or a TIMESTAMP; MIN and MAX of anything but DOUBLE (whose -0.0 and NaN keep the value seen
-// first). COUNT(DISTINCT), a DOUBLE sum, the variance family and a wider sum do not.
+// first). COUNT(DISTINCT), a DOUBLE sum, and the variance family do not. A wider decimal sum is
+// also exact if the guaranteed input row bound times the largest unscaled magnitude fits in
+// DECIMAL(38,s).
 bool MergesExactly(const std::vector<plan::BoundColumn>& keys,
-                   const std::vector<plan::AggregateCall>& calls);
+                   const std::vector<plan::AggregateCall>& calls,
+                   std::optional<int64_t> max_rows = std::nullopt);
 
 // The work of a list of grouping sets (indices into the node's keys, each ascending).
 struct GroupingSetsShape {
@@ -35,11 +39,18 @@ struct GroupingSetsShape {
   std::vector<std::vector<std::size_t>> sets;
   // Per entry of the list: its distinct set.
   std::vector<std::size_t> entries;
-  // Per distinct set: the distinct set it is merged from, or itself for a set aggregated from the
-  // input (a root).
+  // Per distinct set: the root that supplies its groups, or itself if aggregated from input.
   std::vector<std::size_t> sources;
-  // Per distinct set: its keys' positions among its source's keys (0, 1, ... for a root).
+  // Per distinct set: its keys' positions among its root's keys (0, 1, ... for a root).
   std::vector<std::vector<std::size_t>> columns;
+  // For a nested family with at least two exact subtotals, in dependency order. Each projection
+  // maps the child's keys to positions in its immediate parent, independent of SQL emission order.
+  struct RollupLevel {
+    std::size_t set;
+    std::size_t parent;
+    std::vector<std::size_t> columns;
+  };
+  std::vector<RollupLevel> rollup;
   // Per distinct set: the entries of the list after which nothing reads its rows any more.
   std::vector<std::size_t> last_entries;
 
@@ -47,7 +58,7 @@ struct GroupingSetsShape {
 };
 
 // With `exact` (MergesExactly), the roots are the distinct sets no other distinct set contains and
-// every other set is merged from the smallest root that contains it (the first of them on a tie);
+// every other set is assigned to the smallest root that contains it (the first on a tie);
 // without, every distinct set is a root, aggregated from the input in a table of its own.
 GroupingSetsShape PlanGroupingSets(const std::vector<std::vector<std::size_t>>& sets, bool exact);
 

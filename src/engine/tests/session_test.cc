@@ -109,12 +109,57 @@ TEST_F(SessionTest, RankingAndRegroupingReuseTheSameGroupingBuckets) {
       const auto text = FormatProfile(*profile, ProfileFormat::kJson);
       EXPECT_NE(text.find("\"rank_buckets\":"), std::string::npos);
       EXPECT_NE(text.find("\"group_buckets\":"), std::string::npos);
+      if (std::string_view(grouping).contains("GROUPING SETS")) {
+        // Only (tenant) is complete within root buckets. (item) and () span buckets.
+        EXPECT_TRUE(text.contains("\"colocated_sets\":1")) << text;
+      }
       const auto serial = session->ExplainAnalyze(control);
       ASSERT_TRUE(serial.ok()) << serial.status().ToString();
       EXPECT_EQ(FormatProfile(*serial, ProfileFormat::kJson).find("\"rank_buckets\":"),
                 std::string::npos);
     }
   }
+}
+
+TEST_F(SessionTest, WideDecimalRollupUsesTheVerifiedJoinMultiplicity) {
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("events", {path_}).ok());
+  // Ten input rows fit the DECIMAL(37,0) proof. The other join pairs every row with all ten.
+  for (const bool unique : {true, false}) {
+    const auto* field = unique ? "AdvEngineID" : "EventDate";
+    const auto sql = std::format(
+        "SELECT a.AdvEngineID AS k, SUM(CAST(b.AdvEngineID AS DECIMAL(37,0))) AS v "
+        "FROM events a LEFT JOIN events b ON a.{} = b.{} GROUP BY ROLLUP(a.AdvEngineID) "
+        "ORDER BY k NULLS LAST",
+        field, field);
+    const auto result = session->Execute(sql);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_EQ(result->types.back(), plan::LogicalType::Decimal(38, 0));
+    ASSERT_EQ(result->table->num_rows(), 11);
+    const auto& sums = result->table->column(1);
+    for (int64_t i = 0; i < 10; ++i) {
+      EXPECT_EQ(sums->GetScalar(i).ValueOrDie()->ToString(), std::to_string(unique ? i : 45));
+    }
+    EXPECT_EQ(sums->GetScalar(10).ValueOrDie()->ToString(), unique ? "45" : "450");
+    const auto profile = session->ExplainAnalyze(sql);
+    ASSERT_TRUE(profile.ok()) << profile.status();
+    const auto json = FormatProfile(*profile, ProfileFormat::kJson);
+    const auto visits = std::format("\"local_rows\":{}", unique ? 10 : 200);
+    EXPECT_TRUE(json.contains(visits + ",") || json.contains(visits + "}")) << json;
+  }
+}
+
+TEST_F(SessionTest, WideDecimalRollupKeepsIntermediateOverflowBeforeCancellation) {
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("events", {path_}).ok());
+  // Individual fine groups fit. The grand total overflows on its second row before cancellation.
+  const auto result = session->Execute(
+      "SELECT k,SUM(v) FROM (SELECT AdvEngineID % 2 AS k, "
+      "CASE WHEN AdvEngineID < 2 THEN CAST(90000000000000000000000000000000000000 "
+      "AS DECIMAL(38,0)) ELSE CAST(-90000000000000000000000000000000000000 AS DECIMAL(38,0)) "
+      "END AS v FROM events WHERE AdvEngineID < 3) t GROUP BY ROLLUP(k) LIMIT 1");
+  EXPECT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().message().contains("SUM overflow")) << result.status();
 }
 
 TEST_F(SessionTest, CountStarFromRegisteredTable) {

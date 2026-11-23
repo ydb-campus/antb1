@@ -445,17 +445,35 @@ the builds, outermost first and each after the builds its input probes, then the
 | `UnionAllOperator` | `UnionAll` | the batches of each input in input order, on the consumer's thread (an input that is a part pipeline runs its own parts); an input is opened when the previous one is exhausted and closed before the next one opens, so one input's resources at a time and none of an input a `Limit` never reaches; each batch rebuilt in the union's schema (input 0's names, nullable fields) with its selection kept, no row copied; the first failing input in order decides the error ([ADR 0036](adr/0036-union-all.md)) |
 | `SetOperationOperator` | `SetOperation` | one `GroupTable` keyed on every column, the inputs read in full in written order, one open at a time as in `UnionAllOperator`; the rows of a starter (an input that can bring a row into the result: `plan::SetStarters`) insert their groups, every other input's only look theirs up (`KeyTable::Lookup`) and add none; per group and input a presence bit, or a count where the formula reads one (`plan::SetCounted`), charged to the budget; after the last input the formula gives each group its copies, in chunks: under a DISTINCT root each kept group once with its keys as first seen among the starters, selected over the table's chunks; under an ALL root each group repeated by its copies with its normalized keys, in batches of at most 64Ki rows; the first failing input in order decides the error ([ADR 0039](adr/0039-set-operations.md)) |
 
+For a rollup over a part pipeline, wide decimal SUM and AVG can reuse the finest groups when
+all intermediate sums fit in 38 digits. The exact scan row count bounds the number of inputs
+through filters, computations, projections and joins that emit at most one row per probe row.
+For a join that can emit multiple matches, the operator checks uniqueness in the prepared build.
+The row bound times the largest absolute unscaled input must fit at the original scale. Without
+that proof, each grouping set accumulates its own wide decimal state in the original order.
+
 A grouped producer can distribute its output on one requested grouping column. Its part tables
 still compare every grouping key. Raw rows, partial groups and derived grouping sets use the
-same routing hash when the set includes the column. A set omitting it completes its normal
-aggregation and sends its result batches to the bucket for NULL. Projections remap a requested
-column and filters preserve the distribution. Unsupported operators decline the request.
+same routing hash when the set includes the column. Each such subtotal is complete in its
+root bucket, so it can be emitted directly after the local merge. Exact nested grouping sets can derive each
+subtotal from its immediate finer level using the existing aggregate states and key chunks. The
+part operator measures the first subtotal in the largest root bucket. When it reduces the group count at
+least fourfold and all levels fit the same budgeted batch, each bucket builds them in dependency order.
+Other batches read their subtotals from the finest groups. When the active buckets leave workers idle,
+workers can build different subtotals from the same immutable chunks. Each subtotal table has one
+writer. Batches that need a shared key snapshot keep one task per bucket. A set omitting the
+routing column completes its normal aggregation and sends its result batches to the bucket for
+NULL. Projections remap a requested column and filters preserve the distribution. Unsupported
+operators decline the request.
 
 An ordered rank window can reuse this layout when all its calls partition on that column.
 It sorts disjoint ranges of row references on the query executor, compares the actual window
 keys inside each bucket, and writes ranks in input row order. It passes the distribution to a
 subsequent GROUP BY on the same column, which consumes each batch directly into its bucket's
-aggregate table. The profile counts populated buckets as `rank_buckets` and `group_buckets`.
+aggregate table. When a mixed rank bucket is large and workers are available, a sample of its
+partition keys selects a pivot. The worker ranges on either side contain whole SQL partitions.
+The profile counts populated buckets as `rank_buckets` and `group_buckets`, and extra sort
+ranges as `rank_bucket_splits`.
 
 Large ordered windows, full sorts and top-N compactions can pack several sort fields into one
 64-bit key when every value fits. Wider keys use up to 128 bits. Equal prefixes resume comparison

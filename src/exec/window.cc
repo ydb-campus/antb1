@@ -122,6 +122,7 @@ struct Specification {
   PoolVector<RowRef> groups;      // group -> finalized chunk/row
   PoolVector<RowRef> positions;   // input row -> running result chunk/row
   int64_t packed_rows = 0;
+  std::size_t rank_splits = 0;
   std::vector<Results> results;
   std::vector<arrow::ArrayVector> direct;
   PoolVector<std::size_t> direct_first;
@@ -201,6 +202,7 @@ struct OrderedLayout {
   explicit OrderedLayout(arrow::MemoryPool* pool)
       : permutation(pool), offsets(pool), starts(pool) {}
   int64_t packed_rows = 0;
+  std::size_t rank_splits = 0;
   PoolVector<RowRef> permutation;
   PoolVector<std::size_t> offsets;
   PoolVector<std::uint8_t> starts;
@@ -211,6 +213,54 @@ struct WindowBuckets {
   const BatchPartition* source = nullptr;
   std::vector<std::size_t> chunks;  // one bucket per input batch, in stream order
 };
+
+// Each endpoint initially belongs to an upstream hash bucket. Keep equal SQL partition keys
+// together while splitting an oversized mixed bucket across otherwise idle workers.
+std::size_t SplitRankBuckets(std::span<RowRef> rows, std::span<std::size_t> ends,
+                             const RowComparator& partition,
+                             std::span<const RowComparator::KeyArrays> arrays, std::size_t threads,
+                             std::size_t& splits) {
+  std::size_t tasks = 0;
+  std::size_t previous = 0;
+  for (const auto end : ends) {
+    if (end != previous) {
+      ends[tasks++] = end;
+      previous = end;
+    }
+  }
+  const auto populated = tasks;
+  const auto max_tasks = std::min(threads, ends.size());
+  const auto minimum = std::max<std::size_t>(kChunkRows, rows.size() / threads);
+  const auto less = [&](RowRef a, RowRef b) {
+    return partition.Compare(arrays[a.chunk], a.row, arrays[b.chunk], b.row) < 0;
+  };
+  for (std::size_t i = 0; i < populated && tasks < max_tasks; ++i) {
+    const auto begin = i == 0 ? 0 : ends[i - 1];
+    auto bucket = rows.subspan(begin, ends[i] - begin);
+    if (bucket.size() / 2 < minimum) {
+      continue;
+    }
+    std::array<RowRef, 16> sample;
+    const auto stride = bucket.size() / sample.size();
+    for (std::size_t j = 0; j < sample.size(); ++j) {
+      sample[j] = bucket[j * stride];
+    }
+    std::ranges::sort(sample, less);
+    if (!less(sample[3], sample[12])) {
+      continue;
+    }
+    // The sampled quartiles straddle a partition boundary even if the median equals the first
+    // quartile. Both sides of the actual partition therefore contain at least one sampled row.
+    const RowRef pivot = less(sample[3], sample[8]) ? sample[8] : sample[12];
+    const auto right = std::ranges::partition(bucket, [&](RowRef row) { return less(row, pivot); });
+    ends[tasks++] = begin + Narrow<std::size_t>(right.begin() - bucket.begin());
+  }
+  splits = tasks - populated;
+  if (splits > 0) {
+    std::ranges::sort(ends.first(tasks));
+  }
+  return tasks;
+}
 
 arrow::Result<OrderedLayout> OrderRows(const plan::WindowCall& call,
                                        const arrow::RecordBatchVector& input, std::size_t rows,
@@ -308,6 +358,12 @@ arrow::Result<OrderedLayout> OrderRows(const plan::WindowCall& call,
     offset += count;
   }
   bucket_ids.Reset();
+  std::size_t tasks = count_buckets;
+  if (rank && buckets.source != nullptr && ctx.executor != nullptr && ctx.threads > 1) {
+    tasks =
+        SplitRankBuckets({layout.permutation.data(), rows}, {ends.data(), ends.size()}, partition,
+                         arrays, Narrow<std::size_t>(ctx.threads), layout.rank_splits);
+  }
   // Each bucket owns a disjoint range of the permutation and disjoint result rows.
   // Compare actual partition keys inside it, since distinct SQL partitions can collide.
   std::atomic<int64_t> packed_rows{0};
@@ -386,8 +442,8 @@ arrow::Result<OrderedLayout> OrderRows(const plan::WindowCall& call,
     }
     return arrow::Status::OK();
   };
-  auto* executor = count_buckets > 1 && rows >= kChunkRows ? ctx.executor : nullptr;
-  ARROW_RETURN_NOT_OK(ForEach(executor, count_buckets, order_bucket));
+  auto* executor = tasks > 1 && rows >= kChunkRows ? ctx.executor : nullptr;
+  ARROW_RETURN_NOT_OK(ForEach(executor, tasks, order_bucket));
   layout.packed_rows = packed_rows.load(std::memory_order_relaxed);
   return layout;
 }
@@ -440,6 +496,7 @@ arrow::Status PrepareOrdered(Specification& spec, const std::vector<plan::Window
   }
   ARROW_ASSIGN_OR_RAISE(auto layout, std::move(ordered));
   spec.packed_rows = layout.packed_rows;
+  spec.rank_splits = layout.rank_splits;
   if (!direct.empty()) {
     spec.direct_first = std::move(direct.front().first);
     ARROW_RETURN_NOT_OK(Reserve(spec.direct, direct.size(), memory));
@@ -744,6 +801,9 @@ arrow::Status WindowOperator::Prepare() {
     if (calls_[spec.calls.front()].frame != plan::WindowCall::Frame::kWholePartition) {
       ARROW_RETURN_NOT_OK(
           PrepareOrdered(spec, calls_, s.input, s.rows, s.memory, s.ctx, s.buckets));
+      if (profile() != nullptr && spec.rank_splits > 0) {
+        profile()->Add("rank_bucket_splits", MetricUnit::kCount, Narrow<int64_t>(spec.rank_splits));
+      }
       if (profile() != nullptr && spec.packed_rows > 0) {
         profile()->Add("packed_sort_rows", MetricUnit::kCount, spec.packed_rows);
       }

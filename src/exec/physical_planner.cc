@@ -1439,10 +1439,26 @@ struct Builder {
       ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node.input, *scan, slot));
       ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
       const int width = sample->output_schema()->num_fields();
+      // Filters and projections cannot expand the scan. Neither can a probing semi/anti/mark
+      // join or a one-row join. Pair-producing joins need an actual unique build, checked at
+      // Open after PrepareBuilds. Joins that also emit build rows end a part pipeline.
+      auto row_bound = [table = scan->table,
+                        pipeline_builds = parts.builds] -> std::optional<int64_t> {
+        if (pipeline_builds != nullptr) {
+          for (const auto& build : pipeline_builds->builds) {
+            const auto traits = plan::Traits(build->kind());
+            if (traits.outputs_right && !traits.one_row &&
+                (build->table() == nullptr || !build->table()->unique())) {
+              return std::nullopt;
+            }
+          }
+        }
+        return table->exact_row_count();
+      };
       Name("PartGroupingSets");
       return WithBuilds(std::make_unique<PartGroupingSetsOperator>(
                             std::move(parts.pipeline), parts.count, width, node.keys, node.sets,
-                            node.aggregates, node.grouping),
+                            node.aggregates, node.grouping, std::move(row_bound)),
                         parts.builds, slot);
     }
     Name("GroupingSets");
