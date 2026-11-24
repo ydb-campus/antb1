@@ -6,7 +6,9 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <numeric>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -28,6 +30,7 @@
 
 #include "column_key_table.h"
 #include "fixed_key_table.h"
+#include "pool_vector.h"
 
 namespace antb1::exec {
 namespace {
@@ -403,6 +406,118 @@ class PackedStringKeyTable final : public KeyTable {
   bool packed_ = true;
 };
 
+// A chain of subtotal projections preserves first occurrence under deduplication. Arrow may
+// reorder new groups within a Consume call, so translate its IDs only if that actually happens.
+class FirstSeenKeyTable final : public KeyTable {
+ public:
+  FirstSeenKeyTable(std::unique_ptr<KeyTable> backend, arrow::compute::ExecContext* ctx)
+      : backend_(std::move(backend)), ctx_(ctx), order_(ctx->memory_pool()) {}
+
+  arrow::Result<KeyIds> Consume(const arrow::compute::ExecBatch& keys) override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeyIds> {
+      ARROW_RETURN_NOT_OK(FinishOrder());
+      ARROW_ASSIGN_OR_RAISE(auto ids, backend_->Consume(keys));
+      if (order_.empty() && AlreadyOrdered(ids)) {
+        return ids;
+      }
+      if (ids.after != ids.before) {
+        pending_ = ids;
+        ARROW_RETURN_NOT_OK(FinishOrder());
+      }
+      ARROW_ASSIGN_OR_RAISE(auto values, AllocateWords(keys.length, 4, ctx_->memory_pool()));
+      auto* mapped = values->mutable_data_as<std::uint32_t>();
+      std::ranges::transform(ids.ids, mapped, [&](auto id) { return order_[id]; });
+      ids.owner = std::move(values);
+      ids.ids = {mapped, ids.ids.size()};
+      return ids;
+    });
+  }
+
+  arrow::Result<std::shared_ptr<arrow::UInt32Array>> Lookup(
+      const arrow::compute::ExecBatch& keys) override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
+      ARROW_RETURN_NOT_OK(FinishOrder());
+      ARROW_ASSIGN_OR_RAISE(auto ids, backend_->Lookup(keys));
+      if (order_.empty()) {
+        return ids;
+      }
+      const arrow::UInt32Array order(num_groups(),
+                                     arrow::Buffer::Wrap(order_.data(), order_.size()));
+      ARROW_ASSIGN_OR_RAISE(
+          auto mapped,
+          arrow::compute::Take(order, *ids, arrow::compute::TakeOptions::NoBoundsCheck(), ctx_));
+      return std::static_pointer_cast<arrow::UInt32Array>(mapped);
+    });
+  }
+
+  [[nodiscard]] arrow::Result<KeySnapshot> Uniques() const override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
+      ARROW_RETURN_NOT_OK(FinishOrder());
+      ARROW_ASSIGN_OR_RAISE(auto snapshot, backend_->Uniques());
+      if (!order_.empty()) {
+        ARROW_ASSIGN_OR_RAISE(auto values, AllocateWords(num_groups(), 4, ctx_->memory_pool()));
+        auto* inverse = values->mutable_data_as<std::uint32_t>();
+        for (std::uint32_t id = 0; id < num_groups(); ++id) {
+          inverse[order_[id]] = id;
+        }
+        const arrow::Datum indices(
+            arrow::ArrayData::Make(arrow::uint32(), num_groups(), {nullptr, std::move(values)}, 0));
+        for (auto& column : snapshot.batch.values) {
+          ARROW_ASSIGN_OR_RAISE(
+              column, arrow::compute::Take(column, indices,
+                                           arrow::compute::TakeOptions::NoBoundsCheck(), ctx_));
+        }
+      }
+      return snapshot;
+    });
+  }
+
+  [[nodiscard]] std::uint32_t num_groups() const override { return backend_->num_groups(); }
+
+ private:
+  static bool AlreadyOrdered(const KeyIds& ids) {
+    auto next = ids.before;
+    for (const auto id : ids.ids) {
+      if (next == ids.after || id > next) {
+        break;
+      }
+      if (id == next) {
+        ++next;
+      }
+    }
+    return next == ids.after;
+  }
+
+  // Keep the backend IDs if growing the map fails after insertion. A subsequent lookup,
+  // snapshot or insert can retry the allocation without losing encounter order.
+  arrow::Status FinishOrder() const {
+    if (!pending_.has_value()) {
+      return arrow::Status::OK();
+    }
+    const auto& ids = *pending_;
+    const bool identity = order_.empty();
+    ARROW_RETURN_NOT_OK(order_.Resize(ids.after));
+    if (identity) {
+      std::ranges::iota(std::span(order_.data(), ids.before), 0U);
+    }
+    constexpr auto kUnseen = std::numeric_limits<std::uint32_t>::max();
+    std::fill(order_.data() + ids.before, order_.data() + ids.after, kUnseen);
+    auto next = ids.before;
+    for (const auto id : ids.ids) {
+      if (order_[id] == kUnseen) {
+        order_[id] = next++;
+      }
+    }
+    pending_.reset();
+    return arrow::Status::OK();
+  }
+
+  std::unique_ptr<KeyTable> backend_;
+  arrow::compute::ExecContext* ctx_;
+  mutable PoolVector<std::uint32_t> order_;  // backend ID to first-seen ID; empty for identity
+  mutable std::optional<KeyIds> pending_;
+};
+
 }  // namespace
 
 arrow::Status StoredKeyTable::CheckSelection(std::span<const std::uint32_t> selected,
@@ -458,11 +573,17 @@ arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
       options.kind == KeyTableKind::kFixedIdOrder;
   ANTB1_CHECK(known_kind);
   return KeyTableNoBadAlloc([&] -> arrow::Result<std::unique_ptr<KeyTable>> {
+    const auto ordered = [&](std::unique_ptr<KeyTable> table) -> std::unique_ptr<KeyTable> {
+      if (options.first_seen_order) {
+        return std::make_unique<FirstSeenKeyTable>(std::move(table), ctx);
+      }
+      return table;
+    };
     if ((options.kind == KeyTableKind::kAuto || options.kind == KeyTableKind::kPackedStrings) &&
         SupportsPackedStrings(key_types)) {
       const std::vector<arrow::TypeHolder> packed_types(key_types.size(), arrow::uint64());
       ARROW_ASSIGN_OR_RAISE(auto backend, MakeGrouper(packed_types, ctx));
-      return std::make_unique<PackedStringKeyTable>(std::move(backend), key_types, ctx);
+      return ordered(std::make_unique<PackedStringKeyTable>(std::move(backend), key_types, ctx));
     }
     if (options.kind == KeyTableKind::kFixed || options.kind == KeyTableKind::kFixedIdOrder) {
       if (auto layout = FixedKeyLayoutOf(key_types); layout.has_value()) {
@@ -474,7 +595,8 @@ arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
         return MakeColumnKeyTable(key_types, ctx->memory_pool(), options, budget);
       }
     }
-    return MakeGrouper(key_types, ctx);
+    ARROW_ASSIGN_OR_RAISE(auto backend, MakeGrouper(key_types, ctx));
+    return ordered(std::move(backend));
   });
 }
 

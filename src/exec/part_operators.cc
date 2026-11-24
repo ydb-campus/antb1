@@ -999,7 +999,8 @@ arrow::Status PartGroupingSetsOperator::Probe() {
     ARROW_ASSIGN_OR_RAISE(
         auto table,
         GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_, input_width_, pool_, budget_,
-                         /*first_keys=*/true, GroupTable::kPartitions, {.estimate = false}));
+                         /*first_keys=*/true, GroupTable::kPartitions,
+                         {.estimate = false, .first_seen_order = !shape.rollup.empty()}));
     ARROW_RETURN_NOT_OK(table->MergeProjectedChunks(source, columns));
     const int64_t groups = table->num_groups();
     // The set's groups over the whole root, at the partition's ratio, and at most the root's.
@@ -1093,10 +1094,11 @@ std::vector<std::size_t> PartGroupingSetsOperator::NextBatch(std::size_t from_en
 
 arrow::Status PartGroupingSetsOperator::DeriveBatch(const std::vector<std::size_t>& batch) {
   const GroupingSetsShape& shape = shape_;
-  const auto make_table = [&](std::size_t s) {
-    return GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_, input_width_, pool_,
-                            budget_,
-                            /*first_keys=*/true, GroupTable::kPartitions, {.estimate = false});
+  const auto make_table = [&](std::size_t s, bool partial = false) {
+    return GroupTable::Make(
+        SetKeys(keys_, shape.sets[s]), aggregates_, input_width_, pool_, budget_,
+        /*first_keys=*/true, GroupTable::kPartitions,
+        {.estimate = false, .first_seen_order = partial && !shape.rollup.empty()});
   };
   const std::size_t sets = shape.sets.size();
   std::size_t partitions = 1;
@@ -1164,7 +1166,7 @@ arrow::Status PartGroupingSetsOperator::DeriveBatch(const std::vector<std::size_
                                                 GroupTable::kPartitions, pool_));
               continue;
             }
-            ARROW_ASSIGN_OR_RAISE(auto table, make_table(s));
+            ARROW_ASSIGN_OR_RAISE(auto table, make_table(s, true));
             if (chained && i > 0) {
               const auto& level = shape.rollup[i];
               ARROW_RETURN_NOT_OK(
