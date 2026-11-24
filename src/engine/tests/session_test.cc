@@ -253,6 +253,70 @@ TEST_F(SessionTest, GroupKeyPushdownKeepsJoinResidualErrors) {
   }
 }
 
+TEST_F(SessionTest, RegroupingHasTheSameMatchesWithEitherJoinBuild) {
+  const auto write = [&](std::string_view name, const std::shared_ptr<arrow::Table>& table,
+                         int64_t part_rows) {
+    const auto out = arrow::io::FileOutputStream::Open((dir_ / name).string()).ValueOrDie();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, part_rows).ok());
+    ASSERT_TRUE(out->Close().ok());
+  };
+  arrow::Int32Builder keys;
+  arrow::Int64Builder a;
+  arrow::Int64Builder b;
+  // Two dimension matches for 2, none for 3, and an ordinary join ignores NULL on either side.
+  for (const int k : {0, 1, 2, 2, 4, 5, 6, 7}) {
+    ASSERT_TRUE(keys.Append(k).ok());
+    ASSERT_TRUE(a.Append(k % 2).ok());
+    ASSERT_TRUE(b.Append(k % 3).ok());
+  }
+  ASSERT_TRUE(keys.AppendNull().ok());
+  ASSERT_TRUE(a.Append(0).ok());
+  ASSERT_TRUE(b.Append(0).ok());
+  ASSERT_NO_FATAL_FAILURE(
+      write("labels.parquet",
+            arrow::Table::Make(
+                arrow::schema({arrow::field("k", arrow::int32()), arrow::field("a", arrow::int64()),
+                               arrow::field("b", arrow::int64())}),
+                {keys.Finish().ValueOrDie(), a.Finish().ValueOrDie(), b.Finish().ValueOrDie()}),
+            3));
+  arrow::Int32Builder bucket;
+  arrow::DoubleBuilder value;
+  for (int i = 0; i < 480; ++i) {
+    ASSERT_TRUE((i % 19 == 0 ? keys.AppendNull() : keys.Append(i % 8)).ok());
+    ASSERT_TRUE(bucket.Append(i % 3).ok());
+    ASSERT_TRUE(value.Append(i % 5).ok());
+  }
+  ASSERT_NO_FATAL_FAILURE(write(
+      "readings.parquet",
+      arrow::Table::Make(
+          arrow::schema({arrow::field("k", arrow::int32()), arrow::field("bucket", arrow::int32()),
+                         arrow::field("v", arrow::float64())}),
+          {keys.Finish().ValueOrDie(), bucket.Finish().ValueOrDie(), value.Finish().ValueOrDie()}),
+      60));
+  constexpr std::string_view kSql =
+      "SELECT a,b,bucket,n FROM (SELECT a,b,bucket,SUM(v) AS n FROM readings JOIN labels "
+      "ON readings.k=labels.k GROUP BY a,b,bucket) g WHERE bucket=2 ORDER BY a,b";
+  QueryResult reference;
+  for (const int ratio : {200, 100}) {
+    auto session = Session::Make({.build_side_ratio = ratio}).ValueOrDie();
+    ASSERT_TRUE(session->RegisterParquet("labels", {(dir_ / "labels.parquet").string()}).ok());
+    ASSERT_TRUE(session->RegisterParquet("readings", {(dir_ / "readings.parquet").string()}).ok());
+    const auto plan = session->ExplainPhysical(kSql);
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    EXPECT_EQ(plan->contains("PartGroupAggregate GroupAggregate keys=[labels.a"), ratio == 100)
+        << *plan;
+    const auto result = session->Execute(kSql);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_GT(result->table->num_rows(), 0);
+    if (reference.table == nullptr) {
+      reference = *result;
+    } else {
+      EXPECT_TRUE(reference.table->Equals(*result->table));
+    }
+  }
+}
+
 TEST_F(SessionTest, GroupKeyFilterPreservesOverflowInDiscardedDecimalRows) {
   // The second row fits the physical INT32 but exceeds its declared precision. Doubling
   // it overflows DECIMAL(5,1), even though the consumer only wants the first group.

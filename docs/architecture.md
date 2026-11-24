@@ -252,6 +252,14 @@ steps (only step 7 uses more than one thread):
    each scanned operand across every row group and requires the result type to have room for
    rescaling and a carry. Ordinary floating-point arithmetic can pass the same check when
    both operands can be evaluated and converted safely.
+   After pushing a grouping-key equality, the optimizer can build an inner join on the
+   filtered groups so a multi-part scan probes it and the next aggregate can group in parallel.
+   Every grouping key except the ordinary join key must be fixed. Exact scan bounds must cover
+   the grouped key range, and its maximum number of matchable groups must fit the configured
+   build-side ratio. The fixed-width values in a grouped row must fit within the width of the
+   scan columns needed for the final grouping, counting only the offset for a string. The
+   choice applies at every thread count to preserve the probe and accumulation order. A
+   finite memory limit keeps the previous build side for an OOM retry.
    Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both

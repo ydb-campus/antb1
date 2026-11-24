@@ -1131,6 +1131,88 @@ TEST(OptimizerTest, GroupKeyStaysAboveCappedDecimalAndRemainder) {
   }
 }
 
+TEST(OptimizerTest, ReconsidersFilteredGroupsForAParallelJoinProbe) {
+  constexpr int64_t kLabels = 4096;
+  constexpr int64_t kPart = kLabels / 2;
+  constexpr int64_t kReadings = 4 * kLabels;
+  struct Scenario {
+    bool multipart = true;
+    bool complete = true;
+    int64_t fact_max = kLabels - 1;
+    int threads = 4;
+    int64_t ratio = 100;
+    bool filtered = true;
+    bool wide_sum = false;
+  };
+  const auto run = [&](Scenario sample, bool expect_flip) {
+    SCOPED_TRACE(std::format("parts={} complete={} max={} threads={} ratio={} filtered={} wide={}",
+                             sample.multipart, sample.complete, sample.fact_max, sample.threads,
+                             sample.ratio, sample.filtered, sample.wide_sum));
+    Catalog catalog;
+    auto readings = std::make_shared<testing::FakeTable>(
+        arrow::schema(
+            {arrow::field("k", arrow::int32()), arrow::field("bucket", arrow::int32()),
+             arrow::field("v", sample.wide_sum ? arrow::decimal128(26, 2) : arrow::float64())}),
+        kReadings);
+    readings->WithStats(0, 0,
+                        {.min = 0, .max = sample.fact_max, .null_count = 1, .rows = kReadings});
+    readings->WithStats(0, 1, {.min = 0, .max = 6, .rows = kReadings});
+    auto labels = std::make_shared<testing::FakeTable>(
+        arrow::schema({arrow::field("k", arrow::int32()), arrow::field("a", arrow::binary()),
+                       arrow::field("b", arrow::binary()), arrow::field("c", arrow::binary()),
+                       arrow::field("d", arrow::binary())}),
+        kLabels);
+    if (sample.multipart) {
+      labels->WithParts({kPart, kPart})
+          .WithStats(0, 0, {.min = 0, .max = kPart - 1, .rows = kPart});
+      if (sample.complete) {
+        labels->WithStats(1, 0, {.min = kPart, .max = kLabels - 1, .rows = kPart});
+      }
+    } else {
+      labels->WithStats(0, 0, {.min = 0, .max = kLabels - 1, .rows = kLabels});
+    }
+    ASSERT_TRUE(catalog.Register("readings", readings).ok());
+    ASSERT_TRUE(catalog.Register("labels", labels).ok());
+    const std::string sql =
+        "SELECT a,b,c,d,bucket,n FROM (SELECT a,b,c,d,bucket,SUM(v) AS n "
+        "FROM readings JOIN labels ON readings.k=labels.k "
+        "GROUP BY a,b,c,d,bucket) g";
+    const auto bound = BindSql(sql + (sample.filtered ? " WHERE bucket=2" : ""), catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const BindOptions options{.build_side_ratio = sample.ratio,
+                              .threads = sample.threads,
+                              .memory_limit = 64 * 1024 * 1024};
+    LogicalPlan fallback;
+    const auto result = Optimize(*bound, options, &fallback);
+    ASSERT_TRUE(result.ok()) << result.status();
+    const auto* join = Find<JoinNode>(result->root);
+    ASSERT_NE(join, nullptr) << Explain(*result);
+    const auto& build = join->build == BuildSide::kLeft ? join->left : join->right;
+    EXPECT_EQ(std::holds_alternative<GroupAggregateNode>(*build), expect_flip) << Explain(*result);
+    EXPECT_EQ(fallback.root != nullptr, expect_flip);
+    EXPECT_EQ(PositionMismatch(*result), std::nullopt);
+    if (fallback.root != nullptr) {
+      const auto* previous = Find<JoinNode>(fallback.root);
+      ASSERT_NE(previous, nullptr);
+      const auto& old_build =
+          previous->build == BuildSide::kLeft ? previous->left : previous->right;
+      EXPECT_TRUE(std::holds_alternative<ScanNode>(*old_build)) << Explain(fallback);
+      EXPECT_EQ(PositionMismatch(fallback), std::nullopt);
+    }
+    const auto again = Optimize(*result, options);
+    ASSERT_TRUE(again.ok()) << again.status();
+    EXPECT_EQ(Explain(*again), Explain(*result));
+  };
+  run({}, true);              // one matchable group per scan key
+  run({.threads = 1}, true);  // preserve probe and accumulation order
+  run({.multipart = false}, false);
+  run({.complete = false}, false);    // missing bounds in one scan part
+  run({.fact_max = kLabels}, false);  // the old scan build can prune a grouped key
+  run({.ratio = 200}, false);
+  run({.filtered = false}, false);  // another grouping key still varies
+  run({.wide_sum = true}, false);   // changing accumulation order could hide overflow
+}
+
 const JoinNode& JoinBelowProject(const LogicalPlan& plan) {
   return std::get<JoinNode>(*std::get<ProjectNode>(*plan.root).input);
 }
