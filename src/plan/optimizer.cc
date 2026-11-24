@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <format>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -14,6 +16,8 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include <arrow/type.h>
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
@@ -119,11 +123,39 @@ class ComputeSafety {
     return total(op->left) && total(op->right);
   }
 
+  const ColumnRange* RangeFor(const LogicalNodePtr& node, ColumnId id) {
+    if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+      return RangeFor(filter->input, id);
+    }
+    if (const auto* join = std::get_if<JoinNode>(node.get());
+        join != nullptr && join->kind == JoinKind::kInner) {
+      const ColumnRange* left = RangeFor(join->left, id);
+      return left != nullptr ? left : RangeFor(join->right, id);
+    }
+    const auto* scan = std::get_if<ScanNode>(node.get());
+    if (scan == nullptr || scan->table == nullptr || scan->ids.size() != scan->fields.size()) {
+      return nullptr;
+    }
+    const auto at = std::ranges::find(scan->ids, id);
+    if (at == scan->ids.end()) {
+      return nullptr;
+    }
+    const int field = scan->fields[Narrow<std::size_t>(at - scan->ids.begin())];
+    auto [it, inserted] = ranges_.try_emplace({scan->table.get(), field});
+    if (inserted) {
+      it->second = ColumnRangeOf(*scan->table, field);
+    }
+    return &it->second;
+  }
+
  private:
   bool DecimalFits(const Expr& expr, const LogicalNodePtr& input) {
     const IntegerRange allowed = RangeOf(expr.type);
     if (const auto* col = std::get_if<ColumnExpr>(&expr.node)) {
-      return col->id != kNoColumnId && ColumnFits(input, col->id, allowed);
+      const ColumnRange* range = col->id == kNoColumnId ? nullptr : RangeFor(input, col->id);
+      return range != nullptr && range->exact &&
+             (range->non_null == 0 || (range->min.has_value() && range->max.has_value() &&
+                                       *range->min >= allowed.min && *range->max <= allowed.max));
     }
     if (const auto* literal = std::get_if<ConstantExpr>(&expr.node)) {
       const auto* value = std::get_if<Int128>(&literal->value.value);
@@ -132,39 +164,13 @@ class ComputeSafety {
     return Arithmetic(expr, input);
   }
 
-  bool ColumnFits(const LogicalNodePtr& node, ColumnId id, IntegerRange allowed) {
-    if (const auto* filter = std::get_if<FilterNode>(node.get())) {
-      return ColumnFits(filter->input, id, allowed);
-    }
-    if (const auto* join = std::get_if<JoinNode>(node.get());
-        join != nullptr && join->kind == JoinKind::kInner) {
-      return ColumnFits(join->left, id, allowed) || ColumnFits(join->right, id, allowed);
-    }
-    const auto* scan = std::get_if<ScanNode>(node.get());
-    if (scan == nullptr || scan->table == nullptr || scan->ids.size() != scan->fields.size()) {
-      return false;
-    }
-    const auto at = std::ranges::find(scan->ids, id);
-    if (at == scan->ids.end()) {
-      return false;
-    }
-    const int field = scan->fields[Narrow<std::size_t>(at - scan->ids.begin())];
-    auto [it, inserted] = ranges_.try_emplace({scan->table.get(), field});
-    if (inserted) {
-      it->second = ColumnRangeOf(*scan->table, field);
-    }
-    const ColumnRange& range = it->second;
-    return range.exact &&
-           (range.non_null == 0 || (range.min.has_value() && range.max.has_value() &&
-                                    *range.min >= allowed.min && *range.max <= allowed.max));
-  }
-
   std::map<std::pair<const Table*, int>, ColumnRange> ranges_;
 };
 
 struct PushdownState {
   std::set<const LogicalNode*> preserve;
   ComputeSafety compute_safety;
+  std::set<ColumnId> pushed_group_keys;
   // A checked aggregate or an entire UNION ALL input can fail on rows an early filter removes.
   // An inferred filter can depend on other consumers, so preserve the trial for this pass.
   bool keep_filtered_plan = false;
@@ -237,7 +243,11 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
       }
       Predicate below = predicate;
       below.column = group->keys[Narrow<std::size_t>(at - group->key_ids.begin())];
-      return WithInputs(*node, {PushEquality(group->input, below, state)});
+      auto pushed = PushEquality(group->input, below, state);
+      if (pushed != group->input) {
+        state.pushed_group_keys.insert(predicate.column->id);
+      }
+      return WithInputs(*node, {std::move(pushed)});
     }
   }
   // Do not move a filter ahead of expressions which may fail, or through a computed key.
@@ -445,6 +455,106 @@ LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState&
     return out.left == join->left && out.right == join->right ? current : Make(std::move(out));
   }
   return current;
+}
+
+// Compare the fixed-width grouped build with the columns the scan must retain for the
+// grouping above the join. A string costs at least its 32-bit offset, even when empty.
+bool GroupedBuildIsNarrower(const GroupAggregateNode& grouped, const GroupAggregateNode& parent,
+                            const ScanNode& scan) {
+  int64_t group_bits = 0;
+  const auto add = [&](LogicalType type) {
+    const int bits = ToArrow(type)->bit_width();
+    group_bits += std::max(bits, 0);
+    return bits > 0;
+  };
+  for (const auto& key : grouped.keys) {
+    if (!add(key.type)) {
+      return false;
+    }
+  }
+  for (const auto& call : grouped.aggregates) {
+    if (!add(call.type)) {
+      return false;
+    }
+  }
+  int64_t scan_bits = 0;
+  for (const auto& key : parent.keys) {
+    if (std::ranges::contains(scan.ids, key.id)) {
+      scan_bits += key.type == LogicalType::kVarchar ? 32 : ToArrow(key.type)->bit_width();
+    }
+  }
+  return group_bits <= scan_bits;
+}
+
+// A grouped probe ends the scan pipeline, so its parent aggregate runs serially. Once
+// filters fix every grouping key except the join key, at most one group can match each
+// non-NULL value of that key. An ordinary inner join never indexes the NULL group.
+LogicalNodePtr PreferGroupedBuild(const LogicalNodePtr& node, PushdownState& state, int64_t ratio) {
+  const auto current = MapInputs(
+      node, [&](const LogicalNodePtr& input) { return PreferGroupedBuild(input, state, ratio); });
+  const auto* parent = std::get_if<GroupAggregateNode>(current.get());
+  const auto* join = parent == nullptr ? nullptr : std::get_if<JoinNode>(parent->input.get());
+  if (join == nullptr || join->kind != JoinKind::kInner || !join->residual.empty() ||
+      join->keys.size() != 1 || join->keys.front().null_equal ||
+      std::ranges::any_of(parent->aggregates, CanFailOnGroup)) {
+    return current;
+  }
+  const bool left = join->build == BuildSide::kLeft;
+  const auto& build = left ? join->left : join->right;
+  const auto& probe = left ? join->right : join->left;
+  const auto* scan = std::get_if<ScanNode>(build.get());
+  const auto* group = std::get_if<GroupAggregateNode>(probe.get());
+  if (scan == nullptr || scan->table == nullptr || scan->table->num_parts() < 2 ||
+      group == nullptr || group->keys.size() < 2 || group->keys.size() != group->key_ids.size() ||
+      std::ranges::none_of(group->key_ids,
+                           [&](ColumnId id) { return state.pushed_group_keys.contains(id); }) ||
+      !GroupedBuildIsNarrower(*group, *parent, *scan)) {
+    return current;
+  }
+  const auto& key = join->keys.front();
+  const auto& scan_key = left ? key.left : key.right;
+  const auto& group_key = left ? key.right : key.left;
+  const auto at = std::ranges::find(group->key_ids, group_key.id);
+  if (at == group->key_ids.end() || group_key.id == kNoColumnId || scan_key.id == kNoColumnId ||
+      scan_key.type != group_key.type ||
+      (!IsInteger(group_key.type) && group_key.type != LogicalType::kDate) ||
+      group_key.type == LogicalType::kHugeInt) {
+    return current;
+  }
+  const auto facts = KnownGroupEqualities(probe, &state.compute_safety);
+  if (!facts.safe || !std::ranges::all_of(group->key_ids, [&](ColumnId id) {
+        return id == group_key.id || std::ranges::any_of(facts.values, [&](const Predicate& p) {
+                 return p.column.has_value() && p.column->id == id;
+               });
+      })) {
+    return current;
+  }
+  const auto id = group->keys[Narrow<std::size_t>(at - group->key_ids.begin())].id;
+  auto input = group->input;
+  while (const auto* compute = std::get_if<ComputeNode>(input.get())) {
+    if (std::ranges::contains(compute->ids, id)) {
+      return current;
+    }
+    input = compute->input;
+  }
+  const auto* domain = state.compute_safety.RangeFor(input, id);
+  const auto* indexed = state.compute_safety.RangeFor(build, scan_key.id);
+  if (domain == nullptr || !domain->exact || !domain->min.has_value() || !domain->max.has_value() ||
+      indexed == nullptr || !indexed->exact || !indexed->min.has_value() ||
+      !indexed->max.has_value() || indexed->non_null <= 0 || *indexed->min > *domain->min ||
+      *indexed->max < *domain->max || *domain->min < std::numeric_limits<int64_t>::min() ||
+      *domain->max > std::numeric_limits<int64_t>::max()) {
+    return current;
+  }
+  // Keep a scan build whose range could prune any of the grouped keys. Inside that range
+  // the join indexes at most one row per key; the remaining keys of the group are constant.
+  const Int128 groups = std::min<Int128>((*domain->max - *domain->min) + 1, domain->non_null);
+  if (groups <= 0 || (groups * ratio) > (Int128{indexed->non_null} * 100)) {
+    return current;
+  }
+  JoinNode changed = *join;
+  changed.build = left ? BuildSide::kRight : BuildSide::kLeft;
+  return WithInputs(*current, {Make(std::move(changed))});
 }
 
 // ---- rule 1: COUNT(*) without WHERE -> RowCount ----
@@ -944,8 +1054,7 @@ bool StillShared(const ReusableAggregate& before, const ReusableAggregate& after
 // those producers as boundaries, so the consumer's restriction stays above the shared result.
 template <class Rewrite>
 LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstimates& estimates,
-                                        const Rewrite& rewrite) {
-  PushdownState state;
+                                        PushdownState& state, const Rewrite& rewrite) {
   LogicalNodePtr next = rewrite(state);
   if (next == root || state.keep_filtered_plan) {
     return next;
@@ -1002,7 +1111,8 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   const ColumnId last = MaxColumnId(*root);
   SharingEstimates estimates;
   ColumnId last_exchanged = last;
-  root = PreserveSharedAggregates(root, estimates, [&](const PushdownState& state) {
+  PushdownState exchange_state;
+  root = PreserveSharedAggregates(root, estimates, exchange_state, [&](const PushdownState& state) {
     last_exchanged = last;
     return ExchangeAggregates(root, last_exchanged, state.preserve);
   });
@@ -1015,23 +1125,35 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   // After limits, projections and unused computations reach their final shape: otherwise a
   // second Optimize could move a predicate farther than the first. Refresh pruning afterwards:
   // new filters and changed join inputs need their own needed_above sets for scan pushdown.
-  root = PreserveSharedAggregates(
-      root, estimates, [&](PushdownState& state) { return PushGroupKeyEqualities(root, state); });
-  root = Prune(root, Needed(output.begin(), output.end()));
+  PushdownState filters;
+  const auto pushed = PreserveSharedAggregates(root, estimates, filters, [&](PushdownState& state) {
+    state.pushed_group_keys.clear();  // each sharing trial starts from the original tree
+    return PushGroupKeyEqualities(root, state);
+  });
+  const bool reconsider_groups = pushed != root && !filters.pushed_group_keys.empty();
+  root = Prune(pushed, Needed(output.begin(), output.end()));
   // A dependent join that Unnest left behind is a bug in the pass, never an unsupported query: no
   // SqlErrorDetail, so it exits 70 and cannot pass for a refusal (ADR 0005, ADR 0023).
   if (FirstDependentJoin(root) != nullptr) {
     return arrow::Status::NotImplemented("the unnesting pass left a dependent join in the plan");
   }
-  const auto rewritten = PreserveSharedAggregates(root, estimates, [&](const PushdownState& state) {
-    ColumnId last_union = last_exchanged;
-    return RewriteUnionAggregates(root, options, last_union, state.preserve);
-  });
-  if (rewritten != root) {
+  PushdownState union_state;
+  const auto rewritten =
+      PreserveSharedAggregates(root, estimates, union_state, [&](const PushdownState& state) {
+        ColumnId last_union = last_exchanged;
+        return RewriteUnionAggregates(root, options, last_union, state.preserve);
+      });
+  // Both alternatives may need an OOM retry. Give an admitted UNION placement its original
+  // fallback. Otherwise reconsider only groups that gained a restriction in this pass.
+  auto candidate = rewritten;
+  if (candidate == root && reconsider_groups) {
+    candidate = PreferGroupedBuild(root, filters, options.build_side_ratio);
+  }
+  if (candidate != root) {
     if (memory_fallback != nullptr && options.memory_limit.has_value()) {
       *memory_fallback = ResolvePositions({.root = root, .output = plan.output});
     }
-    root = Prune(rewritten, Needed(output.begin(), output.end()));
+    root = Prune(candidate, Needed(output.begin(), output.end()));
   }
   return ResolvePositions({.root = std::move(root), .output = plan.output});
 }
