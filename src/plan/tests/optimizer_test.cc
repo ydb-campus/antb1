@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/plan/explain.h"
+#include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/shared_sub_plans.h"
 
@@ -1066,6 +1067,68 @@ const T* Find(const LogicalNodePtr& node) {
     }
   }
   return nullptr;
+}
+
+TEST(OptimizerTest, GroupKeyCrossesDecimalComputeOnlyWithBoundsForEveryPart) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int16()), arrow::field("x", arrow::decimal128(4, 1)),
+                     arrow::field("y", arrow::decimal128(5, 2))});
+  const PartStats bounded{.min = -9999, .max = 9999, .null_count = 0, .rows = 2};
+  const PartStats nulls{.min = std::nullopt, .max = std::nullopt, .null_count = 2, .rows = 2};
+  const std::vector<std::pair<std::optional<PartStats>, bool>> cases{
+      {bounded, true},
+      {nulls, true},
+      {std::nullopt, false},
+      {PartStats{.min = -10000, .max = 1, .rows = 2}, false},
+      {PartStats{.min = 0, .max = 10000, .rows = 2}, false}};
+  for (const auto& [last, proven] : cases) {
+    auto catalog = MakeCatalog();
+    auto table = std::make_shared<testing::FakeTable>(schema, 4);
+    table->WithParts({2, 2}).WithStats(0, 1, bounded).WithStats(0, 2, bounded);
+    table->WithStats(1, 2, nulls);
+    if (last.has_value()) {
+      table->WithStats(1, 1, *last);
+    }
+    ASSERT_TRUE(catalog.Register("samples", table).ok());
+    const auto bound = BindSql(
+        "SELECT v FROM (SELECT t.i32 AS bucket, SUM(((x - y) + x) / 3) AS v "
+        "FROM samples JOIN t ON samples.k = t.i16 GROUP BY t.i32) g WHERE bucket = 5",
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    // The equality on the dimension is distinct from the join key. It can reach its scan
+    // only by crossing the computed aggregate argument and the join.
+    const auto* filter = Find<FilterNode>(plan.root);
+    ASSERT_NE(filter, nullptr) << Explain(plan);
+    const auto* scan = std::get_if<ScanNode>(filter->input.get());
+    EXPECT_EQ(scan != nullptr, proven) << Explain(plan);
+    if (scan != nullptr) {
+      EXPECT_EQ(scan->table_name, "t");
+    }
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+    EXPECT_EQ(Explain(Optimized(plan)), Explain(plan));
+  }
+}
+
+TEST(OptimizerTest, GroupKeyStaysAboveCappedDecimalAndRemainder) {
+  auto catalog = MakeCatalog();
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int16()), arrow::field("x", arrow::decimal128(38, 1))});
+  auto table = std::make_shared<testing::FakeTable>(schema, 2);
+  table->WithStats(0, 1, {.min = 0, .max = RangeOf(LogicalType::Decimal(38, 1)).max, .rows = 2});
+  ASSERT_TRUE(catalog.Register("samples", table).ok());
+  for (const char* expression : {"(x + x) / 3", "(x % x) / 3"}) {
+    SCOPED_TRACE(expression);
+    const auto bound = BindSql(
+        std::format("SELECT v FROM (SELECT k, MAX({}) AS v FROM samples GROUP BY k) g WHERE k = 5",
+                    expression),
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    const auto* filter = Find<FilterNode>(plan.root);
+    ASSERT_NE(filter, nullptr) << Explain(plan);
+    EXPECT_TRUE(std::holds_alternative<ComputeNode>(*filter->input)) << Explain(plan);
+  }
 }
 
 const JoinNode& JoinBelowProject(const LogicalPlan& plan) {

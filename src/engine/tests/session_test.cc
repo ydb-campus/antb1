@@ -253,6 +253,33 @@ TEST_F(SessionTest, GroupKeyPushdownKeepsJoinResidualErrors) {
   }
 }
 
+TEST_F(SessionTest, GroupKeyFilterPreservesOverflowInDiscardedDecimalRows) {
+  // The second row fits the physical INT32 but exceeds its declared precision. Doubling
+  // it overflows DECIMAL(5,1), even though the consumer only wants the first group.
+  auto session = Session::Make().ValueOrDie();
+  const auto type = arrow::decimal128(4, 1);
+  arrow::Decimal128Builder amounts(type);
+  arrow::Int32Builder keys;
+  ASSERT_TRUE(keys.AppendValues({1, 2}).ok());
+  ASSERT_TRUE(amounts.Append(arrow::Decimal128(10)).ok());
+  ASSERT_TRUE(amounts.Append(arrow::Decimal128(60000)).ok());
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("k", arrow::int32()), arrow::field("v", type)}),
+      {keys.Finish().ValueOrDie(), amounts.Finish().ValueOrDie()});
+  const auto path = (dir_ / "amounts.parquet").string();
+  const auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  parquet::WriterProperties::Builder props;
+  props.enable_store_decimal_as_integer();
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1, props.build()).ok());
+  ASSERT_TRUE(out->Close().ok());
+  ASSERT_TRUE(session->RegisterParquet("samples", {path}).ok());
+  const auto result = session->Execute(
+      "SELECT n FROM (SELECT k, MAX((v + v) / 3) AS n FROM samples GROUP BY k) g WHERE k = 1");
+  EXPECT_TRUE(result.status().IsExecutionError()) << result.status();
+  EXPECT_NE(result.status().ToString().find("Overflow"), std::string::npos) << result.status();
+}
+
 TEST_F(SessionTest, GroupKeyInferenceDoesNotSkipFailingSourceComputations) {
   auto session = Session::Make().ValueOrDie();
   const auto write = [&](const std::string& name, int64_t key, int64_t rows) {

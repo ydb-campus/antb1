@@ -247,6 +247,11 @@ steps (only step 7 uses more than one thread):
    part. Both placements bound SUM magnitudes and screen their group-state workspace against the session
    budget. Under a finite limit, an out-of-memory error releases the candidate and retries the original
    plan once before returning any rows.
+   The logical optimizer can move a grouping-key equality through arithmetic that
+   is safe on every input row. For decimal addition and subtraction, it checks the bounds of
+   each scanned operand across every row group and requires the result type to have room for
+   rescaling and a carry. Ordinary floating-point arithmetic can pass the same check when
+   both operands can be evaluated and converted safely.
    Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
