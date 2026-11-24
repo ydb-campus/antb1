@@ -37,6 +37,8 @@ using testing::Int64Column;
 using testing::Int64s;
 using testing::MemoryTable;
 
+constexpr int64_t kTwoTo62 = 4611686018427387904;
+
 // The number of columns `node` returns if it is planned, for the scans, sorts and joins that the
 // malformed-join cases build: a semi, anti or null-aware anti join returns its probe input's
 // columns, a mark join those and its mark, any other join both inputs' columns. A missing input
@@ -1020,7 +1022,6 @@ TEST_F(PhysicalPlannerTest, JoinsBuildingOnTheirLeftInputKeepTheSameRows) {
 // pair of r.big 1, which passes, and both sides agree: semi keeps l's row of x 2, anti its two rows
 // of x 1.
 TEST_F(PhysicalPlannerTest, AlikeResidualsRaiseTheSameErrorsOnEitherSide) {
-  constexpr int64_t kTwoTo62 = 4611686018427387904;
   const auto schema =
       arrow::schema({arrow::field("x", arrow::int64()), arrow::field("big", arrow::int64())});
   const auto table = [&schema](const std::vector<std::optional<int64_t>>& x,
@@ -1233,7 +1234,7 @@ TEST_F(PhysicalPlannerTest, GroupedProbeFilterPreservesErrorsAndEmptyBuildShortC
   const auto operand = std::make_shared<const plan::Expr>(
       plan::Expr{.node = plan::ColumnExpr{.index = 0}, .type = LogicalType::kBigInt});
   const auto scale = std::make_shared<const plan::Expr>(plan::Expr{
-      .node = plan::ConstantExpr{.value = BigInt(int64_t{1} << 62)}, .type = LogicalType::kBigInt});
+      .node = plan::ConstantExpr{.value = BigInt(kTwoTo62)}, .type = LogicalType::kBigInt});
   const auto product = std::make_shared<const plan::Expr>(plan::Expr{
       .node = plan::ArithExpr{.op = plan::ArithOp::kMultiply, .left = operand, .right = scale},
       .type = LogicalType::kBigInt});
