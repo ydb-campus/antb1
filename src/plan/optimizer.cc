@@ -490,7 +490,7 @@ bool GroupedBuildIsNarrower(const GroupAggregateNode& grouped, const GroupAggreg
 // filters fix every grouping key except the join key, at most one group can match each
 // non-NULL value of that key. An ordinary inner join never indexes the NULL group.
 LogicalNodePtr PreferGroupedBuild(const LogicalNodePtr& node, PushdownState& state, int64_t ratio) {
-  const auto current = MapInputs(
+  auto current = MapInputs(
       node, [&](const LogicalNodePtr& input) { return PreferGroupedBuild(input, state, ratio); });
   const auto* parent = std::get_if<GroupAggregateNode>(current.get());
   const auto* join = parent == nullptr ? nullptr : std::get_if<JoinNode>(parent->input.get());
