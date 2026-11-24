@@ -588,6 +588,38 @@ TEST_P(KeyTableTest, StringColumnBoundariesAndUnsupportedMixedSchemas) {
   Check({BatchOf({first, second, first}), BatchOf({first, second, first})});
 }
 
+TEST_P(KeyTableTest, FirstSeenIdsSurviveBatchBoundariesAndStringPromotion) {
+  arrow::compute::ExecContext ctx;
+  auto table =
+      MakeKeyTable({arrow::binary()}, &ctx, {.kind = GetParam(), .first_seen_order = true});
+  ASSERT_TRUE(table.ok()) << table.status();
+  Expected expected;
+  for (int batch = 0; batch < 3; ++batch) {
+    std::vector<std::optional<std::string>> keys;
+    for (int i = 0; i < 512; ++i) {
+      keys.emplace_back(std::to_string((i * 67 + batch * 512) % 1009));
+    }
+    keys.emplace_back(batch == 0 ? std::nullopt : std::optional<std::string>("a long key"));
+    const auto values = BatchOf({StringKeys(keys)});
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(**table, values, expected));
+    const auto before = expected.key_of.size();
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(**table, values, expected));
+    auto next = before;
+    const auto columns = ArraysOf(values);
+    for (int64_t row = 0; row < values.length; ++row) {
+      const auto id = expected.id_of.at(KeyBytes(columns, row));
+      ASSERT_LE(id, next);
+      if (id == next) {
+        ++next;
+      }
+    }
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(**table, values, expected));
+    const auto uniques = (*table)->Uniques();
+    ASSERT_TRUE(uniques.ok()) << uniques.status();
+    CheckUniques(*uniques, expected, TypesOf(values), next);
+  }
+}
+
 TEST_P(KeyTableTest, StringPromotionPreservesIdsAndLookupNeverAddsGroups) {
   const std::unique_ptr<KeyTable> table = MakeTable({arrow::binary(), arrow::utf8()});
   ASSERT_NE(table, nullptr);

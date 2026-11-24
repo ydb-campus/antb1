@@ -137,6 +137,8 @@ struct KeyTableOptions {
   KeyTableKind kind = KeyTableKind::kAuto;
   // Size the packed fixed-width table from its first two nonempty batches. Disable for merges.
   bool estimate = true;
+  // Number new groups in encounter order, independent of how the input is batched.
+  bool first_seen_order = false;
   // Lower only in tests; the fixed backend rejects an additional group with OutOfMemory.
   std::uint32_t max_groups = kMaxKeyTableGroups;
   // Stage selected stored column keys in bounded chunks and prefetch destination probe slots.
