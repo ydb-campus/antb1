@@ -17,12 +17,14 @@
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
+#include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/sql_status.h"
 
 #include "aggregate_placement.h"
 #include "arithmetic_rewrite.h"
+#include "join_order.h"
 #include "union_aggregate.h"
 #include "union_branches.h"
 #include "unnesting.h"
@@ -79,8 +81,90 @@ std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predic
   return below;
 }
 
+// A filter can discard rows before a Compute only if every expression it skips is total.
+// Cache exact footer ranges by physical field so multiple consumers of a table pay once.
+class ComputeSafety {
+ public:
+  bool Arithmetic(const Expr& expr, const LogicalNodePtr& input) {
+    const auto* op = std::get_if<ArithExpr>(&expr.node);
+    if (op == nullptr || op->left == nullptr || op->right == nullptr) {
+      return false;
+    }
+    if (expr.type == LogicalType::kDecimal &&
+        (op->op == ArithOp::kAdd || op->op == ArithOp::kSubtract)) {
+      // At the result scale each operand fits with a spare integral digit for the carry.
+      // This also proves that rescaling either operand cannot fail before the operation.
+      const auto fits = [&](const ExprPtr& arg) {
+        return arg->type == LogicalType::kDecimal && arg->type.scale() <= expr.type.scale() &&
+               arg->type.width() - arg->type.scale() < expr.type.width() - expr.type.scale() &&
+               DecimalFits(*arg, input);
+      };
+      return fits(op->left) && fits(op->right);
+    }
+    if (expr.type != LogicalType::kDouble ||
+        (op->op != ArithOp::kAdd && op->op != ArithOp::kSubtract && op->op != ArithOp::kMultiply &&
+         op->op != ArithOp::kDivide)) {
+      return false;
+    }
+    // These operands convert to DOUBLE without a value error. Its four kernels use IEEE
+    // arithmetic, including ordinary division by zero. Integer division and modulo differ.
+    const auto total = [&](const ExprPtr& arg) {
+      const LogicalType type = arg->type;
+      return (type == LogicalType::kDouble || type == LogicalType::kDecimal ||
+              type == LogicalType::kSmallInt || type == LogicalType::kUSmallInt ||
+              type == LogicalType::kInteger) &&
+             (std::holds_alternative<ColumnExpr>(arg->node) ||
+              std::holds_alternative<ConstantExpr>(arg->node) || Arithmetic(*arg, input));
+    };
+    return total(op->left) && total(op->right);
+  }
+
+ private:
+  bool DecimalFits(const Expr& expr, const LogicalNodePtr& input) {
+    const IntegerRange allowed = RangeOf(expr.type);
+    if (const auto* col = std::get_if<ColumnExpr>(&expr.node)) {
+      return col->id != kNoColumnId && ColumnFits(input, col->id, allowed);
+    }
+    if (const auto* literal = std::get_if<ConstantExpr>(&expr.node)) {
+      const auto* value = std::get_if<Int128>(&literal->value.value);
+      return value != nullptr && *value >= allowed.min && *value <= allowed.max;
+    }
+    return Arithmetic(expr, input);
+  }
+
+  bool ColumnFits(const LogicalNodePtr& node, ColumnId id, IntegerRange allowed) {
+    if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+      return ColumnFits(filter->input, id, allowed);
+    }
+    if (const auto* join = std::get_if<JoinNode>(node.get());
+        join != nullptr && join->kind == JoinKind::kInner) {
+      return ColumnFits(join->left, id, allowed) || ColumnFits(join->right, id, allowed);
+    }
+    const auto* scan = std::get_if<ScanNode>(node.get());
+    if (scan == nullptr || scan->table == nullptr || scan->ids.size() != scan->fields.size()) {
+      return false;
+    }
+    const auto at = std::ranges::find(scan->ids, id);
+    if (at == scan->ids.end()) {
+      return false;
+    }
+    const int field = scan->fields[Narrow<std::size_t>(at - scan->ids.begin())];
+    auto [it, inserted] = ranges_.try_emplace({scan->table.get(), field});
+    if (inserted) {
+      it->second = ColumnRangeOf(*scan->table, field);
+    }
+    const ColumnRange& range = it->second;
+    return range.exact &&
+           (range.non_null == 0 || (range.min.has_value() && range.max.has_value() &&
+                                    *range.min >= allowed.min && *range.max <= allowed.max));
+  }
+
+  std::map<std::pair<const Table*, int>, ColumnRange> ranges_;
+};
+
 struct PushdownState {
   std::set<const LogicalNode*> preserve;
+  ComputeSafety compute_safety;
   // A checked aggregate or an entire UNION ALL input can fail on rows an early filter removes.
   // An inferred filter can depend on other consumers, so preserve the trial for this pass.
   bool keep_filtered_plan = false;
@@ -96,12 +180,15 @@ struct GroupEqualities {
   bool safe = false;
 };
 
-GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node);
+// Read footer bounds when placing an actual restriction. Speculative collection of facts
+// on every join keeps the cheaper column/literal test.
+GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node, ComputeSafety* safety = nullptr);
 
-bool OnlyColumnsAndConstants(const ComputeNode& compute) {
-  return std::ranges::all_of(compute.exprs, [](const ExprPtr& expr) {
+bool CanSkipCompute(const ComputeNode& compute, ComputeSafety* safety) {
+  return std::ranges::all_of(compute.exprs, [&](const ExprPtr& expr) {
     return std::holds_alternative<ColumnExpr>(expr->node) ||
-           std::holds_alternative<ConstantExpr>(expr->node);
+           std::holds_alternative<ConstantExpr>(expr->node) ||
+           (safety != nullptr && safety->Arithmetic(*expr, compute.input));
   });
 }
 
@@ -157,12 +244,13 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
   if (const auto* compute = std::get_if<ComputeNode>(node.get());
       compute != nullptr &&
       std::ranges::find(compute->ids, predicate.column->id) == compute->ids.end() &&
-      OnlyColumnsAndConstants(*compute)) {
+      CanSkipCompute(*compute, &state.compute_safety)) {
     return WithInputs(*node, {PushEquality(compute->input, predicate, state)});
   }
   if (const auto* join = std::get_if<JoinNode>(node.get());
-      join != nullptr && join->residual.empty() && KnownGroupEqualities(join->left).safe &&
-      KnownGroupEqualities(join->right).safe) {
+      join != nullptr && join->residual.empty() &&
+      KnownGroupEqualities(join->left, &state.compute_safety).safe &&
+      KnownGroupEqualities(join->right, &state.compute_safety).safe) {
     const auto left_ids = OutputIds(*join->left);
     const auto right_ids = OutputIds(*join->right);
     const bool left = std::ranges::find(left_ids, predicate.column->id) != left_ids.end();
@@ -201,9 +289,9 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
 // Conditions true for every returned row, expressed in this node's output ids. `grouped`
 // restricts cross-input inference to grouped relations, whose predicates the binder cannot
 // route into their already-bound bodies. A nullable side contributes no guaranteed equality.
-GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
+GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node, ComputeSafety* safety) {
   if (const auto* filter = std::get_if<FilterNode>(node.get())) {
-    GroupEqualities out = KnownGroupEqualities(filter->input);
+    GroupEqualities out = KnownGroupEqualities(filter->input, safety);
     if (!out.safe) {
       return out;
     }
@@ -215,7 +303,7 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
     return out;
   }
   if (const auto* project = std::get_if<ProjectNode>(node.get())) {
-    GroupEqualities out = KnownGroupEqualities(project->input);
+    GroupEqualities out = KnownGroupEqualities(project->input, safety);
     if (!out.safe) {
       return out;
     }
@@ -245,7 +333,7 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
     if (std::ranges::any_of(group->aggregates, CanFailOnGroup)) {
       return {};
     }
-    GroupEqualities out = KnownGroupEqualities(group->input);
+    GroupEqualities out = KnownGroupEqualities(group->input, safety);
     if (!out.safe) {
       return out;
     }
@@ -267,14 +355,14 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
   // Inferred conditions can empty the opposite build and prevent this input from opening at
   // all. Therefore collecting facts observes the same expression-error barriers as moving them.
   if (const auto* compute = std::get_if<ComputeNode>(node.get());
-      compute != nullptr && OnlyColumnsAndConstants(*compute)) {
-    return KnownGroupEqualities(compute->input);
+      compute != nullptr && CanSkipCompute(*compute, safety)) {
+    return KnownGroupEqualities(compute->input, safety);
   }
   if (const auto* join = std::get_if<JoinNode>(node.get());
       join != nullptr && join->residual.empty() &&
       (join->kind == JoinKind::kLeft || join->kind == JoinKind::kInner)) {
-    GroupEqualities left = KnownGroupEqualities(join->left);
-    GroupEqualities right = KnownGroupEqualities(join->right);
+    GroupEqualities left = KnownGroupEqualities(join->left, safety);
+    GroupEqualities right = KnownGroupEqualities(join->right, safety);
     if (!left.safe || !right.safe) {
       return {};
     }
