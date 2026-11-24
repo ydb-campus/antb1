@@ -609,6 +609,53 @@ TEST_F(GroupingSetsTest, UncheckedWideDecimalKeepsOverflowBeforeCancellation) {
   }
 }
 
+TEST_F(GroupingSetsTest, MissingWideDecimalCastOperandReturnsInvalid) {
+  const auto type = LogicalType::Decimal(26, 2);
+  const auto cast =
+      std::make_shared<plan::Expr>(plan::Expr{.node = plan::CastExpr{}, .type = type});
+  auto value = Column(6, "value", type);
+  value.id = plan::ColumnId{7};
+  const auto input =
+      Node(plan::ComputeNode{.input = Scan(Table(true)), .exprs = {cast}, .ids = {value.id}});
+  for (const auto kind : {AggKind::kSum, AggKind::kAvg}) {
+    const auto root = GroupingSets(
+        input, {ColA()}, {{0}, {}},
+        {{.kind = kind,
+          .arg = value,
+          .type = kind == AggKind::kSum ? LogicalType::Decimal(38, 2) : LogicalType::kDouble}});
+    const auto result = RunPlan(root, nullptr);
+    ASSERT_FALSE(result.ok());
+    EXPECT_TRUE(result.status().IsInvalid()) << result.status();
+    EXPECT_TRUE(result.status().message().contains("a cast without an operand")) << result.status();
+  }
+}
+
+TEST_F(GroupingSetsTest, ReusedWideDecimalAliasesShareTheirProof) {
+  const auto type = LogicalType::Decimal(26, 2);
+  auto input = Scan(Table(true));
+  const auto integer = std::make_shared<plan::Expr>(
+      plan::Expr{.node = plan::ColumnExpr{.index = 0}, .type = LogicalType::kBigInt});
+  auto expr =
+      std::make_shared<plan::Expr>(plan::Expr{.node = plan::CastExpr{integer}, .type = type});
+  auto value = Column(6, "alias", type);
+  // Without caching each COALESCE proves the preceding alias twice.
+  for (std::uint32_t i = 0; i < 40; ++i) {
+    value.id = plan::ColumnId{7 + i};
+    value.index = 6 + Narrow<int>(i);
+    input = Node(plan::ComputeNode{.input = input, .exprs = {expr}, .ids = {value.id}});
+    const auto ref = std::make_shared<plan::Expr>(
+        plan::Expr{.node = plan::ColumnExpr{.index = value.index, .id = value.id}, .type = type});
+    expr = std::make_shared<plan::Expr>(
+        plan::Expr{.node = plan::CaseExpr{.whens = {nullptr}, .thens = {ref}, .otherwise = ref},
+                   .type = type});
+  }
+  const auto root =
+      GroupingSets(input, {ColA()}, {{0}, {}},
+                   {{.kind = AggKind::kAvg, .arg = value, .type = LogicalType::kDouble},
+                    {.kind = AggKind::kSum, .arg = value, .type = LogicalType::Decimal(38, 2)}});
+  EXPECT_TRUE(WideDecimalInputsChecked(std::get<plan::GroupingSetsNode>(*root)));
+}
+
 struct Case {
   std::string name;
   std::vector<plan::BoundColumn> keys;
@@ -1083,7 +1130,7 @@ TEST_F(GroupingSetsTest, ReducingRollupFallsBackWhenItsLevelsNeedSeparateBatches
       ASSERT_TRUE(result.status().IsOutOfMemory()) << result.status().ToString();
     } else if (counts.batches > 1) {
       EXPECT_EQ(counts.chained, 0);
-      EXPECT_EQ(RowsOf(**result), RowsOf(**all));
+      EXPECT_TRUE((*result)->Equals(**all));
       return;
     }
   }
