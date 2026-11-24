@@ -594,10 +594,13 @@ TEST_P(KeyTableTest, FirstSeenIdsSurviveBatchBoundariesAndStringPromotion) {
       MakeKeyTable({arrow::binary()}, &ctx, {.kind = GetParam(), .first_seen_order = true});
   ASSERT_TRUE(table.ok()) << table.status();
   Expected expected;
+  constexpr int kShortKeysPerBatch = 512;
   for (int batch = 0; batch < 3; ++batch) {
     std::vector<std::optional<std::string>> keys;
-    for (int i = 0; i < 512; ++i) {
-      keys.emplace_back(std::to_string((i * 67 + batch * 512) % 1009));
+    keys.reserve(kShortKeysPerBatch + 1);
+    for (int i = 0; i < kShortKeysPerBatch; ++i) {
+      const int key = ((i * 67) + (batch * kShortKeysPerBatch)) % 1009;
+      keys.emplace_back(std::to_string(key));
     }
     keys.emplace_back(batch == 0 ? std::nullopt : std::optional<std::string>("a long key"));
     const auto values = BatchOf({StringKeys(keys)});
