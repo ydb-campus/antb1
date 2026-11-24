@@ -1149,6 +1149,135 @@ TEST_F(PhysicalPlannerTest, ASemiJoinWithoutAProbePipelineBuildsOnItsRightInputI
             "RightJoin/HashJoin/Scan/HashBuild/Scan/");
 }
 
+TEST_F(PhysicalPlannerTest, FiltersCompletedProbeGroupsBeforeAnInnerJoin) {
+  const auto facts = Node(plan::ScanNode{
+      .table = Table(true), .fields = {0, 1}, .ids = {plan::ColumnId{1}, plan::ColumnId{2}}});
+  const auto labels = Node(plan::ScanNode{
+      .table = Repeated(), .fields = {0, 1}, .ids = {plan::ColumnId{3}, plan::ColumnId{4}}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(1, "y", LogicalType::kBigInt);
+  const auto groups = Node(plan::GroupAggregateNode{
+      .input = facts, .keys = {x, y}, .key_ids = {plan::ColumnId{5}, plan::ColumnId{6}}});
+  for (const bool build_left : {false, true}) {
+    SCOPED_TRACE(build_left);
+    const plan::JoinNode join{
+        .kind = plan::JoinKind::kInner,
+        .left = build_left ? labels : groups,
+        .right = build_left ? groups : labels,
+        .keys = {{.left = x, .right = x}},
+        .build = build_left ? plan::BuildSide::kLeft : plan::BuildSide::kRight};
+    auto probe_y = y;
+    probe_y.id = plan::ColumnId{6};
+    probe_y.index = build_left ? 3 : 1;
+    auto build_y = y;
+    build_y.id = plan::ColumnId{4};
+    build_y.index = build_left ? 1 : 3;
+    const auto keep = testing::Compare(probe_y, plan::CompareOp::kEq, BigInt(20));
+    const auto plan_of = [&](const plan::JoinNode& input, std::vector<plan::Predicate> predicates) {
+      return PlanOf(
+          Node(plan::FilterNode{.input = Node(input), .predicates = std::move(predicates)}), 4);
+    };
+    const auto plan = plan_of(join, {keep});
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan, &profile);
+    ASSERT_TRUE(op.ok()) << op.status();
+    ASSERT_EQ(profile.name(), "HashJoin");
+    ASSERT_EQ(profile.children().size(), 2U);
+    const auto* filter = profile.children()[0];
+    ASSERT_EQ(filter->name(), "Filter");
+    ASSERT_EQ(filter->children().size(), 1U);
+    EXPECT_EQ(filter->children()[0]->name(), "PartGroupAggregate");
+    ExecContext ctx{.pool = arrow::default_memory_pool()};
+    const auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status();
+    EXPECT_EQ(filter->rows(), 1);
+    EXPECT_EQ(Int64Column(**rows, probe_y.index),
+              (std::vector<std::optional<int64_t>>{20, 20, 20}));
+    EXPECT_EQ(Int64Column(**rows, build_y.index),
+              (std::vector<std::optional<int64_t>>{-2, -2, -2}));
+
+    const auto stays_above = [&](const plan::JoinNode& input,
+                                 std::vector<plan::Predicate> predicates) {
+      ProfileNode root;
+      const auto query = BuildPhysicalPlan(plan_of(input, std::move(predicates)), &root);
+      ASSERT_TRUE(query.ok()) << query.status();
+      EXPECT_EQ(root.name(), "Filter");
+    };
+    // A mixed filter reads build values. A stale id/slot pair must not be rebound to the probe.
+    const auto on_build = testing::Compare(build_y, plan::CompareOp::kEq, BigInt(-2));
+    stays_above(join, {on_build});
+    stays_above(join, {keep, on_build});
+    build_y.id = probe_y.id;
+    stays_above(join, {testing::Compare(build_y, plan::CompareOp::kEq, BigInt(-2))});
+    if (!build_left) {
+      auto outer = join;
+      outer.kind = plan::JoinKind::kLeft;
+      stays_above(outer, {keep});
+    }
+    auto guarded = join;
+    guarded.residual.push_back(std::make_shared<const plan::Expr>(plan::Expr{
+        .node =
+            plan::PredicateExpr{
+                .predicate = testing::Compare(x, plan::CompareOp::kGt, BigInt(0)),
+                .operands = {std::make_shared<const plan::Expr>(plan::Expr{
+                    .node = plan::ColumnExpr{.index = 0}, .type = LogicalType::kBigInt})}},
+        .type = LogicalType::kBoolean}));
+    stays_above(guarded, {keep});
+  }
+}
+
+TEST_F(PhysicalPlannerTest, GroupedProbeFilterPreservesErrorsAndEmptyBuildShortCircuit) {
+  const auto table = Table();
+  const auto scan = Node(plan::ScanNode{.table = table, .fields = {0}, .ids = {plan::ColumnId{1}}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto operand = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::ColumnExpr{.index = 0}, .type = LogicalType::kBigInt});
+  const auto scale = std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::ConstantExpr{.value = BigInt(int64_t{1} << 62)}, .type = LogicalType::kBigInt});
+  const auto product = std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::ArithExpr{.op = plan::ArithOp::kMultiply, .left = operand, .right = scale},
+      .type = LogicalType::kBigInt});
+  const auto compute =
+      Node(plan::ComputeNode{.input = scan, .exprs = {product}, .ids = {plan::ColumnId{2}}});
+  const auto groups = Node(
+      plan::GroupAggregateNode{.input = compute,
+                               .keys = {x},
+                               .key_ids = {plan::ColumnId{3}},
+                               .aggregates = {{.kind = plan::AggKind::kMax,
+                                               .arg = Column(1, "product", LogicalType::kBigInt),
+                                               .id = plan::ColumnId{4}}}});
+  auto key = x;
+  key.id = plan::ColumnId{3};
+  // Only group zero is wanted, but computing the discarded groups overflows. An empty build
+  // skips the entire probe, as it did with the filter above the join.
+  for (const int64_t minimum : {0, 10}) {
+    SCOPED_TRACE(minimum);
+    const auto build = Node(plan::FilterNode{
+        .input = scan, .predicates = {testing::Compare(x, plan::CompareOp::kGe, BigInt(minimum))}});
+    const auto join = Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                          .left = groups,
+                                          .right = build,
+                                          .keys = {{.left = x, .right = x}}});
+    const auto plan = PlanOf(
+        Node(plan::FilterNode{
+            .input = join, .predicates = {testing::Compare(key, plan::CompareOp::kEq, BigInt(0))}}),
+        3);
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan, &profile);
+    ASSERT_TRUE(op.ok()) << op.status();
+    ASSERT_EQ(profile.name(), "HashJoin");
+    ExecContext ctx{.pool = arrow::default_memory_pool()};
+    const auto rows = Drain(**op, ctx);
+    if (minimum == 0) {
+      EXPECT_TRUE(rows.status().IsExecutionError()) << rows.status();
+      EXPECT_TRUE(rows.status().message().contains("Overflow in multiplication")) << rows.status();
+    } else {
+      ASSERT_TRUE(rows.ok()) << rows.status();
+      EXPECT_EQ((*rows)->num_rows(), 0);
+    }
+  }
+}
+
 TEST_F(PhysicalPlannerTest, ABuildSideFallbackKeepsTheConsumersPartPipeline) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});

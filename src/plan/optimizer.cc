@@ -57,25 +57,14 @@ LogicalNodePtr MapInputs(const LogicalNodePtr& node, const F& f) {
   return changed ? WithInputs(*node, std::move(inputs)) : node;
 }
 
-// Equality conditions on grouping keys can filter the input before it is grouped. Carry the
-// same restriction to an equijoin's other input where every match must satisfy it too. Only
-// integer-valued equality is moved here: no expression is inverted and no cast is approximated.
-bool KeyEquality(const Predicate& predicate) {
-  return predicate.kind == Predicate::Kind::kCompare && predicate.op == CompareOp::kEq &&
-         predicate.column.has_value() && !predicate.other.has_value() &&
-         (IsInteger(predicate.column->type) || predicate.column->type == LogicalType::kDate) &&
-         predicate.constant.type == predicate.column->type &&
-         std::holds_alternative<Int128>(predicate.constant.value);
-}
-
 bool SameEquality(const Predicate& a, const Predicate& b) {
-  return KeyEquality(a) && KeyEquality(b) && a.column.has_value() && b.column.has_value() &&
-         a.column->id == b.column->id && a.constant.type == b.constant.type &&
-         a.constant.value == b.constant.value;
+  return IsIntegerOrDateEquality(a) && IsIntegerOrDateEquality(b) && a.column.has_value() &&
+         b.column.has_value() && a.column->id == b.column->id &&
+         a.constant.type == b.constant.type && a.constant.value == b.constant.value;
 }
 
 std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predicate& predicate) {
-  ANTB1_CHECK(predicate.column.has_value());  // called only for a KeyEquality
+  ANTB1_CHECK(predicate.column.has_value());  // the equality reads a column
   const auto at = std::ranges::find(project.ids, predicate.column->id);
   if (at == project.ids.end()) {
     return std::nullopt;
@@ -133,7 +122,7 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
   if (state.preserve.contains(node.get())) {
     return Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
   }
-  ANTB1_CHECK(predicate.column.has_value());  // KeyEquality or its remapped copy
+  ANTB1_CHECK(predicate.column.has_value());  // the equality or its remapped copy
   if (const auto* filter = std::get_if<FilterNode>(node.get())) {
     if (std::ranges::any_of(filter->predicates,
                             [&](const Predicate& p) { return SameEquality(p, predicate); })) {
@@ -219,7 +208,7 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
       return out;
     }
     for (const Predicate& predicate : filter->predicates) {
-      if (KeyEquality(predicate)) {
+      if (IsIntegerOrDateEquality(predicate)) {
         out.values.push_back(predicate);
       }
     }
@@ -236,7 +225,7 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
         continue;
       }
       for (const Predicate& predicate : out.values) {
-        ANTB1_CHECK(predicate.column.has_value());  // every recorded fact is a KeyEquality
+        ANTB1_CHECK(predicate.column.has_value());  // every recorded fact is a column equality
         if (predicate.column->id == project->columns[i].id) {
           Predicate above = predicate;
           BoundColumn column = *predicate.column;
@@ -312,7 +301,7 @@ LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState&
     LogicalNodePtr below = filter->input;
     std::vector<Predicate> kept;
     for (const Predicate& predicate : filter->predicates) {
-      if (KeyEquality(predicate)) {
+      if (IsIntegerOrDateEquality(predicate)) {
         LogicalNodePtr pushed = PushEquality(below, predicate, state);
         const auto* placed = std::get_if<FilterNode>(pushed.get());
         // Keep the original predicate order and filter span when nothing moved. In particular,

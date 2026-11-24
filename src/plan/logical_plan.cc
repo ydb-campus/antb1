@@ -168,6 +168,14 @@ struct WithInputsOfNode {
 
 }  // namespace
 
+bool IsIntegerOrDateEquality(const Predicate& predicate) {
+  return predicate.kind == Predicate::Kind::kCompare && predicate.op == CompareOp::kEq &&
+         predicate.column.has_value() && !predicate.other.has_value() &&
+         (IsInteger(predicate.column->type) || predicate.column->type == LogicalType::kDate) &&
+         predicate.constant.type == predicate.column->type &&
+         std::holds_alternative<Int128>(predicate.constant.value);
+}
+
 std::string EscapeText(std::string_view text, char quote) {
   std::string out;
   for (const char c : text) {
