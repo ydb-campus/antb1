@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 #include "antb1/plan/logical_plan.h"
 
@@ -35,6 +36,10 @@ struct BindOptions {
   // it is kept so that a plan can be compared against it and so that a query whose order the
   // search gets wrong has somewhere to go.
   JoinOrderSearch join_order = JoinOrderSearch::kCost;
+  // Execution resources for costing alternative aggregate placements above UNION ALL.
+  int threads = 1;
+  int64_t batch_size = int64_t{64} * 1024;
+  std::optional<int64_t> memory_limit;
 };
 
 }  // namespace antb1::plan

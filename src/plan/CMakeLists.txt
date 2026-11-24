@@ -12,6 +12,7 @@ antb1_add_module(
     predicate_domain.cc
     or_factoring.cc
     aggregate_placement.cc
+    union_aggregate.cc
     arithmetic_rewrite.cc
     relation_count.cc
     binder.cc

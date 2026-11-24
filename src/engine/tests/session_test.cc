@@ -955,6 +955,57 @@ TEST_F(SessionTest, ThreadsDoNotChangeResults) {
 
 // The memory limit: a query that needs more fails with OutOfMemory; one that fits gives the same
 // result as without a limit; a result keeps its memory valid after the session is gone.
+TEST_F(SessionTest, ConditionalPreaggregationRetriesWithLessAvailableMemory) {
+  const auto facts = (dir_ / "facts.parquet").string();
+  arrow::Int16Builder keys;
+  arrow::Int64Builder amounts;
+  for (int i = 0; i < 32768; ++i) {
+    ASSERT_TRUE(keys.Append(static_cast<int16_t>(i % 1024)).ok());
+    ASSERT_TRUE(amounts.Append(i % 5).ok());
+  }
+  const auto table =
+      arrow::Table::Make(arrow::schema({arrow::field("keycol", arrow::int16()),
+                                        arrow::field("amount", arrow::int64())}),
+                         {keys.Finish().ValueOrDie(), amounts.Finish().ValueOrDie()});
+  const auto file = arrow::io::FileOutputStream::Open(facts).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), file, 4096).ok());
+  ASSERT_TRUE(file->Close().ok());
+  constexpr int64_t kLimit = int64_t{16} * 1024 * 1024;
+  auto session = Session::Make({.batch_size = 256, .memory_limit = kLimit}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("labels", {path_}).ok());
+  ASSERT_TRUE(session->RegisterParquet("facts", {facts}).ok());
+
+  const auto query = [](std::string_view measure) {
+    return std::format(
+        "SELECT d.EventDate, SUM(CASE WHEN d.AdvEngineID>0 THEN {} END) AS total "
+        "FROM (SELECT keycol,amount FROM facts UNION ALL SELECT keycol,amount "
+        "FROM facts) f JOIN labels d ON d.AdvEngineID=f.keycol GROUP BY d.EventDate",
+        measure);
+  };
+  // Negating twice on this small fixture computes the same answer and keeps the original plan.
+  const auto control = session->Execute(query("-(-f.amount)"));
+  ASSERT_TRUE(control.ok()) << control.status();
+  const auto optimized = session->ExplainAnalyze(query("f.amount"));
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  constexpr int64_t kSlack = 8192;
+  ASSERT_GT(optimized->peak_memory,
+            control->peak_memory + kSlack + control->memory->bytes_allocated());
+  // The planner sees the session limit. Outstanding Arrow buffers reduce the headroom to that
+  // of the original plan. Execute and ExplainAnalyze must both succeed on their second attempt.
+  const int64_t hold = kLimit - control->memory->bytes_allocated() - control->peak_memory - kSlack;
+  ASSERT_GT(hold, 0);
+  const auto held = arrow::AllocateBuffer(hold, control->memory.get());
+  ASSERT_TRUE(held.ok()) << held.status();
+  {
+    const auto actual = session->Execute(query("f.amount"));
+    ASSERT_TRUE(actual.ok()) << actual.status();
+    EXPECT_TRUE(actual->table->Equals(*control->table));
+  }
+  const auto profile = session->ExplainAnalyze(query("f.amount"));
+  ASSERT_TRUE(profile.ok()) << profile.status();
+  EXPECT_EQ(profile->rows, control->table->num_rows());
+}
+
 TEST_F(SessionTest, MemoryLimit) {
   for (const int64_t limit : {int64_t{0}, int64_t{-5}}) {
     SessionOptions options;
