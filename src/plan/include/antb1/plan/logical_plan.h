@@ -186,6 +186,9 @@ struct Predicate {
   SourceSpan span;               // the comparison in the query
 };
 
+// An integer or DATE column compared for equality with a constant of its own type.
+bool IsIntegerOrDateEquality(const Predicate& predicate);
+
 struct Expr;
 using ExprPtr = std::shared_ptr<const Expr>;
 

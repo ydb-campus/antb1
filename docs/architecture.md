@@ -266,6 +266,9 @@ steps (only step 7 uses more than one thread):
    nested loop, [ADR 0040](adr/0040-nested-loop-joins.md)), made once per
    pipeline before the factory of its parts, and a probe of the other, in that input's part pipeline or over it; a
    malformed join (keys of two types, say) is `Invalid`.
+   For an inner join without a residual, a filter consisting of integer or DATE equalities on
+   the probe’s grouping keys can run on the completed groups before the join gathers build columns.
+   The build still runs first, and the aggregate evaluates the same input rows.
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
    error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns. The part
    pipelines run on the session's thread pool (`--threads`, `engine::SessionOptions::threads`), and so do the batches
