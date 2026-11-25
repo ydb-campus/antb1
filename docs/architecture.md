@@ -237,6 +237,14 @@ steps (only step 7 uses more than one thread):
    When a consumer loses reuse, the optimizer retries with the affected producers protected. It keeps the original
    pushdown when a filter eliminates a union branch or crosses an aggregate that can raise a numeric or temporal
    range error. Both planning stages use the same input-row and result-size criteria for aggregate reuse.
+   Once a producer is chosen for sharing, the physical planner checks its readers' filters. If every reader
+   requires an equality or a finite list on the same integer or date grouping key, the producer can restrict
+   that key to the union of their values. The planner considers reader lists of up to nine values and
+   applies the combined list only when it also fits that limit. This bounds the comparisons per input row
+   before aggregation. Each reader still applies its own filter. The restriction can pass
+   through a distinct union into each input, and through safe computations to a scan. A checked aggregate
+   retains its input. For narrow exact addition or subtraction, bounds from every scan part can prove that
+   both operands, including a nullable join input with a `COALESCE` fallback, fit throughout evaluation.
    For a single-key inner join probing direct scan projections under `UNION ALL`, a grouped aggregate
    can also move into the branches. Conditional sums with a build-side predicate and a narrow fact
    measure first group each branch by its join key when the estimated partial count, bounded from the

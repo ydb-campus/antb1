@@ -1131,6 +1131,52 @@ TEST(OptimizerTest, GroupKeyStaysAboveCappedDecimalAndRemainder) {
   }
 }
 
+TEST(OptimizerTest, SharedKeyReachesEachUnionScanOnlyPastSafeArithmetic) {
+  for (const auto last : std::vector<std::optional<int32_t>>{std::nullopt, 0, INT32_MIN}) {
+    SCOPED_TRACE(::testing::PrintToString(last));
+    Catalog catalog;
+    auto facts = std::make_shared<testing::FakeTable>(
+        arrow::schema({arrow::field("k", arrow::int32()), arrow::field("v", arrow::int32())}),
+        20'000'000);
+    auto adjustments = std::make_shared<testing::FakeTable>(
+        arrow::schema({arrow::field("k", arrow::int32()), arrow::field("delta", arrow::int32())}),
+        2);
+    facts->WithStats(0, 1, {.min = 1, .max = 12, .rows = 20'000'000});
+    adjustments->WithParts({1, 1}).WithStats(0, 1, {.min = -3, .max = 3, .rows = 1});
+    if (last.has_value()) {
+      adjustments->WithStats(1, 1, {.min = *last, .max = *last, .rows = 1});
+    }
+    ASSERT_TRUE(catalog.Register("facts", facts).ok());
+    ASSERT_TRUE(catalog.Register("adj", adjustments).ok());
+    const auto bound = BindSql(
+        "WITH g AS (SELECT k, MAX(x) AS n FROM "
+        "(SELECT f.k, f.v-COALESCE(adj.delta,0) AS x FROM facts f LEFT JOIN adj ON f.k=adj.k "
+        "UNION SELECT k,v AS x FROM facts) u GROUP BY k) "
+        "SELECT a.k,b.k FROM g a JOIN g b ON a.n=b.n WHERE a.k IN (1,3) AND b.k IN (3,8)",
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    const auto groups = SharedSubPlans(plan);
+    ASSERT_FALSE(groups.empty());
+    const auto producer = SharedConsumerFilters(plan).Producer(groups.front());
+    const auto* set = Find<SetOperationNode>(producer);
+    ASSERT_NE(set, nullptr);
+    ASSERT_EQ(set->inputs.size(), 2U);
+    for (std::size_t i = 0; i < set->inputs.size(); ++i) {
+      const auto* filter = Find<FilterNode>(set->inputs[i]);
+      ASSERT_NE(filter, nullptr);
+      EXPECT_EQ(std::holds_alternative<ScanNode>(*filter->input), i == 1 || last == 0);
+      ASSERT_EQ(filter->predicates.size(), 1U);
+      const auto& combined = filter->predicates.front();
+      ASSERT_EQ(combined.kind, Predicate::Kind::kIn);
+      ASSERT_EQ(combined.values.size(), 3U);
+      EXPECT_EQ(std::get<Int128>(combined.values[0].value), 1);
+      EXPECT_EQ(std::get<Int128>(combined.values[1].value), 3);
+      EXPECT_EQ(std::get<Int128>(combined.values[2].value), 8);
+    }
+  }
+}
+
 TEST(OptimizerTest, ReconsidersFilteredGroupsForAParallelJoinProbe) {
   constexpr int64_t kLabels = 4096;
   constexpr int64_t kPart = kLabels / 2;

@@ -1841,6 +1841,7 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   std::vector<SharedBuild> shared;
   std::unordered_map<const plan::LogicalNode*, plan::LogicalNodePtr> replacements;
   int estimate_budget = plan::kSharingEstimateBudget;
+  std::optional<plan::SharedConsumerFilters> consumer_filters;
   for (const plan::SharedSubPlan& group : plan::SharedSubPlans(plan)) {
     if (!plan::WorthSharing(group, estimate_budget)) {
       continue;
@@ -1852,7 +1853,10 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
         })) {
       continue;
     }
-    const plan::LogicalNodePtr& widest = group.members[group.widest];
+    if (!consumer_filters.has_value()) {
+      consumer_filters.emplace(plan);
+    }
+    const plan::LogicalNodePtr widest = consumer_filters->Producer(group);
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op,
                           Build(PreparePhysicalJoins(widest), std::nullopt, nullptr));
     auto table = std::make_shared<MaterializedTable>(op->output_schema());

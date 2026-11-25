@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "antb1/plan/logical_plan.h"
@@ -35,6 +36,18 @@ struct SharedSubPlan {
   // the sum of those. A member reads at most this many, so the difference is what sharing would
   // decode for a consumer that does not want it.
   int64_t fields = 0;
+};
+
+// Direct consumer filters, indexed once when the physical planner admits its first shared
+// producer. A member used without a filter (or via multiple edges) supplies its full output.
+class SharedConsumerFilters {
+ public:
+  explicit SharedConsumerFilters(const LogicalPlan& plan);
+  [[nodiscard]] LogicalNodePtr Producer(const SharedSubPlan& group) const;
+
+ private:
+  static LogicalNodePtr PushGroupKey(const LogicalNodePtr& producer, const Predicate& predicate);
+  std::unordered_map<const LogicalNode*, const FilterNode*> parents_;
 };
 
 // The maximal groups of `plan`, in the order a walk from the root meets them; empty when nothing
