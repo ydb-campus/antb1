@@ -231,7 +231,7 @@ Batch UnionDistinct::Next() {
 }
 
 std::size_t UnionDistinct::Lane(std::uint64_t hash) const {
-  return static_cast<std::size_t>(hash >> 32U) & (lanes_.size() - 1);
+  return (hash >> 32U) & (lanes_.size() - 1);
 }
 arrow::Status UnionDistinct::ConsumeSerial(const std::shared_ptr<arrow::RecordBatch>& rows) {
   ARROW_ASSIGN_OR_RAISE(auto keys, Keys(*rows));
