@@ -43,6 +43,7 @@ antb1_add_module(
     shared_builds.cc
     limit.cc
     set_operation.cc
+    union_distinct.cc
     union_all.cc
     gather.cc
     hash_join.cc

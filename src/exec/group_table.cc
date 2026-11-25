@@ -139,9 +139,14 @@ arrow::Result<std::vector<std::uint64_t>> RoutingHashes(const arrow::compute::Ex
 
 }  // namespace
 
+arrow::Status KeyHashes(const arrow::compute::ExecBatch& keys, std::span<std::uint64_t> hashes) {
+  ANTB1_DCHECK(Narrow<std::size_t>(keys.length) == hashes.size());
+  return HashGroupRows(keys, std::identity{}, hashes);
+}
+
 arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBatch& keys) {
   std::vector<std::uint64_t> hashes(Narrow<std::size_t>(keys.length));
-  ARROW_RETURN_NOT_OK(HashGroupRows(keys, [](std::size_t i) { return i; }, hashes));
+  ARROW_RETURN_NOT_OK(KeyHashes(keys, hashes));
   return hashes;
 }
 
