@@ -20,6 +20,7 @@
 #include <arrow/type.h>
 
 #include "antb1/common/check.h"
+#include "antb1/common/int128.h"
 #include "antb1/common/narrow.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
@@ -89,10 +90,24 @@ std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predic
 // Cache exact footer ranges by physical field so multiple consumers of a table pay once.
 class ComputeSafety {
  public:
+  bool for_shared_producer = false;
+
   bool Arithmetic(const Expr& expr, const LogicalNodePtr& input) {
     const auto* op = std::get_if<ArithExpr>(&expr.node);
     if (op == nullptr || op->left == nullptr || op->right == nullptr) {
       return false;
+    }
+    if (for_shared_producer && NarrowExact(expr.type) &&
+        (op->op == ArithOp::kAdd || op->op == ArithOp::kSubtract)) {
+      const auto left = OperandBounds(*op->left, input, expr.type);
+      const auto right = OperandBounds(*op->right, input, expr.type);
+      if (left && right) {
+        const auto limit = RangeOf(expr.type);
+        // Operands fit in int64 at the result scale. The intermediate bounds fit in Int128.
+        const bool add = op->op == ArithOp::kAdd;
+        return (add ? left->min + right->min : left->min - right->max) >= limit.min &&
+               (add ? left->max + right->max : left->max - right->min) <= limit.max;
+      }
     }
     if (expr.type == LogicalType::kDecimal &&
         (op->op == ArithOp::kAdd || op->op == ArithOp::kSubtract)) {
@@ -128,7 +143,8 @@ class ComputeSafety {
       return RangeFor(filter->input, id);
     }
     if (const auto* join = std::get_if<JoinNode>(node.get());
-        join != nullptr && join->kind == JoinKind::kInner) {
+        join != nullptr && (join->kind == JoinKind::kInner ||
+                            (for_shared_producer && join->kind == JoinKind::kLeft))) {
       const ColumnRange* left = RangeFor(join->left, id);
       return left != nullptr ? left : RangeFor(join->right, id);
     }
@@ -149,6 +165,70 @@ class ComputeSafety {
   }
 
  private:
+  static bool NarrowExact(LogicalType type) {
+    return (IsInteger(type) && type != LogicalType::kHugeInt) ||
+           (type == LogicalType::kDecimal && type.width() <= LogicalType::kMaxNarrowDecimalWidth);
+  }
+
+  // Bounds include every possible non-NULL operand, including the fallback of a COALESCE on
+  // the nullable side of a join. Check the source precision before any implicit conversion.
+  std::optional<IntegerRange> OperandBounds(const Expr& expr, const LogicalNodePtr& input,
+                                            LogicalType target) {
+    if (!NarrowExact(expr.type) || !NarrowExact(target) || expr.type.scale() > target.scale()) {
+      return std::nullopt;
+    }
+    IntegerRange bounds;
+    if (const auto* col = std::get_if<ColumnExpr>(&expr.node)) {
+      const ColumnRange* range = RangeFor(input, col->id);
+      if (range == nullptr || !range->exact) {
+        return std::nullopt;
+      }
+      if (range->non_null > 0) {
+        if (!range->min.has_value() || !range->max.has_value()) {
+          return std::nullopt;
+        }
+        bounds = {.min = *range->min, .max = *range->max};
+      }
+    } else if (const auto* constant = std::get_if<ConstantExpr>(&expr.node)) {
+      const auto* value = std::get_if<Int128>(&constant->value.value);
+      if (value == nullptr || constant->value.type != expr.type) {
+        return std::nullopt;
+      }
+      bounds = {.min = *value, .max = *value};
+    } else if (const auto* arms = std::get_if<CaseExpr>(&expr.node);
+               arms != nullptr && arms->thens.size() == arms->whens.size() &&
+               std::ranges::all_of(arms->whens, [](const ExprPtr& when) { return !when; })) {
+      const auto include = [&](const ExprPtr& arm) {
+        if (arm == nullptr) {
+          return false;  // a COALESCE arm must have a value
+        }
+        const auto value = OperandBounds(*arm, input, expr.type);
+        if (!value.has_value()) {
+          return false;
+        }
+        bounds.min = std::min(bounds.min, value->min);
+        bounds.max = std::max(bounds.max, value->max);
+        return true;
+      };
+      if (!std::ranges::all_of(arms->thens, include) ||
+          (arms->otherwise != nullptr && !include(arms->otherwise))) {
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
+    const auto source = RangeOf(expr.type);
+    if (bounds.min < source.min || bounds.max > source.max) {
+      return std::nullopt;
+    }
+    const Int128 factor = PowerOfTen(target.scale() - expr.type.scale());
+    bounds.min *= factor;
+    bounds.max *= factor;
+    const auto allowed = RangeOf(target);
+    return bounds.min >= allowed.min && bounds.max <= allowed.max ? std::optional{bounds}
+                                                                  : std::nullopt;
+  }
+
   bool DecimalFits(const Expr& expr, const LogicalNodePtr& input) {
     const IntegerRange allowed = RangeOf(expr.type);
     if (const auto* col = std::get_if<ColumnExpr>(&expr.node)) {
@@ -210,8 +290,8 @@ bool CanFailOnGroup(const AggregateCall& call) {
          (call.kind == AggKind::kAvg && type == LogicalType::kDate);
 }
 
-LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predicate,
-                            PushdownState& state) {
+LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predicate,
+                             PushdownState& state) {
   if (state.preserve.contains(node.get())) {
     return Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
   }
@@ -221,7 +301,7 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
                             [&](const Predicate& p) { return SameEquality(p, predicate); })) {
       return node;
     }
-    LogicalNodePtr below = PushEquality(filter->input, predicate, state);
+    LogicalNodePtr below = PushKeyFilter(filter->input, predicate, state);
     if (const auto* placed = std::get_if<FilterNode>(below.get());
         placed != nullptr && placed->input == filter->input) {
       FilterNode out = *filter;
@@ -232,18 +312,21 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
   }
   if (const auto* project = std::get_if<ProjectNode>(node.get())) {
     if (const auto below = ThroughProject(*project, predicate)) {
-      return WithInputs(*node, {PushEquality(project->input, *below, state)});
+      return WithInputs(*node, {PushKeyFilter(project->input, *below, state)});
     }
   }
   if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
     const auto at = std::ranges::find(group->key_ids, predicate.column->id);
     if (at != group->key_ids.end()) {
       if (std::ranges::any_of(group->aggregates, CanFailOnGroup)) {
+        if (state.compute_safety.for_shared_producer) {
+          return Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
+        }
         state.keep_filtered_plan = true;
       }
       Predicate below = predicate;
       below.column = group->keys[Narrow<std::size_t>(at - group->key_ids.begin())];
-      auto pushed = PushEquality(group->input, below, state);
+      auto pushed = PushKeyFilter(group->input, below, state);
       if (pushed != group->input) {
         state.pushed_group_keys.insert(predicate.column->id);
       }
@@ -255,7 +338,7 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
       compute != nullptr &&
       std::ranges::find(compute->ids, predicate.column->id) == compute->ids.end() &&
       CanSkipCompute(*compute, &state.compute_safety)) {
-    return WithInputs(*node, {PushEquality(compute->input, predicate, state)});
+    return WithInputs(*node, {PushKeyFilter(compute->input, predicate, state)});
   }
   if (const auto* join = std::get_if<JoinNode>(node.get());
       join != nullptr && join->residual.empty() &&
@@ -270,7 +353,7 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
         (right && join->kind == JoinKind::kInner)) {
       JoinNode out = *join;
       auto& input = left ? out.left : out.right;
-      input = PushEquality(input, predicate, state);
+      input = PushKeyFilter(input, predicate, state);
       for (const JoinKey& key : join->keys) {
         const BoundColumn& source = left ? key.left : key.right;
         const BoundColumn& target = left ? key.right : key.left;
@@ -278,7 +361,7 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
           Predicate inferred = predicate;
           inferred.column = target;
           auto& other = left ? out.right : out.left;
-          other = PushEquality(other, inferred, state);
+          other = PushKeyFilter(other, inferred, state);
         }
       }
       return Make(std::move(out));
@@ -286,6 +369,30 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
   }
   LogicalNodePtr placed =
       Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
+  if (state.compute_safety.for_shared_producer) {
+    const auto distribute = [&](const auto& set) {
+      const auto key = std::ranges::find(set.ids, predicate.column->id);
+      if (key == set.ids.end()) {
+        return placed;
+      }
+      std::vector<LogicalNodePtr> inputs;
+      for (std::size_t i = 0; i < set.inputs.size(); ++i) {
+        Predicate branch = predicate;
+        branch.column = set.columns[i][Narrow<std::size_t>(key - set.ids.begin())];
+        inputs.push_back(PushKeyFilter(set.inputs[i], branch, state));
+      }
+      return WithInputs(*node, std::move(inputs));
+    };
+    if (const auto* set = std::get_if<SetOperationNode>(node.get());
+        set != nullptr && std::ranges::all_of(set->formula, [](const SetTerm& term) {
+          return term.kind == SetTermKind::kInput || term.kind == SetTermKind::kUnion;
+        })) {
+      return distribute(*set);
+    }
+    if (const auto* set = std::get_if<UnionAllNode>(node.get())) {
+      return distribute(*set);
+    }
+  }
   if (std::holds_alternative<UnionAllNode>(*node)) {
     // A new condition above UNION ALL must reach its branches in this Optimize, too. Their
     // projections or aggregates may then admit it farther down. FALSE filters are left alone.
@@ -339,7 +446,7 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node, ComputeSafety* 
   if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
     // An inferred key can empty the opposite build, skipping this aggregate entirely, or
     // remove one of its failing groups when this is the target. A consumer's own filter
-    // can still cross a checked group in PushEquality.
+    // can still cross a checked group in PushKeyFilter.
     if (std::ranges::any_of(group->aggregates, CanFailOnGroup)) {
       return {};
     }
@@ -400,7 +507,7 @@ LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState&
     std::vector<Predicate> kept;
     for (const Predicate& predicate : filter->predicates) {
       if (IsIntegerOrDateEquality(predicate)) {
-        LogicalNodePtr pushed = PushEquality(below, predicate, state);
+        LogicalNodePtr pushed = PushKeyFilter(below, predicate, state);
         const auto* placed = std::get_if<FilterNode>(pushed.get());
         // Keep the original predicate order and filter span when nothing moved. In particular,
         // ordinary scan filters and repeated EXISTS checks need no rewrite here.
@@ -443,7 +550,7 @@ LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState&
             Predicate inferred = predicate;
             inferred.column = target;
             auto& input = from_left ? out.right : out.left;
-            input = PushEquality(input, inferred, state);
+            input = PushKeyFilter(input, inferred, state);
           }
         }
       }
@@ -1090,6 +1197,14 @@ LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstim
 }
 
 }  // namespace
+
+LogicalNodePtr SharedConsumerFilters::PushGroupKey(const LogicalNodePtr& producer,
+                                                   const Predicate& predicate) {
+  PushdownState state;
+  state.compute_safety.for_shared_producer = true;
+  auto filtered = PushKeyFilter(producer, predicate, state);
+  return state.pushed_group_keys.empty() ? producer : ResolveSubtreePositions(filtered);
+}
 
 arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options,
                                     LogicalPlan* memory_fallback) {

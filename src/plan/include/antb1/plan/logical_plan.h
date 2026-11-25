@@ -738,6 +738,9 @@ LogicalNodePtr CloneWithFreshIds(const LogicalNodePtr& node, ColumnId& last_id);
 // (ADR 0022). A plan that breaks an invariant (see PositionMismatch) is a programming error: the
 // process aborts, reported at the caller, with a description that names node kinds, ids and
 // positions only.
+// Resolve a producer with no top-level SELECT list.
+LogicalNodePtr ResolveSubtreePositions(
+    const LogicalNodePtr& node, std::source_location location = std::source_location::current());
 LogicalPlan ResolvePositions(const LogicalPlan& plan,
                              std::source_location location = std::source_location::current());
 

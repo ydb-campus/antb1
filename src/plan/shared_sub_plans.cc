@@ -6,6 +6,7 @@
 #include <format>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -774,6 +775,92 @@ std::optional<SharedSubPlan> GroupOf(std::vector<LogicalNodePtr> members, const 
 }
 
 }  // namespace
+
+SharedConsumerFilters::SharedConsumerFilters(const LogicalPlan& plan) {
+  const auto visit = [&](const auto& self, const LogicalNodePtr& node,
+                         const FilterNode* parent) -> void {
+    if (node == nullptr) {
+      return;
+    }
+    const auto [at, first] = parents_.emplace(node.get(), parent);
+    if (!first) {
+      at->second = nullptr;
+      return;
+    }
+    for (const auto& input : InputsOf(*node)) {
+      self(self, input, std::get_if<FilterNode>(node.get()));
+    }
+  };
+  visit(visit, plan.root, nullptr);
+}
+
+LogicalNodePtr SharedConsumerFilters::Producer(const SharedSubPlan& group) const {
+  const auto& widest = group.members[group.widest];
+  // Intersect the constrained output positions across readers, unioning their allowed values.
+  // Map by origin-derived producer position: every reference has its own ids and projection.
+  using Domains = std::map<int, std::set<Int128>>;
+  Domains common;
+  std::map<int, BoundColumn> producer_columns;
+  for (std::size_t i = 0; i < group.members.size(); ++i) {
+    const auto parent = parents_.find(group.members[i].get());
+    if (parent == parents_.end() || parent->second == nullptr) {
+      return widest;
+    }
+    const auto ids = OutputIds(*group.members[i]);
+    Domains local;
+    for (const Predicate& p : parent->second->predicates) {
+      if (!p.column.has_value()) {
+        continue;
+      }
+      const auto& column = *p.column;
+      if ((!IsInteger(column.type) && column.type != LogicalType::kDate) ||
+          column.id == kNoColumnId) {
+        continue;
+      }
+      const auto at = std::ranges::find(ids, column.id);
+      if (at == ids.end()) {
+        continue;
+      }
+      const int position = group.columns[i][static_cast<std::size_t>(at - ids.begin())];
+      if (i == group.widest) {
+        producer_columns.try_emplace(position, column);
+      }
+      if (IsIntegerOrDateEquality(p)) {
+        local[position].insert(std::get<Int128>(p.constant.value));
+      } else if (p.kind == Predicate::Kind::kIn && !p.values.empty() &&
+                 std::ranges::all_of(p.values, [&](const Constant& v) {
+                   return v.type == column.type && std::holds_alternative<Int128>(v.value);
+                 })) {
+        for (const auto& v : p.values) {
+          local[position].insert(std::get<Int128>(v.value));
+        }
+      }
+    }
+    if (i == 0) {
+      common = std::move(local);
+    } else {
+      std::erase_if(common, [&](const auto& entry) { return !local.contains(entry.first); });
+      for (auto& [pos, values] : common) {
+        values.merge(local.at(pos));
+      }
+    }
+    if (common.empty()) {
+      return widest;
+    }
+  }
+  for (const auto& [pos, values] : common) {
+    const auto& column = producer_columns.at(pos);
+    Predicate combined{.kind = Predicate::Kind::kIn, .column = column};
+    for (const Int128 v : values) {
+      combined.values.push_back(Constant{.type = column.type, .value = v});
+    }
+    auto filtered = PushGroupKey(widest, combined);
+    if (filtered != widest) {
+      return filtered;
+    }
+  }
+  return widest;
+}
 
 bool WorthSharing(const SharedSubPlan& group, int& remaining) {
   if (group.members.size() < 2 || group.widest >= group.members.size() ||

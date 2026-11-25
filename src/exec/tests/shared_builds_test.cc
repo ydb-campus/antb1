@@ -132,6 +132,48 @@ TEST_F(SharedBuildsTest, ComputesARepeatedSubPlanOnceAndKeepsTheAnswer) {
       << without->rows->ToString();
 }
 
+TEST_F(SharedBuildsTest, UnionsEveryReadersKeyValuesBeforeMaterializing) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(
+      schema, 6,
+      {testing::Int64s({1, 2, 3, 3, 5, std::nullopt}), testing::Int64s({9, 9, 9, 9, 9, 9})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+  const std::string query =
+      "WITH g AS (SELECT k, COUNT(*) AS n FROM (SELECT k,v FROM t UNION SELECT k,v FROM t) u "
+      "GROUP BY k) SELECT a.k,b.k FROM g a JOIN g b ON a.n=b.n WHERE a.k IN (1,3) ";
+  for (const auto& [condition, shared_rows] :
+       std::vector<std::pair<std::string, int>>{{" AND b.k IN (3,5)", 3}, {"", 5}}) {
+    const auto sql = query + condition + " ORDER BY a.k,b.k";
+    table->set_claimed_rows(20'000'000);
+    const auto shared = Execute(sql, table);
+    ASSERT_TRUE(shared.ok()) << shared.status();
+    EXPECT_EQ(shared->shared_rows, shared_rows);
+    table->set_claimed_rows(6);
+    const auto independent = Execute(sql, table);
+    ASSERT_TRUE(independent.ok()) << independent.status();
+    EXPECT_EQ(independent->shared_rows, std::nullopt);
+    EXPECT_TRUE(independent->rows->Equals(*shared->rows));
+  }
+}
+
+TEST_F(SharedBuildsTest, SharedKeyRestrictionPreservesOverflowInAnUnusedGroup) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(
+      schema, 3, {testing::Int64s({1, 2, 3}), testing::Int64s({2, 3, INT64_MAX})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+  table->set_claimed_rows(20'000'000);
+  const auto result = Execute(
+      "WITH g AS (SELECT k, MAX(x) AS n FROM (SELECT k,v+1 AS x FROM t UNION "
+      "SELECT k,v FROM t) u GROUP BY k) SELECT a.k,b.k FROM g a JOIN g b ON a.n=b.n "
+      "WHERE a.k=1 AND b.k=2",
+      table);
+  ASSERT_FALSE(result.ok());
+  const auto message = result.status().message();
+  EXPECT_TRUE(message.contains("overflow") || message.contains("Overflow")) << result.status();
+}
+
 // A reducing shape alone does not make its output small. Sparse, multi-column key domains can
 // predict a result beyond the materialization cap, without allocating a large test table.
 TEST_F(SharedBuildsTest, RecomputesWhenTheGroupEstimateExceedsTheSharedResultCap) {

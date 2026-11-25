@@ -1744,6 +1744,18 @@ LogicalNodePtr CloneWithFreshIds(const LogicalNodePtr& node, ColumnId& last_id) 
   return Cloned(node, renamed, last_id);
 }
 
+LogicalNodePtr ResolveSubtreePositions(const LogicalNodePtr& node, std::source_location location) {
+  if (node == nullptr) {
+    return nullptr;
+  }
+  Resolver resolver;
+  Resolver::Resolved root = resolver.Walk(node);
+  if (resolver.failure().has_value()) {
+    internal::CheckFailed(resolver.failure()->c_str(), location);
+  }
+  return root.node;
+}
+
 LogicalPlan ResolvePositions(const LogicalPlan& plan, std::source_location location) {
   if (plan.root == nullptr) {
     return plan;
