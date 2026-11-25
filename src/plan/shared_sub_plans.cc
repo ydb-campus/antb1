@@ -420,31 +420,28 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
             key += ';';
           }
           return key + ')';
-        } else if constexpr (std::is_same_v<T, UnionAllNode>) {
-          // Keyed by its inputs in order, which SubtreeKey appends: a union's rows come in its
-          // inputs' order, so two unions of the same inputs in two orders are not one sub-plan.
-          // Keyed so that a union repeated whole -- a CTE referenced twice -- is reported as one
-          // group, which exec declines to hold (WorthSharing); nothing below a union is collected
-          // at all (SharedSubPlans, ADR 0036).
-          std::string key = "union(";
-          for (const std::vector<BoundColumn>& input : n.columns) {
-            for (const BoundColumn& column : input) {
-              key += origins.Key(column, node);
-              key += ',';
+        } else if constexpr (std::is_same_v<T, UnionAllNode> ||
+                             std::is_same_v<T, SetOperationNode>) {
+          // A shared producer may remap a filter through every branch. Leave malformed maps
+          // to the physical planner, which reports the missing list or incorrect width.
+          if (n.columns.size() != n.inputs.size() ||
+              std::ranges::any_of(n.columns,
+                                  [&](const auto& cols) { return cols.size() != n.ids.size(); })) {
+            return std::nullopt;
+          }
+          // SubtreeKey appends the inputs in order. A distinct set operation also needs its
+          // formula.
+          std::string key;
+          if constexpr (std::is_same_v<T, SetOperationNode>) {
+            key = "setop(";
+            for (const SetTerm& term : n.formula) {
+              key += std::format("{}:{}:{},", std::to_underlying(term.kind), term.input,
+                                 term.operands);
             }
             key += ';';
+          } else {
+            key = "union(";
           }
-          return key + ')';
-        } else if constexpr (std::is_same_v<T, SetOperationNode>) {
-          // Keyed as a union is, with its formula, so that one repeated whole is one group, which
-          // exec declines to hold (WorthSharing: no aggregate); nothing below it is collected
-          // (SharedSubPlans, ADR 0039).
-          std::string key = "setop(";
-          for (const SetTerm& term : n.formula) {
-            key +=
-                std::format("{}:{}:{},", std::to_underlying(term.kind), term.input, term.operands);
-          }
-          key += ';';
           for (const std::vector<BoundColumn>& input : n.columns) {
             for (const BoundColumn& column : input) {
               key += origins.Key(column, node);
@@ -798,6 +795,9 @@ LogicalNodePtr SharedConsumerFilters::Producer(const SharedSubPlan& group) const
   const auto& widest = group.members[group.widest];
   // Intersect the constrained output positions across readers, unioning their allowed values.
   // Map by origin-derived producer position: every reference has its own ids and projection.
+  // Fixed-width IN evaluates one comparison per value. The scan selectivity heuristic
+  // expects ten equality values to cover the domain; avoid adding that work below a group.
+  constexpr std::size_t kMaxSharedFilterValues = 9;
   using Domains = std::map<int, std::set<Int128>>;
   Domains common;
   std::map<int, BoundColumn> producer_columns;
@@ -826,13 +826,19 @@ LogicalNodePtr SharedConsumerFilters::Producer(const SharedSubPlan& group) const
         producer_columns.try_emplace(position, column);
       }
       if (IsIntegerOrDateEquality(p)) {
-        local[position].insert(std::get<Int128>(p.constant.value));
+        local[position] = {std::get<Int128>(p.constant.value)};
       } else if (p.kind == Predicate::Kind::kIn && !p.values.empty() &&
+                 p.values.size() <= kMaxSharedFilterValues &&
                  std::ranges::all_of(p.values, [&](const Constant& v) {
                    return v.type == column.type && std::holds_alternative<Int128>(v.value);
                  })) {
-        for (const auto& v : p.values) {
-          local[position].insert(std::get<Int128>(v.value));
+        auto& values = local[position];
+        // All predicates of this reader are conjuncts, so its shortest list suffices.
+        if (values.empty() || p.values.size() < values.size()) {
+          values.clear();
+          for (const auto& v : p.values) {
+            values.insert(std::get<Int128>(v.value));
+          }
         }
       }
     }
@@ -843,6 +849,8 @@ LogicalNodePtr SharedConsumerFilters::Producer(const SharedSubPlan& group) const
       for (auto& [pos, values] : common) {
         values.merge(local.at(pos));
       }
+      std::erase_if(common,
+                    [](const auto& entry) { return entry.second.size() > kMaxSharedFilterValues; });
     }
     if (common.empty()) {
       return widest;

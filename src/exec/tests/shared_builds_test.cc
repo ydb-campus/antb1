@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -157,6 +158,76 @@ TEST_F(SharedBuildsTest, UnionsEveryReadersKeyValuesBeforeMaterializing) {
   }
 }
 
+TEST_F(SharedBuildsTest, AppliesOnlyShortCombinedListsBeforeGrouping) {
+  const auto table = KeyedTable();
+  table->set_claimed_rows(20'000'000);
+  const std::string query =
+      "WITH g AS (SELECT k+1 AS bucket, COUNT(*) AS n FROM t GROUP BY k+1) "
+      "SELECT a.bucket,b.bucket FROM g a JOIN g b ON a.n=b.n "
+      "WHERE a.bucket IN (1,11,12,13,14) AND b.bucket IN ";
+  // Only keys 1 and 2 exist in these lists. One overlap keeps the combined size at nine.
+  for (const auto& [list, shared_rows] :
+       std::vector<std::pair<std::string, int>>{{"(2,15,16,17,11)", 2},
+                                                {"(2,15,16,17,18)", 7},
+                                                {"(2,11,12,13,14,15,16,17,18,19)", 7},
+                                                {"(2,15,16,17,18) AND b.bucket IN (2,14)", 2}}) {
+    SCOPED_TRACE(list);
+    const auto run = Execute(query + list, table);
+    ASSERT_TRUE(run.ok()) << run.status();
+    EXPECT_EQ(run->shared_rows, shared_rows);
+  }
+}
+
+TEST_F(SharedBuildsTest, RejectsIncompleteUnionColumnMapsBeforeSharing) {
+  const auto table = KeyedTable();
+  table->set_claimed_rows(20'000'000);
+  for (const std::string_view op : {"UNION", "UNION ALL"}) {
+    const auto valid = PlanOf(
+        std::format("WITH g AS (SELECT k, COUNT(*) AS n FROM (SELECT k,v FROM t {} SELECT k,v "
+                    "FROM t) u GROUP BY k) SELECT a.k,b.k FROM g a JOIN g b ON a.n=b.n "
+                    "WHERE a.k IN (1,3) AND b.k IN (3,5)",
+                    op),
+        table);
+    ASSERT_TRUE(valid.ok()) << valid.status();
+    const auto groups = plan::SharedSubPlans(*valid);
+    ASSERT_FALSE(groups.empty());
+    ASSERT_TRUE(plan::WorthSharing(groups.front()));
+
+    for (const bool missing_list : {true, false}) {
+      SCOPED_TRACE(std::format("{} missing list={}", op, missing_list));
+      const auto omit = [&](const auto& self,
+                            const plan::LogicalNodePtr& node) -> plan::LogicalNodePtr {
+        const auto omit_columns = [&](auto set) {
+          if (missing_list) {
+            set.columns.pop_back();
+          } else {
+            set.columns.back().clear();
+          }
+          return std::make_shared<const plan::LogicalNode>(std::move(set));
+        };
+        if (const auto* set = std::get_if<plan::SetOperationNode>(node.get())) {
+          return omit_columns(*set);
+        }
+        if (const auto* set = std::get_if<plan::UnionAllNode>(node.get())) {
+          return omit_columns(*set);
+        }
+        auto inputs = plan::InputsOf(*node);
+        for (auto& input : inputs) {
+          input = self(self, input);
+        }
+        return plan::WithInputs(*node, std::move(inputs));
+      };
+      auto malformed = *valid;
+      malformed.root = omit(omit, malformed.root);
+      const auto result = BuildPhysicalPlan(malformed);
+      ASSERT_TRUE(result.status().IsInvalid()) << result.status();
+      EXPECT_TRUE(
+          result.status().message().contains(missing_list ? "column lists for" : "columns for"))
+          << result.status();
+    }
+  }
+}
+
 TEST_F(SharedBuildsTest, SharedKeyRestrictionPreservesOverflowInAnUnusedGroup) {
   const auto schema =
       arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
@@ -272,6 +343,14 @@ TEST_F(SharedBuildsTest, SharedCostDoesNotExposeOverflowInExcludedGroups) {
     auto overflow = Execute(std::string(kFiltered) + "3", table);
     ASSERT_FALSE(overflow.ok());
     EXPECT_NE(overflow.status().ToString().find("overflow"), std::string::npos);
+
+    // IN lists stay on the readers. Pushing their union through SUM would hide key 3's overflow.
+    const auto unused = Execute(
+        "WITH g AS (SELECT k, SUM(v) AS n FROM t GROUP BY k) "
+        "SELECT a.k,b.k FROM g a JOIN g b ON a.n=b.n WHERE a.k IN (1,4) AND b.k IN (2,5)",
+        table);
+    ASSERT_FALSE(unused.ok());
+    EXPECT_TRUE(unused.status().message().contains("SUM overflow")) << unused.status();
   }
 }
 
