@@ -13,27 +13,38 @@ race:libparquet.so
 
 # DuckDB 2.0.0 (conda-forge, test oracle). Recheck these Linux reports with pixi run tsan on
 # the next DuckDB upgrade. Access stacks: https://github.com/ydb-campus/antb1/issues/271
-# Nightly runs 45616991058, 45819101495 and 45824073976 cover the signatures below.
+# Nightly runs 45616991058, 45819101495, 45824073976 and 45830643662 and a Linux x86-64
+# reproduction show the following handoffs inside the oracle.
 #
 # Parquet scans: a worker releases its read-ahead task as the consumer frees the job. Other
-# reports pair the worker's file read with a Thrift buffer read, growth of its buffer handle
-# vector with destruction of the reader's cached handles, and BlockHandle construction with
-# unpinning that block. Reproduced by oracle and differential tests.
+# reports pair a worker's positional file read with a Thrift buffer read or file close, growth
+# of its buffer handle vector with destruction of the reader's cached handles, and BlockHandle
+# construction with unpinning that block. OpenMarkedFile reads a worker-created file state, and
+# the worker checks a cached file's path while the consumer disposes of the handle. The worker
+# also accesses that handle during ParquetReader destruction.
 race:duckdb::ReadAheadIOTask::~ReadAheadIOTask(
-race:duckdb::ThriftFileTransport::read(
+race:duckdb::LocalFileSystem::Read(duckdb::FileHandle&, void*, long, unsigned long)
 race:_M_realloc_append<duckdb::FileBufferHandleGroup::MemoryHandle>(
 race:duckdb::StandardBufferManager::Unpin(duckdb::shared_ptr<duckdb::BlockHandle, true>&)
+race:duckdb::MultiFileReaderData::MultiFileReaderData(duckdb::OpenFileInfo const&)
+race:std::_Sp_counted_deleter<duckdb::CachingFileHandle*, std::default_delete<duckdb::CachingFileHandle>,*>::_M_dispose()
+race:duckdb::ParquetReader::~ParquetReader()
 
 # Parquet fixture creation: row-group preparation and batch flushes race with writer and file
-# initialization. Copies of column names race with allocation of integer or struct column writers.
-# The dictionary predicate integration test also reports a worker copying identifiers as DuckDB reads them.
+# initialization. A queued write reads a payload filled by the producer, and the producer
+# reads a formatted string from another worker. Copies of column names race with writer construction.
+# The dictionary predicate integration test reports a worker copying identifiers as DuckDB reads them.
 race:duckdb::ParquetWriter::PrepareRowGroup(
 race:duckdb::CopyToFileGlobalState::InitializeFileState(duckdb::PendingFileState)
-race:duckdb::make_uniq<duckdb::StandardColumnWriter<long, long, duckdb::ParquetCastOperator>,
-race:duckdb::make_uniq<duckdb::StandardColumnWriter<short, int, duckdb::ParquetCastOperator>,
+race:duckdb::ManagedAsyncWriteStreamQueue::CoalescedWritePayload::Ptr()
+race:duckdb::AsyncFileWriter::WriteDataInternal(unsigned char const*, unsigned long)
+race:duckdb::make_uniq<duckdb::StandardColumnWriter<*, duckdb::ParquetCastOperator>, duckdb::ParquetWriter&,
+race:duckdb::make_uniq<duckdb::StandardColumnWriter<duckdb::string_t, duckdb::string_t, duckdb::ParquetStringOperator>,
 race:duckdb::make_uniq<duckdb::StructColumnWriter,
+race:duckdb::ColumnWriter::ColumnWriter(duckdb::ParquetWriter&,
 race:duckdb::IdentifiersToStrings[abi:cxx11](
 
-# Differential tests also report DuckDB's bundled jemalloc initializing a decay mutex while
-# another thread acquires it. Match the initializer specific to DuckDB's copy of jemalloc.
+# DuckDB's bundled jemalloc initializes a decay mutex while another thread acquires it,
+# and reads arena statistics while a worker maps or initializes the arena.
 race:^duckdb_je_decay_init$
+race:^duckdb_je_arena_stats_merge$
