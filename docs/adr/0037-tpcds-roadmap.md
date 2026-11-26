@@ -208,16 +208,16 @@ Queries are those a PR completes when the PRs merge in this order.
 | W2 | Existing non-DISTINCT aggregates over unordered whole partitions, including windows over a grouped block's aggregates; ratchet 90 | 12, 20, 53, 63, 89, 98 | Built |
 | W3 | RANK with partition and ordering expressions, including grouped aggregates and GROUPING(); ratchet 98 | 36, 44, 47, 49, 57, 67, 70, 86 | Built |
 | W4 | Running aggregates with ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW; ratchet 99 | 51 | Built |
-| **Phase 10** | **Full decorrelation ([ADR 0041](0041-subqueries-and-decorrelation.md)), of which phase 8 is a subset; the ids name items, not yet an order (the phase 8 update below)** | | |
-| SQ4b | The single join, `kSingle`: correlated scalar subqueries that are not aggregates, grouped ones included, checked per probe row (needs SQ0 and SQ8) | | Planned |
+| **Phase 10** | **Full decorrelation builds on phase 8. Items are in build order. Benchmark every existing query whose plan changes at any step ([ADR 0041](0041-subqueries-and-decorrelation.md#phase-10-build-order-and-benchmarks)).** | | |
 | SQ9 | The domain D, the unnesting's second terminal step, for correlations that substitution cannot express: relational division (a double NOT EXISTS, or NOT EXISTS over an EXCEPT whose left arm is uncorrelated), non-equality and OR correlations below an aggregate, outer columns inside an aggregate's argument, references two blocks out that the middle block does not equate, and the input that reads no outer column of a join that must be unnested on both inputs (needs SQ0) | | Planned |
+| SQ4b | The single join, `kSingle`: correlated scalar subqueries that are not aggregates, grouped ones included, checked per probe row (needs SQ0 and SQ8) | | Planned |
 | SQ10 | Correlation forms that need no D: keys over computed expressions; widened keys of two types; an outer-only conjunct of a scalar aggregate, lifted out under the consumer proof and otherwise kept as a CASE above the join; substitution through a middle block's classes; a correlation inside a derived table or CTE body nested in the subquery; a join whose two inputs both read outer columns, unnested on both by substitution with their representatives equated NULL-equal; maps in select items; SQL's rule that an aggregate whose arguments are only outer columns is the outer block's, with DuckDB's bind error for one in a subquery's select list where the subquery stands in the enclosing WHERE, ON or GROUP BY (needs SQ0 and SQ6) | | Planned |
 | SQ11 | Keyless semi, anti and mark joins, amending [ADR 0040](0040-nested-loop-joins.md)'s decision 3: correlated EXISTS, NOT EXISTS, IN and NOT IN whose correlation has no equality (needs SQ8) | | Planned |
 | SQ12 | Correlated marks: correlated IN, NOT IN, `= ANY` and `<> ALL` under OR, NOT or CASE, three-valued, with per-binding NULL and empty flags (needs SQ8) | | Planned |
 | SQ13 | Correlation above an aggregation: free variables remapped to the GROUP BY or grouping-sets output, NULL where rolled up; correlated subqueries in HAVING and in a grouped block's select list; an aggregate of the enclosing block inside a subquery that stands in the enclosing HAVING or select list; DuckDB's bind error for one in a subquery's HAVING where the subquery stands in the enclosing WHERE, ON or GROUP BY (needs SQ0 and SQ5) | | Planned |
-| SQ14 | Per-binding LIMIT and OFFSET, a ROW_NUMBER partitioned by the representatives (needs W5 of [ADR 0043](0043-window-functions.md), and SQ9 for an ORDER BY over an outer column without an equivalent) | | Planned |
 | SQ15 | Set operations with correlated arms: an uncorrelated right arm of EXCEPT or INTERSECT without D, a UNION arm through D or a decomposition (needs SQ9) | | Planned |
 | SQ16 | Grouping sets that mix `()` with other sets inside a correlated block, with GROUPING()'s empty value (needs SQ4b and SQ6) | | Planned |
+| SQ14 | Per-binding LIMIT and OFFSET, a ROW_NUMBER partitioned by the representatives (needs W5 of [ADR 0043](0043-window-functions.md), and SQ9 for an ORDER BY over an outer column without an equivalent) | | Planned |
 | SQ17 | Correlated values in an aggregate's FILTER clause and in window arguments (needs the window core and W10b of [ADR 0043](0043-window-functions.md); W11g records the integration obligations) | | Planned |
 | **Guards** | **Pulled in front of the PR they protect when the budget gate or their own trigger (the updates below) fires** | | |
 | PF2 | Filters into derived tables and CTE references: through their Projects, GROUP BY keys and inner joins to the scan of the relation that defines the column | | Conditional |
@@ -963,6 +963,13 @@ ratchet remains at 84. The new ADR is a separate documentation commit and must m
   dependencies and completion criteria stay in ADR 0043.
 - **Existing decisions.** The ordered phase boundary, data policy, ratchet, budget gates and open decision about
   CL1/CL2 remain. No existing ADR changes status.
+
+Update (2026-11-26, phase 10). With W1-W4 built and the ratchet at 99, the table now gives the implementation
+order. SQ9 starts with a keyed domain and then covers the keyless case. SQ4b follows as an independent change.
+The two items with window prerequisites come last. At every step, including each part of SQ9, compare existing
+query plans before and after the change. Benchmark every query whose logical or physical plan changes and fix
+confirmed regressions before merge. The rationale and benchmark procedure are in
+[ADR 0041](0041-subqueries-and-decorrelation.md#phase-10-build-order-and-benchmarks).
 
 ## Alternatives considered
 
