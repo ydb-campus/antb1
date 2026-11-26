@@ -548,18 +548,25 @@ std::unique_ptr<Operator> WithBuilds(std::unique_ptr<PartSink> sink,
   return std::make_unique<BuildsFirstOperator>(std::move(sink), builds->builds);
 }
 
-// A part pipeline's batches in part order, at most row_cap selected rows per part.
+// A part pipeline's batches in part order. Its sink may cap selected rows for a LIMIT or remove
+// repeated keys for an INTERSECT DISTINCT.
 OperatorResult BuildPartUnion(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
-                              std::optional<int64_t> row_cap, ProfileNode* slot) {
+                              std::optional<int64_t> row_cap, ProfileNode* slot,
+                              std::vector<int> distinct_keys = {}) {
   if (slot != nullptr) {
     slot->set_name("PartUnion");
-    slot->set_detail(row_cap.has_value() ? std::format("at most {} rows per part", *row_cap)
-                                         : std::string("in part order"));
+    if (!distinct_keys.empty()) {
+      slot->set_detail("in part order, adaptive INTERSECT deduplication");
+    } else {
+      slot->set_detail(row_cap.has_value() ? std::format("at most {} rows per part", *row_cap)
+                                           : std::string("in part order"));
+    }
   }
   ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node, scan, slot));
   ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the output schema; never opened
   return WithBuilds(std::make_unique<PartUnionOperator>(std::move(parts.pipeline), parts.count,
-                                                        sample->output_schema(), row_cap),
+                                                        sample->output_schema(), row_cap,
+                                                        std::move(distinct_keys)),
                     parts.builds, slot);
 }
 
@@ -1709,8 +1716,8 @@ struct Builder {
     return union_all;
   }
   OperatorResult operator()(const plan::SetOperationNode& node) const {
-    // As a union's inputs (above): each planned on its own and read one after another on the
-    // consumer's thread, with nothing above travelling into one (docs/adr/0039-set-operations.md).
+    // Read the operands in written order. A pure distinct intersection needs only the presence
+    // of each key, so its part workers can discard repeated keys before the consumer sees them.
     if (part.has_value()) {
       return arrow::Status::Invalid("a set operation inside a part pipeline");
     }
@@ -1719,15 +1726,28 @@ struct Builder {
     std::vector<std::vector<int>> columns;
     inputs.reserve(node.inputs.size());
     columns.reserve(node.columns.size());
-    for (std::size_t k = 0; k < node.inputs.size(); ++k) {
-      ARROW_ASSIGN_OR_RAISE(auto input, Build(node.inputs[k], std::nullopt, Input(k)));
-      inputs.push_back(std::move(input));
-    }
     for (const std::vector<plan::BoundColumn>& input : node.columns) {
       std::vector<int>& picked = columns.emplace_back();
       for (const plan::BoundColumn& column : input) {
         picked.push_back(column.index);
       }
+    }
+    const bool distinct_intersect =
+        node.inputs.size() > 1 && node.columns.size() == node.inputs.size() &&
+        std::ranges::all_of(node.formula, [](const plan::SetTerm& term) {
+          return term.kind == plan::SetTermKind::kInput ||
+                 term.kind == plan::SetTermKind::kIntersect;
+        });
+    for (std::size_t k = 0; k < node.inputs.size(); ++k) {
+      const auto& input = node.inputs[k];
+      const auto* scan = distinct_intersect ? PipelineScan(input) : nullptr;
+      ProfileNode* input_profile = Input(k);
+      ARROW_ASSIGN_OR_RAISE(auto op, scan == nullptr
+                                         ? Build(input, std::nullopt, input_profile)
+                                         : Profiled(BuildPartUnion(input, *scan, std::nullopt,
+                                                                   input_profile, columns[k]),
+                                                    input, input_profile));
+      inputs.push_back(std::move(op));
     }
     std::vector<plan::LogicalType> types;
     if (!node.columns.empty()) {

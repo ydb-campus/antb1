@@ -20,6 +20,7 @@
 #include <arrow/array/concatenate.h>
 #include <arrow/compute/api_vector.h>
 #include <arrow/stl_allocator.h>
+#include <arrow/util/byte_size.h>
 #include <arrow/util/thread_pool.h>
 
 #include "antb1/common/check.h"
@@ -37,6 +38,7 @@
 #include "part_pruning.h"
 #include "part_scheduler.h"
 #include "partition_lanes.h"
+#include "union_distinct.h"
 #include "variance.h"
 
 namespace antb1::exec {
@@ -93,19 +95,126 @@ arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ct
 
 // ---- PartUnionOperator ----
 
+namespace {
+
+// Sample selected rows across input batches. Bound speculative key state even if a part starts
+// with many repeats and its remaining rows are unique.
+constexpr int64_t kDistinctSampleRows = 8192;
+constexpr int64_t kMaxPartDistinctBytes = int64_t{8} * 1024 * 1024;
+
+// Stop exactly at the end of the selected sample, also for sparse masks.
+int64_t DistinctChunkSize(const Batch& batch, int64_t start, int64_t remaining_sample) {
+  const auto count = std::min(kDistinctSampleRows, batch.data->num_rows() - start);
+  if (remaining_sample <= 0 || remaining_sample >= count) {
+    return count;
+  }
+  if (batch.selection == nullptr) {
+    return remaining_sample;
+  }
+  for (int64_t i = 0; i < count; ++i) {
+    if (batch.selection->IsValid(start + i) && batch.selection->Value(start + i) &&
+        --remaining_sample == 0) {
+      return i + 1;
+    }
+  }
+  return count;
+}
+
+// Keep the original batches until the optional reduction commits. In particular, a refused hash
+// table or output allocation can be retried by forwarding the input directly to the set operation.
+arrow::Result<int64_t> DeduplicatePart(std::vector<Batch>& batches, int64_t rows,
+                                       const std::vector<int>& columns, const arrow::Schema& schema,
+                                       const ExecContext& ctx, int64_t window,
+                                       const std::atomic<bool>& stop) {
+  // Leave room for the other workers and the consumer. Scratch and candidate output each take
+  // at most one eighth of a worker's share of headroom, including variable-width keys.
+  auto allowance = kMaxPartDistinctBytes;
+  const auto limit = ctx.budget == nullptr ? std::nullopt : ctx.budget->limit();
+  if (limit.has_value()) {
+    const auto headroom = *limit - ctx.budget->bytes_allocated();
+    allowance = std::min(allowance, std::max<int64_t>(0, headroom) / window / 8);
+  }
+  MemoryBudget scratch(allowance, ctx.pool);
+  auto local = ctx;
+  local.pool = &scratch;
+  UnionDistinct distinct(local);
+  // Materialized input and output rows may outlive scratch, including any Arrow buffers shared
+  // by a Take kernel. Normalized keys, hash state and the seen-group bitmap use the scratch pool.
+  arrow::compute::ExecContext output(ctx.pool);
+  std::vector<Batch> reduced;
+  int64_t output_bytes = 0;
+  const int64_t sample = std::min(rows, kDistinctSampleRows);
+  int64_t consumed = 0;
+  for (const auto& batch : batches) {
+    for (const int column : columns) {
+      if (column < 0 || column >= batch.data->num_columns() || column >= schema.num_fields() ||
+          !batch.data->column(column)->type()->Equals(*schema.field(column)->type())) {
+        return 0;  // the set operation validates every original key column
+      }
+    }
+    for (int64_t start = 0; start < batch.data->num_rows();) {
+      if (stop.load() || (ctx.budget != nullptr && ctx.budget->under_pressure())) {
+        return 0;
+      }
+      const auto count = DistinctChunkSize(batch, start, sample - consumed);
+      Batch chunk{.data = batch.data->Slice(start, count), .selection = {}};
+      if (batch.selection != nullptr) {
+        chunk.selection =
+            std::static_pointer_cast<arrow::BooleanArray>(batch.selection->Slice(start, count));
+      }
+      start += count;
+      // The unfiltered slice bounds both optional materialization and the rows Take could copy.
+      ARROW_ASSIGN_OR_RAISE(const auto bytes, arrow::util::ReferencedBufferSize(*chunk.data));
+      if (bytes > allowance - output_bytes) {
+        return 0;
+      }
+      ARROW_ASSIGN_OR_RAISE(const auto selected, Materialize(chunk, ctx.pool));
+      if (selected->num_rows() == 0) {
+        continue;
+      }
+      ARROW_ASSIGN_OR_RAISE(const auto keys, selected->SelectColumns(columns));
+      ARROW_RETURN_NOT_OK(distinct.AppendSerial(selected, *keys, output));
+      consumed += selected->num_rows();
+      const auto removed = consumed - distinct.num_groups();
+      // Continue only while at least one eighth of the selected rows are duplicates.
+      if (consumed >= sample && removed <= (consumed - 1) / 8) {
+        return 0;
+      }
+      if (auto kept = distinct.Next(); !kept.end()) {
+        const auto held = arrow::util::TotalBufferSize(*kept.data) + Narrow<int64_t>(sizeof(Batch));
+        if (held > allowance - output_bytes) {
+          return 0;
+        }
+        output_bytes += held;
+        reduced.push_back(std::move(kept));
+      }
+    }
+  }
+  if (ctx.budget != nullptr && ctx.budget->under_pressure()) {
+    return 0;
+  }
+  batches.swap(reduced);
+  return consumed - distinct.num_groups();
+}
+
+}  // namespace
+
 PartUnionOperator::PartUnionOperator(PartPipeline pipeline, int64_t num_parts,
                                      std::shared_ptr<arrow::Schema> schema,
-                                     std::optional<int64_t> row_cap)
+                                     std::optional<int64_t> row_cap,
+                                     std::vector<int> distinct_columns)
     : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       schema_(std::move(schema)),
-      row_cap_(row_cap) {}
+      row_cap_(row_cap),
+      distinct_columns_(std::move(distinct_columns)) {}
 
 PartUnionOperator::~PartUnionOperator() = default;
 
 arrow::Status PartUnionOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), cap = row_cap_,
+               columns = distinct_columns_, schema = schema_, window = PartWindow(ctx),
                profile = profile()](int64_t part,
                                     const std::atomic<bool>& stop) -> arrow::Result<PartBatches> {
     const ProfileTimer part_time(profile, "part_time");
@@ -120,6 +229,16 @@ arrow::Status PartUnionOperator::Open(ExecContext& ctx) {
           batches->push_back(std::move(batch));
           return !cap.has_value() || rows < *cap;
         }));
+    if (!columns.empty() && !cap.has_value() && rows > 0) {
+      const auto removed = KeyTableNoBadAlloc([&] {
+        return DeduplicatePart(*batches, rows, columns, *schema, part_ctx, window, stop);
+      });
+      if (profile != nullptr) {
+        const auto saved = removed.ValueOr(0);
+        profile->Add("local_distinct_rows_removed", MetricUnit::kCount, saved);
+        profile->Add("local_distinct_parts_bypassed", MetricUnit::kCount, saved == 0 ? 1 : 0);
+      }
+    }
     return batches;
   };
   scheduler_ = std::make_unique<PartScheduler<PartBatches>>(

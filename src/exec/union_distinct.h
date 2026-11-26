@@ -24,6 +24,13 @@ class UnionDistinct {
   UnionDistinct& operator=(const UnionDistinct&) = delete;
 
   arrow::Status Append(const std::shared_ptr<arrow::RecordBatch>& rows);
+  // Serial, bounded batch path shared with part-local INTERSECT deduplication. Keep the first
+  // original row for each normalized key tuple. key_columns has one row per row of rows.
+  // Allocate the Take indices and retained rows through output; key and hash scratch uses ctx_.
+  arrow::Status AppendSerial(const std::shared_ptr<arrow::RecordBatch>& rows,
+                             const arrow::RecordBatch& key_columns,
+                             arrow::compute::ExecContext& output);
+  [[nodiscard]] int64_t num_groups() const { return groups_; }
   // Complete earlier input work before the next input opens.
   arrow::Status Flush();
   void Finish(ProfileNode* profile);
@@ -34,7 +41,6 @@ class UnionDistinct {
   struct Piece;
   std::size_t Lane(std::uint64_t hash) const;
   arrow::Status SeedLanes();
-  arrow::Status ConsumeSerial(const std::shared_ptr<arrow::RecordBatch>& rows);
   arrow::Result<arrow::compute::ExecBatch> Keys(const arrow::RecordBatch& rows) const;
   arrow::Status Route(Piece& piece);
   arrow::Status Insert(std::size_t lane);

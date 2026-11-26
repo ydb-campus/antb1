@@ -136,7 +136,8 @@ arrow::Status UnionDistinct::Append(const std::shared_ptr<arrow::RecordBatch>& r
       if (groups_ < kTileRows / 2 || ctx_.threads <= 1 || ctx_.executor == nullptr ||
           ctx_.executor->IsCurrentExecutor()) {
         const auto count = std::min(kTileRows, rows->num_rows() - start);
-        ARROW_RETURN_NOT_OK(ConsumeSerial(rows->Slice(start, count)));
+        const auto chunk = rows->Slice(start, count);
+        ARROW_RETURN_NOT_OK(AppendSerial(chunk, *chunk, kernels_));
         start += count;
         continue;
       }
@@ -233,8 +234,10 @@ Batch UnionDistinct::Next() {
 std::size_t UnionDistinct::Lane(std::uint64_t hash) const {
   return (hash >> 32U) & (lanes_.size() - 1);
 }
-arrow::Status UnionDistinct::ConsumeSerial(const std::shared_ptr<arrow::RecordBatch>& rows) {
-  ARROW_ASSIGN_OR_RAISE(auto keys, Keys(*rows));
+arrow::Status UnionDistinct::AppendSerial(const std::shared_ptr<arrow::RecordBatch>& rows,
+                                          const arrow::RecordBatch& key_columns,
+                                          arrow::compute::ExecContext& output) {
+  ARROW_ASSIGN_OR_RAISE(auto keys, Keys(key_columns));
   if (serial_ == nullptr) {
     ARROW_ASSIGN_OR_RAISE(serial_, MakeKeyTable(keys.GetTypes(), &kernels_, {}, ctx_.budget));
   }
@@ -243,7 +246,8 @@ arrow::Status UnionDistinct::ConsumeSerial(const std::shared_ptr<arrow::RecordBa
   if (added == 0) {
     return arrow::Status::OK();
   }
-  arrow::UInt32Builder selected(ctx_.pool);
+  // Both Take inputs outlive the key scratch pool if a kernel shares one of their buffers.
+  arrow::UInt32Builder selected(output.memory_pool());
   ARROW_RETURN_NOT_OK(selected.Reserve(added));
   ARROW_ASSIGN_OR_RAISE(auto seen, arrow::AllocateEmptyBitmap(added, ctx_.pool));
   for (std::uint32_t row = 0; row < ids.ids.size(); ++row) {
@@ -256,8 +260,7 @@ arrow::Status UnionDistinct::ConsumeSerial(const std::shared_ptr<arrow::RecordBa
   ARROW_ASSIGN_OR_RAISE(const auto positions, selected.Finish());
   ARROW_ASSIGN_OR_RAISE(
       const auto taken,
-      arrow::compute::Take(rows, positions, arrow::compute::TakeOptions::NoBoundsCheck(),
-                           &kernels_));
+      arrow::compute::Take(rows, positions, arrow::compute::TakeOptions::NoBoundsCheck(), &output));
   (void)taken.record_batch()->columns();
   output_.push_back(taken.record_batch());
   groups_ += added;
