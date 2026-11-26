@@ -37,6 +37,7 @@ enum class GroupTableMode : std::uint8_t { kSeparate, kBatch };
 // the same on every run and build of this Arrow version: each value's bytes through Arrow's string
 // hash (a fixed-width value's bytes, a binary value's bytes, a constant for NULL), combined over
 // the keys. Without columns every row has the same hash.
+arrow::Status KeyHashes(const arrow::compute::ExecBatch& keys, std::span<std::uint64_t> hashes);
 arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBatch& keys);
 
 // Canonical routing hashes for valid row indices into normalized key arrays.

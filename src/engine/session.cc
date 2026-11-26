@@ -62,6 +62,9 @@ arrow::Result<std::shared_ptr<plan::Table>> OpenParquet(const SessionOptions& op
 // it; an option the caller left unset keeps the planner's own default.
 plan::BindOptions BindOptionsOf(const SessionOptions& options) {
   plan::BindOptions out;
+  out.threads = options.threads;
+  out.batch_size = options.batch_size;
+  out.memory_limit = options.memory_limit;
   if (options.build_side_ratio.has_value()) {
     out.build_side_ratio = *options.build_side_ratio;
   }
@@ -73,7 +76,8 @@ plan::BindOptions BindOptionsOf(const SessionOptions& options) {
 
 arrow::Result<plan::LogicalPlan> ParseAndBind(std::string_view sql, const plan::Catalog& catalog,
                                               const plan::BindOptions& options,
-                                              QueryTimings* timings) {
+                                              QueryTimings* timings,
+                                              plan::LogicalPlan* memory_fallback = nullptr) {
   const auto t0 = Clock::now();
   auto stmt = sql::Parse(sql);
   const auto t1 = Clock::now();
@@ -85,13 +89,26 @@ arrow::Result<plan::LogicalPlan> ParseAndBind(std::string_view sql, const plan::
     ARROW_RETURN_NOT_OK(plan::RefuseWindowExecution(*stmt));
     // Optimize can fail (ADR 0023's unnesting pass), and every caller of ParseAndBind propagates
     // it, so `explain` and `explain --analyze` reject exactly what `query` rejects.
-    bound = plan::Optimize(*bound, options);
+    bound = plan::Optimize(*bound, options, memory_fallback);
   }
   if (timings != nullptr) {
     timings->parse = t1 - t0;
     timings->bind = Clock::now() - t1;  // bind and optimize
   }
   return bound;
+}
+
+// Drain finishes or discards the whole result before it is exposed. If the new plan runs out of
+// budget (including buffers held by earlier queries), release it and run the original plan once.
+// Other errors, including validation failures and arithmetic overflow, propagate directly.
+template <class Run>
+auto RunWithMemoryFallback(const plan::LogicalPlan& logical, const plan::LogicalPlan& fallback,
+                           Run run) {
+  auto result = run(logical);
+  if (!result.ok() && result.status().IsOutOfMemory() && fallback.root) {
+    return run(fallback);
+  }
+  return result;
 }
 
 }  // namespace
@@ -143,17 +160,21 @@ arrow::Status Session::RegisterParquet(const std::string& name,
 arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
   QueryResult result;
   memory_->ResetPeak();
-  ARROW_ASSIGN_OR_RAISE(auto logical,
-                        ParseAndBind(sql, catalog_, BindOptionsOf(options_), &result.timings));
+  plan::LogicalPlan fallback;
+  ARROW_ASSIGN_OR_RAISE(auto logical, ParseAndBind(sql, catalog_, BindOptionsOf(options_),
+                                                   &result.timings, &fallback));
   const auto t0 = Clock::now();
-  ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical));
   result.memory = memory_;
   exec::ExecContext ctx{.pool = memory_.get(),
                         .batch_size = options_.batch_size,
                         .executor = pool_.get(),
                         .threads = options_.threads,
                         .budget = memory_.get()};
-  ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
+  auto run = [&](const plan::LogicalPlan& chosen) -> arrow::Result<std::shared_ptr<arrow::Table>> {
+    ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(chosen));
+    return exec::Drain(*op, ctx);
+  };
+  ARROW_ASSIGN_OR_RAISE(auto table, RunWithMemoryFallback(logical, fallback, run));
   for (const auto& col : logical.output) {
     result.names.push_back(col.name);
     result.types.push_back(col.type);
@@ -183,24 +204,26 @@ arrow::Result<std::string> Session::ExplainPhysical(std::string_view sql) {
 }
 
 arrow::Result<QueryProfile> Session::ExplainAnalyze(std::string_view sql) {
+  plan::LogicalPlan fallback;
   ARROW_ASSIGN_OR_RAISE(auto logical,
-                        ParseAndBind(sql, catalog_, BindOptionsOf(options_), nullptr));
+                        ParseAndBind(sql, catalog_, BindOptionsOf(options_), nullptr, &fallback));
   QueryProfile profile;
   profile.output = plan::ExplainOutput(logical);
-  profile.root = std::make_shared<exec::ProfileNode>();
   profile.threads = options_.threads;
   memory_->ResetPeak();
   const auto t0 = Clock::now();
-  {
-    ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical, profile.root.get()));
+  auto run = [&](const plan::LogicalPlan& chosen) -> arrow::Result<int64_t> {
+    profile.root = std::make_shared<exec::ProfileNode>();
+    ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(chosen, profile.root.get()));
     exec::ExecContext ctx{.pool = memory_.get(),
                           .batch_size = options_.batch_size,
                           .executor = pool_.get(),
                           .threads = options_.threads,
                           .budget = memory_.get()};
     ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
-    profile.rows = table->num_rows();
-  }
+    return table->num_rows();
+  };
+  ARROW_ASSIGN_OR_RAISE(profile.rows, RunWithMemoryFallback(logical, fallback, run));
   profile.time = Clock::now() - t0;
   profile.peak_memory = memory_->max_memory();
   return profile;

@@ -43,6 +43,7 @@ antb1_add_module(
     shared_builds.cc
     limit.cc
     set_operation.cc
+    union_distinct.cc
     union_all.cc
     gather.cc
     hash_join.cc
@@ -92,6 +93,7 @@ if(ANTB1_BUILD_TESTS)
       tests/fixed_key_table_test.cc
       tests/set_operation_test.cc
       tests/union_all_test.cc
+      tests/union_aggregate_test.cc
     LIBS ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}
   )
   # Replaces the global operator new and delete (an allocation-failure hook), so it is an executable of its own.

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -23,20 +24,36 @@
 namespace antb1::exec {
 namespace {
 
-bool CheckedDecimalColumn(const plan::LogicalNode& node, plan::ColumnId id);
+// A producer can be reached through several CASE arms, projections or aggregates.
+class DecimalProofs {
+ public:
+  bool Column(const plan::LogicalNode& node, plan::ColumnId id) {
+    const auto key = std::pair{&node, id};
+    if (const auto found = checked_.find(key); found != checked_.end()) {
+      return found->second;
+    }
+    return checked_.emplace(key, Trace(node, id)).first->second;
+  }
 
-bool CheckedDecimalExpr(const plan::LogicalNode& input, const plan::Expr& expr) {
+ private:
+  bool Trace(const plan::LogicalNode& node, plan::ColumnId id);
+  bool Expr(const plan::LogicalNode& input, const plan::Expr& expr);
+
+  std::map<std::pair<const plan::LogicalNode*, plan::ColumnId>, bool> checked_;
+};
+
+bool DecimalProofs::Expr(const plan::LogicalNode& input, const plan::Expr& expr) {
   if (const auto* col = std::get_if<plan::ColumnExpr>(&expr.node)) {
-    return CheckedDecimalColumn(input, col->id);
+    return Column(input, col->id);
   }
   if (const auto* cast = std::get_if<plan::CastExpr>(&expr.node)) {
     // Convert range-checks a conversion to a different DECIMAL type. A same-type cast passes
     // through the original array and inherits its proof.
-    return cast->operand->type != expr.type || CheckedDecimalExpr(input, *cast->operand);
+    return cast->operand && (cast->operand->type != expr.type || Expr(input, *cast->operand));
   }
   if (const auto* branch = std::get_if<plan::CaseExpr>(&expr.node)) {
     const auto checked = [&](const plan::ExprPtr& value) {
-      return !value || value->type != expr.type || CheckedDecimalExpr(input, *value);
+      return !value || value->type != expr.type || Expr(input, *value);
     };
     return checked(branch->otherwise) && std::ranges::all_of(branch->thens, checked);
   }
@@ -45,17 +62,16 @@ bool CheckedDecimalExpr(const plan::LogicalNode& input, const plan::Expr& expr) 
          std::holds_alternative<plan::ConstantExpr>(expr.node);
 }
 
-bool CheckedDecimalColumn(const plan::LogicalNode& node, plan::ColumnId id) {
+bool DecimalProofs::Trace(const plan::LogicalNode& node, plan::ColumnId id) {
   if (id == plan::kNoColumnId) {
     return false;
   }
   if (const auto* compute = std::get_if<plan::ComputeNode>(&node)) {
     const auto it = std::ranges::find(compute->ids, id);
     return it == compute->ids.end()
-               ? CheckedDecimalColumn(*compute->input, id)
-               : CheckedDecimalExpr(
-                     *compute->input,
-                     *compute->exprs[Narrow<std::size_t>(it - compute->ids.begin())]);
+               ? Column(*compute->input, id)
+               : Expr(*compute->input,
+                      *compute->exprs[Narrow<std::size_t>(it - compute->ids.begin())]);
   }
   if (const auto* project = std::get_if<plan::ProjectNode>(&node)) {
     const auto it = std::ranges::find(project->ids, id);
@@ -64,13 +80,13 @@ bool CheckedDecimalColumn(const plan::LogicalNode& node, plan::ColumnId id) {
     }
     const auto index = Narrow<std::size_t>(it - project->ids.begin());
     return (!project->constants.empty() && project->constants[index].has_value()) ||
-           CheckedDecimalColumn(*project->input, project->columns[index].id);
+           Column(*project->input, project->columns[index].id);
   }
   if (const auto* filter = std::get_if<plan::FilterNode>(&node)) {
-    return CheckedDecimalColumn(*filter->input, id);
+    return Column(*filter->input, id);
   }
   if (const auto* join = std::get_if<plan::JoinNode>(&node)) {
-    return CheckedDecimalColumn(*join->left, id) || CheckedDecimalColumn(*join->right, id);
+    return Column(*join->left, id) || Column(*join->right, id);
   }
   return false;
 }
@@ -155,13 +171,14 @@ std::vector<GroupingSetsShape::RollupLevel> NestedRollup(
 }  // namespace
 
 bool WideDecimalInputsChecked(const plan::GroupingSetsNode& node) {
+  DecimalProofs proofs;
   return std::ranges::all_of(node.aggregates, [&](const plan::AggregateCall& call) {
     if ((call.kind != plan::AggKind::kSum && call.kind != plan::AggKind::kAvg) ||
         !call.arg.has_value() || call.arg->type != plan::LogicalType::kDecimal ||
         call.arg->type.width() <= plan::LogicalType::kMaxNarrowDecimalWidth) {
       return true;
     }
-    return CheckedDecimalColumn(*node.input, call.arg->id);
+    return proofs.Column(*node.input, call.arg->id);
   });
 }
 

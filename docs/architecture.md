@@ -237,6 +237,37 @@ steps (only step 7 uses more than one thread):
    When a consumer loses reuse, the optimizer retries with the affected producers protected. It keeps the original
    pushdown when a filter eliminates a union branch or crosses an aggregate that can raise a numeric or temporal
    range error. Both planning stages use the same input-row and result-size criteria for aggregate reuse.
+   Once a producer is chosen for sharing, the physical planner checks its readers' filters. If every reader
+   requires an equality or a finite list on the same integer or date grouping key, the producer can restrict
+   that key to the union of their values. The planner considers reader lists of up to nine values and
+   applies the combined list only when it also fits that limit. This bounds the comparisons per input row
+   before aggregation. Each reader still applies its own filter. The restriction can pass
+   through a distinct union into each input, and through safe computations to a scan. A checked aggregate
+   retains its input. For narrow exact addition or subtraction, bounds from every scan part can prove that
+   both operands, including a nullable join input with a `COALESCE` fallback, fit throughout evaluation.
+   For a single-key inner join probing direct scan projections under `UNION ALL`, a grouped aggregate
+   can also move into the branches. Conditional sums with a build-side predicate and a narrow fact
+   measure first group each branch by its join key when the estimated partial count, bounded from the
+   footers, is at most one eighth of the probe rows. Conditions sharing a measure reuse one partial.
+   The ordinary join still applies its multiplicity and NULL semantics. Otherwise branch-local joins
+   and mergeable aggregates need a 20% estimated saving after duplicate builds, part tasks and both
+   levels of merging. The estimate credits at most four workers per branch and accounts for its largest
+   part. Both placements bound SUM magnitudes and screen their group-state workspace against the session
+   budget. Under a finite limit, an out-of-memory error releases the candidate and retries the original
+   plan once before returning any rows.
+   The logical optimizer can move a grouping-key equality through arithmetic that
+   is safe on every input row. For decimal addition and subtraction, it checks the bounds of
+   each scanned operand across every row group and requires the result type to have room for
+   rescaling and a carry. Ordinary floating-point arithmetic can pass the same check when
+   both operands can be evaluated and converted safely.
+   After pushing a grouping-key equality, the optimizer can build an inner join on the
+   filtered groups so a multi-part scan probes it and the next aggregate can group in parallel.
+   Every grouping key except the ordinary join key must be fixed. Exact scan bounds must cover
+   the grouped key range, and its maximum number of matchable groups must fit the configured
+   build-side ratio. The fixed-width values in a grouped row must fit within the width of the
+   scan columns needed for the final grouping, counting only the offset for a string. The
+   choice applies at every thread count to preserve the probe and accumulation order. A
+   finite memory limit keeps the previous build side for an OOM retry.
    Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
@@ -256,6 +287,9 @@ steps (only step 7 uses more than one thread):
    nested loop, [ADR 0040](adr/0040-nested-loop-joins.md)), made once per
    pipeline before the factory of its parts, and a probe of the other, in that input's part pipeline or over it; a
    malformed join (keys of two types, say) is `Invalid`.
+   For an inner join without a residual, a filter consisting of integer or DATE equalities on
+   the probe’s grouping keys can run on the completed groups before the join gathers build columns.
+   The build still runs first, and the aggregate evaluates the same input rows.
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
    error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns. The part
    pipelines run on the session's thread pool (`--threads`, `engine::SessionOptions::threads`), and so do the batches
@@ -443,7 +477,7 @@ the builds, outermost first and each after the builds its input probes, then the
 | `BuildsFirstOperator` | the sink of a part pipeline whose probes read builds | prepares the pipeline's builds (`exec::JoinBuild`: the `JoinTable` of a build input's parts, or of a drained operator's batches) at its first `Next`, outermost first and stopping after one that empties its join, then opens the sink and returns its batches; releases the builds once the sink's parts are done, or at `Close` |
 | `RowCountOperator` | `RowCount` | one BIGINT row from the table's exact row count |
 | `UnionAllOperator` | `UnionAll` | the batches of each input in input order, on the consumer's thread (an input that is a part pipeline runs its own parts); an input is opened when the previous one is exhausted and closed before the next one opens, so one input's resources at a time and none of an input a `Limit` never reaches; each batch rebuilt in the union's schema (input 0's names, nullable fields) with its selection kept, no row copied; the first failing input in order decides the error ([ADR 0036](adr/0036-union-all.md)) |
-| `SetOperationOperator` | `SetOperation` | one `GroupTable` keyed on every column, the inputs read in full in written order, one open at a time as in `UnionAllOperator`; the rows of a starter (an input that can bring a row into the result: `plan::SetStarters`) insert their groups, every other input's only look theirs up (`KeyTable::Lookup`) and add none; per group and input a presence bit, or a count where the formula reads one (`plan::SetCounted`), charged to the budget; after the last input the formula gives each group its copies, in chunks: under a DISTINCT root each kept group once with its keys as first seen among the starters, selected over the table's chunks; under an ALL root each group repeated by its copies with its normalized keys, in batches of at most 64Ki rows; the first failing input in order decides the error ([ADR 0039](adr/0039-set-operations.md)) |
+| `SetOperationOperator` | `SetOperation` | pure `UNION DISTINCT` hashes all columns and assigns each hash to a worker-owned index. Equal hashes compare full rows. Bounded windows compact the first occurrences in input order, and the indexes are released before the first output batch. Small inputs use one index. Mixed set operations use one `GroupTable` keyed on every column, the inputs read in full in written order, one open at a time as in `UnionAllOperator`; the rows of a starter (an input that can bring a row into the result: `plan::SetStarters`) insert their groups, every other input's only look theirs up (`KeyTable::Lookup`) and add none; per group and input a presence bit, or a count where the formula reads one (`plan::SetCounted`), charged to the budget; after the last input the formula gives each group its copies, in chunks: under a DISTINCT root each kept group once with its keys as first seen among the starters, selected over the table's chunks; under an ALL root each group repeated by its copies with its normalized keys, in batches of at most 64Ki rows; the first failing input in order decides the error ([ADR 0039](adr/0039-set-operations.md)) |
 
 For a rollup over a part pipeline, wide decimal SUM and AVG can reuse the finest groups when
 all intermediate sums fit in 38 digits. The exact scan row count bounds the number of inputs

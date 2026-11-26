@@ -168,6 +168,14 @@ struct WithInputsOfNode {
 
 }  // namespace
 
+bool IsIntegerOrDateEquality(const Predicate& predicate) {
+  return predicate.kind == Predicate::Kind::kCompare && predicate.op == CompareOp::kEq &&
+         predicate.column.has_value() && !predicate.other.has_value() &&
+         (IsInteger(predicate.column->type) || predicate.column->type == LogicalType::kDate) &&
+         predicate.constant.type == predicate.column->type &&
+         std::holds_alternative<Int128>(predicate.constant.value);
+}
+
 std::string EscapeText(std::string_view text, char quote) {
   std::string out;
   for (const char c : text) {
@@ -1734,6 +1742,18 @@ LogicalNodePtr Cloned(const LogicalNodePtr& node, std::map<ColumnId, ColumnId>& 
 LogicalNodePtr CloneWithFreshIds(const LogicalNodePtr& node, ColumnId& last_id) {
   std::map<ColumnId, ColumnId> renamed;
   return Cloned(node, renamed, last_id);
+}
+
+LogicalNodePtr ResolveSubtreePositions(const LogicalNodePtr& node, std::source_location location) {
+  if (node == nullptr) {
+    return nullptr;
+  }
+  Resolver resolver;
+  Resolver::Resolved root = resolver.Walk(node);
+  if (resolver.failure().has_value()) {
+    internal::CheckFailed(resolver.failure()->c_str(), location);
+  }
+  return root.node;
 }
 
 LogicalPlan ResolvePositions(const LogicalPlan& plan, std::source_location location) {

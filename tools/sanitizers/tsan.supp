@@ -10,3 +10,10 @@
 # library is reported as "unlock of an unlocked mutex". Races confined to our own code are still reported.
 race:libarrow.so
 race:libparquet.so
+
+# DuckDB 2.0.0 (conda-forge) is the test oracle. Linux TSan reports competing accesses across
+# DuckDB workers during Parquet I/O, scan state teardown and allocator initialization. The frames
+# vary between runs of pixi run tsan (https://github.com/ydb-campus/antb1/issues/271).
+# A race report matches if either access stack contains libduckdb.so, including mixed harness
+# and DuckDB stacks. Keep the library's synchronization interceptors active. Recheck on upgrade.
+race:libduckdb.so

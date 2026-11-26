@@ -57,6 +57,10 @@ namespace antb1::plan {
 // subquery's join and the placed aggregate stays above its partials, as their final step; a
 // hand-built plan whose root is Path 2's join itself would see the wider output. Rule 1 changes
 // the number of a UnionAll's inputs, and no node's output columns.
-arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options = {});
+// A new UNION ALL placement or grouped join build can keep extra buffers live. Under a finite
+// memory limit callers may request the plan before the change for a single OOM retry.
+// An empty fallback means no such retry is needed.
+arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options = {},
+                                    LogicalPlan* memory_fallback = nullptr);
 
 }  // namespace antb1::plan

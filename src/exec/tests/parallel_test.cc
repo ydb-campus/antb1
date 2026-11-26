@@ -47,6 +47,7 @@
 #include "../part_operators.h"
 #include "../part_pruning.h"
 #include "../part_scheduler.h"
+#include "../set_operation.h"
 #include "../variance.h"
 #include "exec_test_util.h"
 
@@ -870,6 +871,91 @@ TEST_F(PartOperatorsTest, LimitStopsSchedulingParts) {
   }
 }
 
+// Exercise the DISTINCT form with the same executor as UNION ALL. A short input supplies
+// the first spelling, then a larger input crosses the parallel threshold and repeats keys
+// within batches, across windows and across inputs.
+void CheckDistinctUnion(arrow::internal::Executor* executor) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::float64())});
+  constexpr int64_t kGroups = 40'000;
+  constexpr std::uint64_t kFirstNaN = 0x7ff800000000002aULL;
+  const auto batch = [&](int64_t start, int64_t length, bool first) {
+    std::vector<std::optional<int64_t>> keys;
+    std::vector<std::optional<double>> values;
+    const double zero = first ? -0.0 : 0.0;
+    const double nan =
+        first ? std::bit_cast<double>(kFirstNaN) : std::numeric_limits<double>::quiet_NaN();
+    for (int64_t i = start; i < start + length; ++i) {
+      const auto key = i % kGroups;
+      keys.push_back(key == 0 ? std::nullopt : std::optional(key));
+      values.emplace_back(key % 2 == 0 ? zero : nan);
+    }
+    return arrow::RecordBatch::Make(
+        schema, length,
+        {Int64s(keys), testing::ArrayOf<arrow::DoubleBuilder>(arrow::float64(), values)});
+  };
+  const auto prefix = batch(0, 4, true);
+  const auto rest = batch(0, 2 * kGroups, false);
+  const auto tail = batch(0, kGroups, true);
+  std::vector<std::unique_ptr<Operator>> sources;
+  sources.push_back(
+      std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = prefix}}));
+  sources.push_back(std::make_unique<testing::ScriptedSource>(
+      schema, std::vector<Batch>{{.data = rest}, {.data = rest}}));
+  sources.push_back(
+      std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = tail}}));
+  auto op = SetOperationOperator::Make(std::move(sources), {{0, 1}, {0, 1}, {0, 1}},
+                                       {LogicalType::kBigInt, LogicalType::kDouble},
+                                       {{.kind = plan::SetTermKind::kInput, .input = 0},
+                                        {.kind = plan::SetTermKind::kInput, .input = 1},
+                                        {.kind = plan::SetTermKind::kInput, .input = 2},
+                                        {.kind = plan::SetTermKind::kUnion, .operands = 3}});
+  ASSERT_TRUE(op.ok()) << op.status();
+  ProfileNode profile;
+  (*op)->set_profile(&profile);
+  MemoryBudget budget(std::nullopt);
+  ExecContext ctx{.pool = &budget,
+                  .executor = executor,
+                  .threads = executor == nullptr ? 1 : kThreads,
+                  .budget = &budget};
+  {
+    auto result = Drain(**op, ctx);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_EQ((*result)->num_rows(), kGroups);
+    int64_t row = 0;
+    for (int b = 0; b < (*result)->column(0)->num_chunks(); ++b) {
+      const auto& keys = static_cast<const arrow::Int64Array&>(*(*result)->column(0)->chunk(b));
+      const auto& values = static_cast<const arrow::DoubleArray&>(*(*result)->column(1)->chunk(b));
+      for (int64_t i = 0; i < keys.length(); ++i, ++row) {
+        ASSERT_EQ(keys.IsNull(i), row == 0);
+        if (row != 0) {
+          ASSERT_EQ(keys.Value(i), row);
+        }
+        const double zero = row < 4 ? -0.0 : 0.0;
+        const double nan =
+            row < 4 ? std::bit_cast<double>(kFirstNaN) : std::numeric_limits<double>::quiet_NaN();
+        const double expected = row % 2 == 0 ? zero : nan;
+        ASSERT_EQ(std::bit_cast<std::uint64_t>(values.Value(i)),
+                  std::bit_cast<std::uint64_t>(expected));
+      }
+    }
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+  const auto metrics = profile.metrics();
+  const auto lanes = std::ranges::find(metrics, "distinct_lanes", &ProfileMetric::name);
+  ASSERT_NE(lanes, metrics.end());
+  EXPECT_EQ(lanes->value, executor == nullptr ? 1 : kThreads);
+  MemoryBudget tiny(64 * 1024);
+  ctx.pool = &tiny;
+  ctx.budget = &tiny;
+  ASSERT_TRUE((*op)->Open(ctx).ok());
+  const auto failed = (*op)->Next();
+  ASSERT_TRUE(failed.status().IsOutOfMemory()) << failed.status();
+  EXPECT_EQ((*op)->Next().status(), failed.status());
+  EXPECT_TRUE((*op)->Close().ok());
+  EXPECT_EQ(tiny.bytes_allocated(), 0);
+}
+
 // A union runs its inputs one after another, each over its own parts (ADR 0036): every row of input
 // 0 in part order, then input 1's, on any number of threads. A LIMIT met in input 0 never scans a
 // part of input 1, and the first failing input decides the error.
@@ -901,6 +987,7 @@ TEST_F(PartOperatorsTest, UnionsKeepInputThenPartOrder) {
        {static_cast<arrow::internal::Executor*>(nullptr),
         static_cast<arrow::internal::Executor*>(pool.get())}) {
     SCOPED_TRACE(executor == nullptr ? "one thread" : "the pool");
+    CheckDistinctUnion(executor);
     const auto result = Run(PlanOf(union_of(Table(), Table()), 1), executor);
     ASSERT_TRUE(result.ok()) << result.status().ToString();
     EXPECT_EQ(Int64Column(**result), expected);

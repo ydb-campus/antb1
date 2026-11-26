@@ -253,6 +253,97 @@ TEST_F(SessionTest, GroupKeyPushdownKeepsJoinResidualErrors) {
   }
 }
 
+TEST_F(SessionTest, RegroupingHasTheSameMatchesWithEitherJoinBuild) {
+  const auto write = [&](std::string_view name, const std::shared_ptr<arrow::Table>& table,
+                         int64_t part_rows) {
+    const auto out = arrow::io::FileOutputStream::Open((dir_ / name).string()).ValueOrDie();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, part_rows).ok());
+    ASSERT_TRUE(out->Close().ok());
+  };
+  arrow::Int32Builder keys;
+  arrow::Int64Builder a;
+  arrow::Int64Builder b;
+  // Two dimension matches for 2, none for 3, and an ordinary join ignores NULL on either side.
+  for (const int k : {0, 1, 2, 2, 4, 5, 6, 7}) {
+    ASSERT_TRUE(keys.Append(k).ok());
+    ASSERT_TRUE(a.Append(k % 2).ok());
+    ASSERT_TRUE(b.Append(k % 3).ok());
+  }
+  ASSERT_TRUE(keys.AppendNull().ok());
+  ASSERT_TRUE(a.Append(0).ok());
+  ASSERT_TRUE(b.Append(0).ok());
+  ASSERT_NO_FATAL_FAILURE(
+      write("labels.parquet",
+            arrow::Table::Make(
+                arrow::schema({arrow::field("k", arrow::int32()), arrow::field("a", arrow::int64()),
+                               arrow::field("b", arrow::int64())}),
+                {keys.Finish().ValueOrDie(), a.Finish().ValueOrDie(), b.Finish().ValueOrDie()}),
+            3));
+  arrow::Int32Builder bucket;
+  arrow::DoubleBuilder value;
+  for (int i = 0; i < 480; ++i) {
+    ASSERT_TRUE((i % 19 == 0 ? keys.AppendNull() : keys.Append(i % 8)).ok());
+    ASSERT_TRUE(bucket.Append(i % 3).ok());
+    ASSERT_TRUE(value.Append(i % 5).ok());
+  }
+  ASSERT_NO_FATAL_FAILURE(write(
+      "readings.parquet",
+      arrow::Table::Make(
+          arrow::schema({arrow::field("k", arrow::int32()), arrow::field("bucket", arrow::int32()),
+                         arrow::field("v", arrow::float64())}),
+          {keys.Finish().ValueOrDie(), bucket.Finish().ValueOrDie(), value.Finish().ValueOrDie()}),
+      60));
+  constexpr std::string_view kSql =
+      "SELECT a,b,bucket,n FROM (SELECT a,b,bucket,SUM(v) AS n FROM readings JOIN labels "
+      "ON readings.k=labels.k GROUP BY a,b,bucket) g WHERE bucket=2 ORDER BY a,b";
+  QueryResult reference;
+  for (const int ratio : {200, 100}) {
+    auto session = Session::Make({.build_side_ratio = ratio}).ValueOrDie();
+    ASSERT_TRUE(session->RegisterParquet("labels", {(dir_ / "labels.parquet").string()}).ok());
+    ASSERT_TRUE(session->RegisterParquet("readings", {(dir_ / "readings.parquet").string()}).ok());
+    const auto plan = session->ExplainPhysical(kSql);
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    EXPECT_EQ(plan->contains("PartGroupAggregate GroupAggregate keys=[labels.a"), ratio == 100)
+        << *plan;
+    const auto result = session->Execute(kSql);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_GT(result->table->num_rows(), 0);
+    if (reference.table == nullptr) {
+      reference = *result;
+    } else {
+      EXPECT_TRUE(reference.table->Equals(*result->table));
+    }
+  }
+}
+
+TEST_F(SessionTest, GroupKeyFilterPreservesOverflowInDiscardedDecimalRows) {
+  // The second row fits the physical INT32 but exceeds its declared precision. Doubling
+  // it overflows DECIMAL(5,1), even though the consumer only wants the first group.
+  auto session = Session::Make().ValueOrDie();
+  const auto type = arrow::decimal128(4, 1);
+  arrow::Decimal128Builder amounts(type);
+  arrow::Int32Builder keys;
+  ASSERT_TRUE(keys.AppendValues({1, 2}).ok());
+  ASSERT_TRUE(amounts.Append(arrow::Decimal128(10)).ok());
+  ASSERT_TRUE(amounts.Append(arrow::Decimal128(60000)).ok());
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("k", arrow::int32()), arrow::field("v", type)}),
+      {keys.Finish().ValueOrDie(), amounts.Finish().ValueOrDie()});
+  const auto path = (dir_ / "amounts.parquet").string();
+  const auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  parquet::WriterProperties::Builder props;
+  props.enable_store_decimal_as_integer();
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1, props.build()).ok());
+  ASSERT_TRUE(out->Close().ok());
+  ASSERT_TRUE(session->RegisterParquet("samples", {path}).ok());
+  const auto result = session->Execute(
+      "SELECT n FROM (SELECT k, MAX((v + v) / 3) AS n FROM samples GROUP BY k) g WHERE k = 1");
+  EXPECT_TRUE(result.status().IsExecutionError()) << result.status();
+  EXPECT_NE(result.status().ToString().find("Overflow"), std::string::npos) << result.status();
+}
+
 TEST_F(SessionTest, GroupKeyInferenceDoesNotSkipFailingSourceComputations) {
   auto session = Session::Make().ValueOrDie();
   const auto write = [&](const std::string& name, int64_t key, int64_t rows) {
@@ -955,6 +1046,57 @@ TEST_F(SessionTest, ThreadsDoNotChangeResults) {
 
 // The memory limit: a query that needs more fails with OutOfMemory; one that fits gives the same
 // result as without a limit; a result keeps its memory valid after the session is gone.
+TEST_F(SessionTest, ConditionalPreaggregationRetriesWithLessAvailableMemory) {
+  const auto facts = (dir_ / "facts.parquet").string();
+  arrow::Int16Builder keys;
+  arrow::Int64Builder amounts;
+  for (int i = 0; i < 32768; ++i) {
+    ASSERT_TRUE(keys.Append(static_cast<int16_t>(i % 1024)).ok());
+    ASSERT_TRUE(amounts.Append(i % 5).ok());
+  }
+  const auto table =
+      arrow::Table::Make(arrow::schema({arrow::field("keycol", arrow::int16()),
+                                        arrow::field("amount", arrow::int64())}),
+                         {keys.Finish().ValueOrDie(), amounts.Finish().ValueOrDie()});
+  const auto file = arrow::io::FileOutputStream::Open(facts).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), file, 4096).ok());
+  ASSERT_TRUE(file->Close().ok());
+  constexpr int64_t kLimit = int64_t{16} * 1024 * 1024;
+  auto session = Session::Make({.batch_size = 256, .memory_limit = kLimit}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("labels", {path_}).ok());
+  ASSERT_TRUE(session->RegisterParquet("facts", {facts}).ok());
+
+  const auto query = [](std::string_view measure) {
+    return std::format(
+        "SELECT d.EventDate, SUM(CASE WHEN d.AdvEngineID>0 THEN {} END) AS total "
+        "FROM (SELECT keycol,amount FROM facts UNION ALL SELECT keycol,amount "
+        "FROM facts) f JOIN labels d ON d.AdvEngineID=f.keycol GROUP BY d.EventDate",
+        measure);
+  };
+  // Negating twice on this small fixture computes the same answer and keeps the original plan.
+  const auto control = session->Execute(query("-(-f.amount)"));
+  ASSERT_TRUE(control.ok()) << control.status();
+  const auto optimized = session->ExplainAnalyze(query("f.amount"));
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  constexpr int64_t kSlack = 8192;
+  ASSERT_GT(optimized->peak_memory,
+            control->peak_memory + kSlack + control->memory->bytes_allocated());
+  // The planner sees the session limit. Outstanding Arrow buffers reduce the headroom to that
+  // of the original plan. Execute and ExplainAnalyze must both succeed on their second attempt.
+  const int64_t hold = kLimit - control->memory->bytes_allocated() - control->peak_memory - kSlack;
+  ASSERT_GT(hold, 0);
+  const auto held = arrow::AllocateBuffer(hold, control->memory.get());
+  ASSERT_TRUE(held.ok()) << held.status();
+  {
+    const auto actual = session->Execute(query("f.amount"));
+    ASSERT_TRUE(actual.ok()) << actual.status();
+    EXPECT_TRUE(actual->table->Equals(*control->table));
+  }
+  const auto profile = session->ExplainAnalyze(query("f.amount"));
+  ASSERT_TRUE(profile.ok()) << profile.status();
+  EXPECT_EQ(profile->rows, control->table->num_rows());
+}
+
 TEST_F(SessionTest, MemoryLimit) {
   for (const int64_t limit : {int64_t{0}, int64_t{-5}}) {
     SessionOptions options;

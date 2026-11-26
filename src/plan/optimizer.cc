@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <format>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -15,14 +17,20 @@
 #include <variant>
 #include <vector>
 
+#include <arrow/type.h>
+
 #include "antb1/common/check.h"
+#include "antb1/common/int128.h"
 #include "antb1/common/narrow.h"
+#include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/sql_status.h"
 
 #include "aggregate_placement.h"
 #include "arithmetic_rewrite.h"
+#include "join_order.h"
+#include "union_aggregate.h"
 #include "union_branches.h"
 #include "unnesting.h"
 
@@ -56,25 +64,14 @@ LogicalNodePtr MapInputs(const LogicalNodePtr& node, const F& f) {
   return changed ? WithInputs(*node, std::move(inputs)) : node;
 }
 
-// Equality conditions on grouping keys can filter the input before it is grouped. Carry the
-// same restriction to an equijoin's other input where every match must satisfy it too. Only
-// integer-valued equality is moved here: no expression is inverted and no cast is approximated.
-bool KeyEquality(const Predicate& predicate) {
-  return predicate.kind == Predicate::Kind::kCompare && predicate.op == CompareOp::kEq &&
-         predicate.column.has_value() && !predicate.other.has_value() &&
-         (IsInteger(predicate.column->type) || predicate.column->type == LogicalType::kDate) &&
-         predicate.constant.type == predicate.column->type &&
-         std::holds_alternative<Int128>(predicate.constant.value);
-}
-
 bool SameEquality(const Predicate& a, const Predicate& b) {
-  return KeyEquality(a) && KeyEquality(b) && a.column.has_value() && b.column.has_value() &&
-         a.column->id == b.column->id && a.constant.type == b.constant.type &&
-         a.constant.value == b.constant.value;
+  return IsIntegerOrDateEquality(a) && IsIntegerOrDateEquality(b) && a.column.has_value() &&
+         b.column.has_value() && a.column->id == b.column->id &&
+         a.constant.type == b.constant.type && a.constant.value == b.constant.value;
 }
 
 std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predicate& predicate) {
-  ANTB1_CHECK(predicate.column.has_value());  // called only for a KeyEquality
+  ANTB1_CHECK(predicate.column.has_value());  // the equality reads a column
   const auto at = std::ranges::find(project.ids, predicate.column->id);
   if (at == project.ids.end()) {
     return std::nullopt;
@@ -89,8 +86,171 @@ std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predic
   return below;
 }
 
+// A filter can discard rows before a Compute only if every expression it skips is total.
+// Cache exact footer ranges by physical field so multiple consumers of a table pay once.
+class ComputeSafety {
+ public:
+  bool for_shared_producer = false;
+
+  bool Arithmetic(const Expr& expr, const LogicalNodePtr& input) {
+    const auto* op = std::get_if<ArithExpr>(&expr.node);
+    if (op == nullptr || op->left == nullptr || op->right == nullptr) {
+      return false;
+    }
+    if (for_shared_producer && NarrowExact(expr.type) &&
+        (op->op == ArithOp::kAdd || op->op == ArithOp::kSubtract)) {
+      const auto left = OperandBounds(*op->left, input, expr.type);
+      const auto right = OperandBounds(*op->right, input, expr.type);
+      if (left && right) {
+        const auto limit = RangeOf(expr.type);
+        // Operands fit in int64 at the result scale. The intermediate bounds fit in Int128.
+        const bool add = op->op == ArithOp::kAdd;
+        return (add ? left->min + right->min : left->min - right->max) >= limit.min &&
+               (add ? left->max + right->max : left->max - right->min) <= limit.max;
+      }
+    }
+    if (expr.type == LogicalType::kDecimal &&
+        (op->op == ArithOp::kAdd || op->op == ArithOp::kSubtract)) {
+      // At the result scale each operand fits with a spare integral digit for the carry.
+      // This also proves that rescaling either operand cannot fail before the operation.
+      const auto fits = [&](const ExprPtr& arg) {
+        return arg->type == LogicalType::kDecimal && arg->type.scale() <= expr.type.scale() &&
+               arg->type.width() - arg->type.scale() < expr.type.width() - expr.type.scale() &&
+               DecimalFits(*arg, input);
+      };
+      return fits(op->left) && fits(op->right);
+    }
+    if (expr.type != LogicalType::kDouble ||
+        (op->op != ArithOp::kAdd && op->op != ArithOp::kSubtract && op->op != ArithOp::kMultiply &&
+         op->op != ArithOp::kDivide)) {
+      return false;
+    }
+    // These operands convert to DOUBLE without a value error. Its four kernels use IEEE
+    // arithmetic, including ordinary division by zero. Integer division and modulo differ.
+    const auto total = [&](const ExprPtr& arg) {
+      const LogicalType type = arg->type;
+      return (type == LogicalType::kDouble || type == LogicalType::kDecimal ||
+              type == LogicalType::kSmallInt || type == LogicalType::kUSmallInt ||
+              type == LogicalType::kInteger) &&
+             (std::holds_alternative<ColumnExpr>(arg->node) ||
+              std::holds_alternative<ConstantExpr>(arg->node) || Arithmetic(*arg, input));
+    };
+    return total(op->left) && total(op->right);
+  }
+
+  const ColumnRange* RangeFor(const LogicalNodePtr& node, ColumnId id) {
+    if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+      return RangeFor(filter->input, id);
+    }
+    if (const auto* join = std::get_if<JoinNode>(node.get());
+        join != nullptr && (join->kind == JoinKind::kInner ||
+                            (for_shared_producer && join->kind == JoinKind::kLeft))) {
+      const ColumnRange* left = RangeFor(join->left, id);
+      return left != nullptr ? left : RangeFor(join->right, id);
+    }
+    const auto* scan = std::get_if<ScanNode>(node.get());
+    if (scan == nullptr || scan->table == nullptr || scan->ids.size() != scan->fields.size()) {
+      return nullptr;
+    }
+    const auto at = std::ranges::find(scan->ids, id);
+    if (at == scan->ids.end()) {
+      return nullptr;
+    }
+    const int field = scan->fields[Narrow<std::size_t>(at - scan->ids.begin())];
+    auto [it, inserted] = ranges_.try_emplace({scan->table.get(), field});
+    if (inserted) {
+      it->second = ColumnRangeOf(*scan->table, field);
+    }
+    return &it->second;
+  }
+
+ private:
+  static bool NarrowExact(LogicalType type) {
+    return (IsInteger(type) && type != LogicalType::kHugeInt) ||
+           (type == LogicalType::kDecimal && type.width() <= LogicalType::kMaxNarrowDecimalWidth);
+  }
+
+  // Bounds include every possible non-NULL operand, including the fallback of a COALESCE on
+  // the nullable side of a join. Check the source precision before any implicit conversion.
+  std::optional<IntegerRange> OperandBounds(const Expr& expr, const LogicalNodePtr& input,
+                                            LogicalType target) {
+    if (!NarrowExact(expr.type) || !NarrowExact(target) || expr.type.scale() > target.scale()) {
+      return std::nullopt;
+    }
+    IntegerRange bounds;
+    if (const auto* col = std::get_if<ColumnExpr>(&expr.node)) {
+      const ColumnRange* range = RangeFor(input, col->id);
+      if (range == nullptr || !range->exact) {
+        return std::nullopt;
+      }
+      if (range->non_null > 0) {
+        if (!range->min.has_value() || !range->max.has_value()) {
+          return std::nullopt;
+        }
+        bounds = {.min = *range->min, .max = *range->max};
+      }
+    } else if (const auto* constant = std::get_if<ConstantExpr>(&expr.node)) {
+      const auto* value = std::get_if<Int128>(&constant->value.value);
+      if (value == nullptr || constant->value.type != expr.type) {
+        return std::nullopt;
+      }
+      bounds = {.min = *value, .max = *value};
+    } else if (const auto* arms = std::get_if<CaseExpr>(&expr.node);
+               arms != nullptr && arms->thens.size() == arms->whens.size() &&
+               std::ranges::all_of(arms->whens, [](const ExprPtr& when) { return !when; })) {
+      const auto include = [&](const ExprPtr& arm) {
+        if (arm == nullptr) {
+          return false;  // a COALESCE arm must have a value
+        }
+        const auto value = OperandBounds(*arm, input, expr.type);
+        if (!value.has_value()) {
+          return false;
+        }
+        bounds.min = std::min(bounds.min, value->min);
+        bounds.max = std::max(bounds.max, value->max);
+        return true;
+      };
+      if (!std::ranges::all_of(arms->thens, include) ||
+          (arms->otherwise != nullptr && !include(arms->otherwise))) {
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
+    const auto source = RangeOf(expr.type);
+    if (bounds.min < source.min || bounds.max > source.max) {
+      return std::nullopt;
+    }
+    const Int128 factor = PowerOfTen(target.scale() - expr.type.scale());
+    bounds.min *= factor;
+    bounds.max *= factor;
+    const auto allowed = RangeOf(target);
+    return bounds.min >= allowed.min && bounds.max <= allowed.max ? std::optional{bounds}
+                                                                  : std::nullopt;
+  }
+
+  bool DecimalFits(const Expr& expr, const LogicalNodePtr& input) {
+    const IntegerRange allowed = RangeOf(expr.type);
+    if (const auto* col = std::get_if<ColumnExpr>(&expr.node)) {
+      const ColumnRange* range = col->id == kNoColumnId ? nullptr : RangeFor(input, col->id);
+      return range != nullptr && range->exact &&
+             (range->non_null == 0 || (range->min.has_value() && range->max.has_value() &&
+                                       *range->min >= allowed.min && *range->max <= allowed.max));
+    }
+    if (const auto* literal = std::get_if<ConstantExpr>(&expr.node)) {
+      const auto* value = std::get_if<Int128>(&literal->value.value);
+      return value != nullptr && *value >= allowed.min && *value <= allowed.max;
+    }
+    return Arithmetic(expr, input);
+  }
+
+  std::map<std::pair<const Table*, int>, ColumnRange> ranges_;
+};
+
 struct PushdownState {
   std::set<const LogicalNode*> preserve;
+  ComputeSafety compute_safety;
+  std::set<ColumnId> pushed_group_keys;
   // A checked aggregate or an entire UNION ALL input can fail on rows an early filter removes.
   // An inferred filter can depend on other consumers, so preserve the trial for this pass.
   bool keep_filtered_plan = false;
@@ -106,12 +266,15 @@ struct GroupEqualities {
   bool safe = false;
 };
 
-GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node);
+// Read footer bounds when placing an actual restriction. Speculative collection of facts
+// on every join keeps the cheaper column/literal test.
+GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node, ComputeSafety* safety = nullptr);
 
-bool OnlyColumnsAndConstants(const ComputeNode& compute) {
-  return std::ranges::all_of(compute.exprs, [](const ExprPtr& expr) {
+bool CanSkipCompute(const ComputeNode& compute, ComputeSafety* safety) {
+  return std::ranges::all_of(compute.exprs, [&](const ExprPtr& expr) {
     return std::holds_alternative<ColumnExpr>(expr->node) ||
-           std::holds_alternative<ConstantExpr>(expr->node);
+           std::holds_alternative<ConstantExpr>(expr->node) ||
+           (safety != nullptr && safety->Arithmetic(*expr, compute.input));
   });
 }
 
@@ -127,18 +290,18 @@ bool CanFailOnGroup(const AggregateCall& call) {
          (call.kind == AggKind::kAvg && type == LogicalType::kDate);
 }
 
-LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predicate,
-                            PushdownState& state) {
+LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predicate,
+                             PushdownState& state) {
   if (state.preserve.contains(node.get())) {
     return Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
   }
-  ANTB1_CHECK(predicate.column.has_value());  // KeyEquality or its remapped copy
+  ANTB1_CHECK(predicate.column.has_value());  // the equality or its remapped copy
   if (const auto* filter = std::get_if<FilterNode>(node.get())) {
     if (std::ranges::any_of(filter->predicates,
                             [&](const Predicate& p) { return SameEquality(p, predicate); })) {
       return node;
     }
-    LogicalNodePtr below = PushEquality(filter->input, predicate, state);
+    LogicalNodePtr below = PushKeyFilter(filter->input, predicate, state);
     if (const auto* placed = std::get_if<FilterNode>(below.get());
         placed != nullptr && placed->input == filter->input) {
       FilterNode out = *filter;
@@ -149,30 +312,38 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
   }
   if (const auto* project = std::get_if<ProjectNode>(node.get())) {
     if (const auto below = ThroughProject(*project, predicate)) {
-      return WithInputs(*node, {PushEquality(project->input, *below, state)});
+      return WithInputs(*node, {PushKeyFilter(project->input, *below, state)});
     }
   }
   if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
     const auto at = std::ranges::find(group->key_ids, predicate.column->id);
     if (at != group->key_ids.end()) {
       if (std::ranges::any_of(group->aggregates, CanFailOnGroup)) {
+        if (state.compute_safety.for_shared_producer) {
+          return Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
+        }
         state.keep_filtered_plan = true;
       }
       Predicate below = predicate;
       below.column = group->keys[Narrow<std::size_t>(at - group->key_ids.begin())];
-      return WithInputs(*node, {PushEquality(group->input, below, state)});
+      auto pushed = PushKeyFilter(group->input, below, state);
+      if (pushed != group->input) {
+        state.pushed_group_keys.insert(predicate.column->id);
+      }
+      return WithInputs(*node, {std::move(pushed)});
     }
   }
   // Do not move a filter ahead of expressions which may fail, or through a computed key.
   if (const auto* compute = std::get_if<ComputeNode>(node.get());
       compute != nullptr &&
       std::ranges::find(compute->ids, predicate.column->id) == compute->ids.end() &&
-      OnlyColumnsAndConstants(*compute)) {
-    return WithInputs(*node, {PushEquality(compute->input, predicate, state)});
+      CanSkipCompute(*compute, &state.compute_safety)) {
+    return WithInputs(*node, {PushKeyFilter(compute->input, predicate, state)});
   }
   if (const auto* join = std::get_if<JoinNode>(node.get());
-      join != nullptr && join->residual.empty() && KnownGroupEqualities(join->left).safe &&
-      KnownGroupEqualities(join->right).safe) {
+      join != nullptr && join->residual.empty() &&
+      KnownGroupEqualities(join->left, &state.compute_safety).safe &&
+      KnownGroupEqualities(join->right, &state.compute_safety).safe) {
     const auto left_ids = OutputIds(*join->left);
     const auto right_ids = OutputIds(*join->right);
     const bool left = std::ranges::find(left_ids, predicate.column->id) != left_ids.end();
@@ -182,7 +353,7 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
         (right && join->kind == JoinKind::kInner)) {
       JoinNode out = *join;
       auto& input = left ? out.left : out.right;
-      input = PushEquality(input, predicate, state);
+      input = PushKeyFilter(input, predicate, state);
       for (const JoinKey& key : join->keys) {
         const BoundColumn& source = left ? key.left : key.right;
         const BoundColumn& target = left ? key.right : key.left;
@@ -190,7 +361,7 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
           Predicate inferred = predicate;
           inferred.column = target;
           auto& other = left ? out.right : out.left;
-          other = PushEquality(other, inferred, state);
+          other = PushKeyFilter(other, inferred, state);
         }
       }
       return Make(std::move(out));
@@ -198,6 +369,30 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
   }
   LogicalNodePtr placed =
       Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
+  if (state.compute_safety.for_shared_producer) {
+    const auto distribute = [&](const auto& set) {
+      const auto key = std::ranges::find(set.ids, predicate.column->id);
+      if (key == set.ids.end()) {
+        return placed;
+      }
+      std::vector<LogicalNodePtr> inputs;
+      for (std::size_t i = 0; i < set.inputs.size(); ++i) {
+        Predicate branch = predicate;
+        branch.column = set.columns[i][Narrow<std::size_t>(key - set.ids.begin())];
+        inputs.push_back(PushKeyFilter(set.inputs[i], branch, state));
+      }
+      return WithInputs(*node, std::move(inputs));
+    };
+    if (const auto* set = std::get_if<SetOperationNode>(node.get());
+        set != nullptr && std::ranges::all_of(set->formula, [](const SetTerm& term) {
+          return term.kind == SetTermKind::kInput || term.kind == SetTermKind::kUnion;
+        })) {
+      return distribute(*set);
+    }
+    if (const auto* set = std::get_if<UnionAllNode>(node.get())) {
+      return distribute(*set);
+    }
+  }
   if (std::holds_alternative<UnionAllNode>(*node)) {
     // A new condition above UNION ALL must reach its branches in this Optimize, too. Their
     // projections or aggregates may then admit it farther down. FALSE filters are left alone.
@@ -211,21 +406,21 @@ LogicalNodePtr PushEquality(const LogicalNodePtr& node, const Predicate& predica
 // Conditions true for every returned row, expressed in this node's output ids. `grouped`
 // restricts cross-input inference to grouped relations, whose predicates the binder cannot
 // route into their already-bound bodies. A nullable side contributes no guaranteed equality.
-GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
+GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node, ComputeSafety* safety) {
   if (const auto* filter = std::get_if<FilterNode>(node.get())) {
-    GroupEqualities out = KnownGroupEqualities(filter->input);
+    GroupEqualities out = KnownGroupEqualities(filter->input, safety);
     if (!out.safe) {
       return out;
     }
     for (const Predicate& predicate : filter->predicates) {
-      if (KeyEquality(predicate)) {
+      if (IsIntegerOrDateEquality(predicate)) {
         out.values.push_back(predicate);
       }
     }
     return out;
   }
   if (const auto* project = std::get_if<ProjectNode>(node.get())) {
-    GroupEqualities out = KnownGroupEqualities(project->input);
+    GroupEqualities out = KnownGroupEqualities(project->input, safety);
     if (!out.safe) {
       return out;
     }
@@ -235,7 +430,7 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
         continue;
       }
       for (const Predicate& predicate : out.values) {
-        ANTB1_CHECK(predicate.column.has_value());  // every recorded fact is a KeyEquality
+        ANTB1_CHECK(predicate.column.has_value());  // every recorded fact is a column equality
         if (predicate.column->id == project->columns[i].id) {
           Predicate above = predicate;
           BoundColumn column = *predicate.column;
@@ -251,11 +446,11 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
   if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
     // An inferred key can empty the opposite build, skipping this aggregate entirely, or
     // remove one of its failing groups when this is the target. A consumer's own filter
-    // can still cross a checked group in PushEquality.
+    // can still cross a checked group in PushKeyFilter.
     if (std::ranges::any_of(group->aggregates, CanFailOnGroup)) {
       return {};
     }
-    GroupEqualities out = KnownGroupEqualities(group->input);
+    GroupEqualities out = KnownGroupEqualities(group->input, safety);
     if (!out.safe) {
       return out;
     }
@@ -277,14 +472,14 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node) {
   // Inferred conditions can empty the opposite build and prevent this input from opening at
   // all. Therefore collecting facts observes the same expression-error barriers as moving them.
   if (const auto* compute = std::get_if<ComputeNode>(node.get());
-      compute != nullptr && OnlyColumnsAndConstants(*compute)) {
-    return KnownGroupEqualities(compute->input);
+      compute != nullptr && CanSkipCompute(*compute, safety)) {
+    return KnownGroupEqualities(compute->input, safety);
   }
   if (const auto* join = std::get_if<JoinNode>(node.get());
       join != nullptr && join->residual.empty() &&
       (join->kind == JoinKind::kLeft || join->kind == JoinKind::kInner)) {
-    GroupEqualities left = KnownGroupEqualities(join->left);
-    GroupEqualities right = KnownGroupEqualities(join->right);
+    GroupEqualities left = KnownGroupEqualities(join->left, safety);
+    GroupEqualities right = KnownGroupEqualities(join->right, safety);
     if (!left.safe || !right.safe) {
       return {};
     }
@@ -311,8 +506,8 @@ LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState&
     LogicalNodePtr below = filter->input;
     std::vector<Predicate> kept;
     for (const Predicate& predicate : filter->predicates) {
-      if (KeyEquality(predicate)) {
-        LogicalNodePtr pushed = PushEquality(below, predicate, state);
+      if (IsIntegerOrDateEquality(predicate)) {
+        LogicalNodePtr pushed = PushKeyFilter(below, predicate, state);
         const auto* placed = std::get_if<FilterNode>(pushed.get());
         // Keep the original predicate order and filter span when nothing moved. In particular,
         // ordinary scan filters and repeated EXISTS checks need no rewrite here.
@@ -355,7 +550,7 @@ LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState&
             Predicate inferred = predicate;
             inferred.column = target;
             auto& input = from_left ? out.right : out.left;
-            input = PushEquality(input, inferred, state);
+            input = PushKeyFilter(input, inferred, state);
           }
         }
       }
@@ -367,6 +562,106 @@ LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState&
     return out.left == join->left && out.right == join->right ? current : Make(std::move(out));
   }
   return current;
+}
+
+// Compare the fixed-width grouped build with the columns the scan must retain for the
+// grouping above the join. A string costs at least its 32-bit offset, even when empty.
+bool GroupedBuildIsNarrower(const GroupAggregateNode& grouped, const GroupAggregateNode& parent,
+                            const ScanNode& scan) {
+  int64_t group_bits = 0;
+  const auto add = [&](LogicalType type) {
+    const int bits = ToArrow(type)->bit_width();
+    group_bits += std::max(bits, 0);
+    return bits > 0;
+  };
+  for (const auto& key : grouped.keys) {
+    if (!add(key.type)) {
+      return false;
+    }
+  }
+  for (const auto& call : grouped.aggregates) {
+    if (!add(call.type)) {
+      return false;
+    }
+  }
+  int64_t scan_bits = 0;
+  for (const auto& key : parent.keys) {
+    if (std::ranges::contains(scan.ids, key.id)) {
+      scan_bits += key.type == LogicalType::kVarchar ? 32 : ToArrow(key.type)->bit_width();
+    }
+  }
+  return group_bits <= scan_bits;
+}
+
+// A grouped probe ends the scan pipeline, so its parent aggregate runs serially. Once
+// filters fix every grouping key except the join key, at most one group can match each
+// non-NULL value of that key. An ordinary inner join never indexes the NULL group.
+LogicalNodePtr PreferGroupedBuild(const LogicalNodePtr& node, PushdownState& state, int64_t ratio) {
+  auto current = MapInputs(
+      node, [&](const LogicalNodePtr& input) { return PreferGroupedBuild(input, state, ratio); });
+  const auto* parent = std::get_if<GroupAggregateNode>(current.get());
+  const auto* join = parent == nullptr ? nullptr : std::get_if<JoinNode>(parent->input.get());
+  if (join == nullptr || join->kind != JoinKind::kInner || !join->residual.empty() ||
+      join->keys.size() != 1 || join->keys.front().null_equal ||
+      std::ranges::any_of(parent->aggregates, CanFailOnGroup)) {
+    return current;
+  }
+  const bool left = join->build == BuildSide::kLeft;
+  const auto& build = left ? join->left : join->right;
+  const auto& probe = left ? join->right : join->left;
+  const auto* scan = std::get_if<ScanNode>(build.get());
+  const auto* group = std::get_if<GroupAggregateNode>(probe.get());
+  if (scan == nullptr || scan->table == nullptr || scan->table->num_parts() < 2 ||
+      group == nullptr || group->keys.size() < 2 || group->keys.size() != group->key_ids.size() ||
+      std::ranges::none_of(group->key_ids,
+                           [&](ColumnId id) { return state.pushed_group_keys.contains(id); }) ||
+      !GroupedBuildIsNarrower(*group, *parent, *scan)) {
+    return current;
+  }
+  const auto& key = join->keys.front();
+  const auto& scan_key = left ? key.left : key.right;
+  const auto& group_key = left ? key.right : key.left;
+  const auto at = std::ranges::find(group->key_ids, group_key.id);
+  if (at == group->key_ids.end() || group_key.id == kNoColumnId || scan_key.id == kNoColumnId ||
+      scan_key.type != group_key.type ||
+      (!IsInteger(group_key.type) && group_key.type != LogicalType::kDate) ||
+      group_key.type == LogicalType::kHugeInt) {
+    return current;
+  }
+  const auto facts = KnownGroupEqualities(probe, &state.compute_safety);
+  if (!facts.safe || !std::ranges::all_of(group->key_ids, [&](ColumnId id) {
+        return id == group_key.id || std::ranges::any_of(facts.values, [&](const Predicate& p) {
+                 return p.column.has_value() && p.column->id == id;
+               });
+      })) {
+    return current;
+  }
+  const auto id = group->keys[Narrow<std::size_t>(at - group->key_ids.begin())].id;
+  auto input = group->input;
+  while (const auto* compute = std::get_if<ComputeNode>(input.get())) {
+    if (std::ranges::contains(compute->ids, id)) {
+      return current;
+    }
+    input = compute->input;
+  }
+  const auto* domain = state.compute_safety.RangeFor(input, id);
+  const auto* indexed = state.compute_safety.RangeFor(build, scan_key.id);
+  if (domain == nullptr || !domain->exact || !domain->min.has_value() || !domain->max.has_value() ||
+      indexed == nullptr || !indexed->exact || !indexed->min.has_value() ||
+      !indexed->max.has_value() || indexed->non_null <= 0 || *indexed->min > *domain->min ||
+      *indexed->max < *domain->max || *domain->min < std::numeric_limits<int64_t>::min() ||
+      *domain->max > std::numeric_limits<int64_t>::max()) {
+    return current;
+  }
+  // Keep a scan build whose range could prune any of the grouped keys. Inside that range
+  // the join indexes at most one row per key; the remaining keys of the group are constant.
+  const Int128 groups = std::min<Int128>((*domain->max - *domain->min) + 1, domain->non_null);
+  if (groups <= 0 || (groups * ratio) > (Int128{indexed->non_null} * 100)) {
+    return current;
+  }
+  JoinNode changed = *join;
+  changed.build = left ? BuildSide::kRight : BuildSide::kLeft;
+  return WithInputs(*current, {Make(std::move(changed))});
 }
 
 // ---- rule 1: COUNT(*) without WHERE -> RowCount ----
@@ -866,8 +1161,7 @@ bool StillShared(const ReusableAggregate& before, const ReusableAggregate& after
 // those producers as boundaries, so the consumer's restriction stays above the shared result.
 template <class Rewrite>
 LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstimates& estimates,
-                                        const Rewrite& rewrite) {
-  PushdownState state;
+                                        PushdownState& state, const Rewrite& rewrite) {
   LogicalNodePtr next = rewrite(state);
   if (next == root || state.keep_filtered_plan) {
     return next;
@@ -904,7 +1198,19 @@ LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstim
 
 }  // namespace
 
-arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options) {
+LogicalNodePtr SharedConsumerFilters::PushGroupKey(const LogicalNodePtr& producer,
+                                                   const Predicate& predicate) {
+  PushdownState state;
+  state.compute_safety.for_shared_producer = true;
+  auto filtered = PushKeyFilter(producer, predicate, state);
+  return state.pushed_group_keys.empty() ? producer : ResolveSubtreePositions(filtered);
+}
+
+arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options,
+                                    LogicalPlan* memory_fallback) {
+  if (memory_fallback != nullptr) {
+    *memory_fallback = {};
+  }
   if (plan.root == nullptr) {
     return plan;
   }
@@ -919,8 +1225,10 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   // the aggregated side no longer has to carry.
   const ColumnId last = MaxColumnId(*root);
   SharingEstimates estimates;
-  root = PreserveSharedAggregates(root, estimates, [&](const PushdownState& state) {
-    ColumnId last_exchanged = last;
+  ColumnId last_exchanged = last;
+  PushdownState exchange_state;
+  root = PreserveSharedAggregates(root, estimates, exchange_state, [&](const PushdownState& state) {
+    last_exchanged = last;
     return ExchangeAggregates(root, last_exchanged, state.preserve);
   });
   // Integer arithmetic as DuckDB computes it (rule 6): after every rule that reads expressions, so
@@ -932,13 +1240,35 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   // After limits, projections and unused computations reach their final shape: otherwise a
   // second Optimize could move a predicate farther than the first. Refresh pruning afterwards:
   // new filters and changed join inputs need their own needed_above sets for scan pushdown.
-  root = PreserveSharedAggregates(
-      root, estimates, [&](PushdownState& state) { return PushGroupKeyEqualities(root, state); });
-  root = Prune(root, Needed(output.begin(), output.end()));
+  PushdownState filters;
+  const auto pushed = PreserveSharedAggregates(root, estimates, filters, [&](PushdownState& state) {
+    state.pushed_group_keys.clear();  // each sharing trial starts from the original tree
+    return PushGroupKeyEqualities(root, state);
+  });
+  const bool reconsider_groups = pushed != root && !filters.pushed_group_keys.empty();
+  root = Prune(pushed, Needed(output.begin(), output.end()));
   // A dependent join that Unnest left behind is a bug in the pass, never an unsupported query: no
   // SqlErrorDetail, so it exits 70 and cannot pass for a refusal (ADR 0005, ADR 0023).
   if (FirstDependentJoin(root) != nullptr) {
     return arrow::Status::NotImplemented("the unnesting pass left a dependent join in the plan");
+  }
+  PushdownState union_state;
+  const auto rewritten =
+      PreserveSharedAggregates(root, estimates, union_state, [&](const PushdownState& state) {
+        ColumnId last_union = last_exchanged;
+        return RewriteUnionAggregates(root, options, last_union, state.preserve);
+      });
+  // Both alternatives may need an OOM retry. Give an admitted UNION placement its original
+  // fallback. Otherwise reconsider only groups that gained a restriction in this pass.
+  auto candidate = rewritten;
+  if (candidate == root && reconsider_groups) {
+    candidate = PreferGroupedBuild(root, filters, options.build_side_ratio);
+  }
+  if (candidate != root) {
+    if (memory_fallback != nullptr && options.memory_limit.has_value()) {
+      *memory_fallback = ResolvePositions({.root = root, .output = plan.output});
+    }
+    root = Prune(candidate, Needed(output.begin(), output.end()));
   }
   return ResolvePositions({.root = std::move(root), .output = plan.output});
 }

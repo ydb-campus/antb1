@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/plan/explain.h"
+#include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/shared_sub_plans.h"
 
@@ -1066,6 +1067,196 @@ const T* Find(const LogicalNodePtr& node) {
     }
   }
   return nullptr;
+}
+
+TEST(OptimizerTest, GroupKeyCrossesDecimalComputeOnlyWithBoundsForEveryPart) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int16()), arrow::field("x", arrow::decimal128(4, 1)),
+                     arrow::field("y", arrow::decimal128(5, 2))});
+  const PartStats bounded{.min = -9999, .max = 9999, .null_count = 0, .rows = 2};
+  const PartStats nulls{.min = std::nullopt, .max = std::nullopt, .null_count = 2, .rows = 2};
+  const std::vector<std::pair<std::optional<PartStats>, bool>> cases{
+      {bounded, true},
+      {nulls, true},
+      {std::nullopt, false},
+      {PartStats{.min = -10000, .max = 1, .rows = 2}, false},
+      {PartStats{.min = 0, .max = 10000, .rows = 2}, false}};
+  for (const auto& [last, proven] : cases) {
+    auto catalog = MakeCatalog();
+    auto table = std::make_shared<testing::FakeTable>(schema, 4);
+    table->WithParts({2, 2}).WithStats(0, 1, bounded).WithStats(0, 2, bounded);
+    table->WithStats(1, 2, nulls);
+    if (last.has_value()) {
+      table->WithStats(1, 1, *last);
+    }
+    ASSERT_TRUE(catalog.Register("samples", table).ok());
+    const auto bound = BindSql(
+        "SELECT v FROM (SELECT t.i32 AS bucket, SUM(((x - y) + x) / 3) AS v "
+        "FROM samples JOIN t ON samples.k = t.i16 GROUP BY t.i32) g WHERE bucket = 5",
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    // The equality on the dimension is distinct from the join key. It can reach its scan
+    // only by crossing the computed aggregate argument and the join.
+    const auto* filter = Find<FilterNode>(plan.root);
+    ASSERT_NE(filter, nullptr) << Explain(plan);
+    const auto* scan = std::get_if<ScanNode>(filter->input.get());
+    EXPECT_EQ(scan != nullptr, proven) << Explain(plan);
+    if (scan != nullptr) {
+      EXPECT_EQ(scan->table_name, "t");
+    }
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+    EXPECT_EQ(Explain(Optimized(plan)), Explain(plan));
+  }
+}
+
+TEST(OptimizerTest, GroupKeyStaysAboveCappedDecimalAndRemainder) {
+  auto catalog = MakeCatalog();
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int16()), arrow::field("x", arrow::decimal128(38, 1))});
+  auto table = std::make_shared<testing::FakeTable>(schema, 2);
+  table->WithStats(0, 1, {.min = 0, .max = RangeOf(LogicalType::Decimal(38, 1)).max, .rows = 2});
+  ASSERT_TRUE(catalog.Register("samples", table).ok());
+  for (const char* expression : {"(x + x) / 3", "(x % x) / 3"}) {
+    SCOPED_TRACE(expression);
+    const auto bound = BindSql(
+        std::format("SELECT v FROM (SELECT k, MAX({}) AS v FROM samples GROUP BY k) g WHERE k = 5",
+                    expression),
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    const auto* filter = Find<FilterNode>(plan.root);
+    ASSERT_NE(filter, nullptr) << Explain(plan);
+    EXPECT_TRUE(std::holds_alternative<ComputeNode>(*filter->input)) << Explain(plan);
+  }
+}
+
+TEST(OptimizerTest, SharedKeyReachesEachUnionScanOnlyPastSafeArithmetic) {
+  for (const auto last : std::vector<std::optional<int32_t>>{std::nullopt, 0, INT32_MIN}) {
+    SCOPED_TRACE(::testing::PrintToString(last));
+    Catalog catalog;
+    auto facts = std::make_shared<testing::FakeTable>(
+        arrow::schema({arrow::field("k", arrow::int32()), arrow::field("v", arrow::int32())}),
+        20'000'000);
+    auto adjustments = std::make_shared<testing::FakeTable>(
+        arrow::schema({arrow::field("k", arrow::int32()), arrow::field("delta", arrow::int32())}),
+        2);
+    facts->WithStats(0, 1, {.min = 1, .max = 12, .rows = 20'000'000});
+    adjustments->WithParts({1, 1}).WithStats(0, 1, {.min = -3, .max = 3, .rows = 1});
+    if (last.has_value()) {
+      adjustments->WithStats(1, 1, {.min = *last, .max = *last, .rows = 1});
+    }
+    ASSERT_TRUE(catalog.Register("facts", facts).ok());
+    ASSERT_TRUE(catalog.Register("adj", adjustments).ok());
+    const auto bound = BindSql(
+        "WITH g AS (SELECT k, MAX(x) AS n FROM "
+        "(SELECT f.k, f.v-COALESCE(adj.delta,0) AS x FROM facts f LEFT JOIN adj ON f.k=adj.k "
+        "UNION SELECT k,v AS x FROM facts) u GROUP BY k) "
+        "SELECT a.k,b.k FROM g a JOIN g b ON a.n=b.n WHERE a.k IN (1,3) AND b.k IN (3,8)",
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    const auto groups = SharedSubPlans(plan);
+    ASSERT_FALSE(groups.empty());
+    const auto producer = SharedConsumerFilters(plan).Producer(groups.front());
+    const auto* set = Find<SetOperationNode>(producer);
+    ASSERT_NE(set, nullptr);
+    ASSERT_EQ(set->inputs.size(), 2U);
+    for (std::size_t i = 0; i < set->inputs.size(); ++i) {
+      const auto* filter = Find<FilterNode>(set->inputs[i]);
+      ASSERT_NE(filter, nullptr);
+      EXPECT_EQ(std::holds_alternative<ScanNode>(*filter->input), i == 1 || last == 0);
+      ASSERT_EQ(filter->predicates.size(), 1U);
+      const auto& combined = filter->predicates.front();
+      ASSERT_EQ(combined.kind, Predicate::Kind::kIn);
+      ASSERT_EQ(combined.values.size(), 3U);
+      EXPECT_EQ(std::get<Int128>(combined.values[0].value), 1);
+      EXPECT_EQ(std::get<Int128>(combined.values[1].value), 3);
+      EXPECT_EQ(std::get<Int128>(combined.values[2].value), 8);
+    }
+  }
+}
+
+TEST(OptimizerTest, ReconsidersFilteredGroupsForAParallelJoinProbe) {
+  constexpr int64_t kLabels = 4096;
+  constexpr int64_t kPart = kLabels / 2;
+  constexpr int64_t kReadings = 4 * kLabels;
+  struct Scenario {
+    bool multipart = true;
+    bool complete = true;
+    int64_t fact_max = kLabels - 1;
+    int threads = 4;
+    int64_t ratio = 100;
+    bool filtered = true;
+    bool wide_sum = false;
+  };
+  const auto run = [&](Scenario sample, bool expect_flip) {
+    SCOPED_TRACE(std::format("parts={} complete={} max={} threads={} ratio={} filtered={} wide={}",
+                             sample.multipart, sample.complete, sample.fact_max, sample.threads,
+                             sample.ratio, sample.filtered, sample.wide_sum));
+    Catalog catalog;
+    auto readings = std::make_shared<testing::FakeTable>(
+        arrow::schema(
+            {arrow::field("k", arrow::int32()), arrow::field("bucket", arrow::int32()),
+             arrow::field("v", sample.wide_sum ? arrow::decimal128(26, 2) : arrow::float64())}),
+        kReadings);
+    readings->WithStats(0, 0,
+                        {.min = 0, .max = sample.fact_max, .null_count = 1, .rows = kReadings});
+    readings->WithStats(0, 1, {.min = 0, .max = 6, .rows = kReadings});
+    auto labels = std::make_shared<testing::FakeTable>(
+        arrow::schema({arrow::field("k", arrow::int32()), arrow::field("a", arrow::binary()),
+                       arrow::field("b", arrow::binary()), arrow::field("c", arrow::binary()),
+                       arrow::field("d", arrow::binary())}),
+        kLabels);
+    if (sample.multipart) {
+      labels->WithParts({kPart, kPart})
+          .WithStats(0, 0, {.min = 0, .max = kPart - 1, .rows = kPart});
+      if (sample.complete) {
+        labels->WithStats(1, 0, {.min = kPart, .max = kLabels - 1, .rows = kPart});
+      }
+    } else {
+      labels->WithStats(0, 0, {.min = 0, .max = kLabels - 1, .rows = kLabels});
+    }
+    ASSERT_TRUE(catalog.Register("readings", readings).ok());
+    ASSERT_TRUE(catalog.Register("labels", labels).ok());
+    const std::string sql =
+        "SELECT a,b,c,d,bucket,n FROM (SELECT a,b,c,d,bucket,SUM(v) AS n "
+        "FROM readings JOIN labels ON readings.k=labels.k "
+        "GROUP BY a,b,c,d,bucket) g";
+    const auto bound = BindSql(sql + (sample.filtered ? " WHERE bucket=2" : ""), catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const BindOptions options{.build_side_ratio = sample.ratio,
+                              .threads = sample.threads,
+                              .memory_limit = 64 * 1024 * 1024};
+    LogicalPlan fallback;
+    const auto result = Optimize(*bound, options, &fallback);
+    ASSERT_TRUE(result.ok()) << result.status();
+    const auto* join = Find<JoinNode>(result->root);
+    ASSERT_NE(join, nullptr) << Explain(*result);
+    const auto& build = join->build == BuildSide::kLeft ? join->left : join->right;
+    EXPECT_EQ(std::holds_alternative<GroupAggregateNode>(*build), expect_flip) << Explain(*result);
+    EXPECT_EQ(fallback.root != nullptr, expect_flip);
+    EXPECT_EQ(PositionMismatch(*result), std::nullopt);
+    if (fallback.root != nullptr) {
+      const auto* previous = Find<JoinNode>(fallback.root);
+      ASSERT_NE(previous, nullptr);
+      const auto& old_build =
+          previous->build == BuildSide::kLeft ? previous->left : previous->right;
+      EXPECT_TRUE(std::holds_alternative<ScanNode>(*old_build)) << Explain(fallback);
+      EXPECT_EQ(PositionMismatch(fallback), std::nullopt);
+    }
+    const auto again = Optimize(*result, options);
+    ASSERT_TRUE(again.ok()) << again.status();
+    EXPECT_EQ(Explain(*again), Explain(*result));
+  };
+  run({}, true);              // one matchable group per scan key
+  run({.threads = 1}, true);  // preserve probe and accumulation order
+  run({.multipart = false}, false);
+  run({.complete = false}, false);    // missing bounds in one scan part
+  run({.fact_max = kLabels}, false);  // the old scan build can prune a grouped key
+  run({.ratio = 200}, false);
+  run({.filtered = false}, false);  // another grouping key still varies
+  run({.wide_sum = true}, false);   // changing accumulation order could hide overflow
 }
 
 const JoinNode& JoinBelowProject(const LogicalPlan& plan) {

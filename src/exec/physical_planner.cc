@@ -14,6 +14,7 @@
 
 #include <arrow/api.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/compute.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
@@ -159,19 +160,57 @@ const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node,
   return nullptr;
 }
 
+// Filter completed groups before gathering the matching build rows. Keep the build untouched:
+// an empty build must still skip the probe, and every group the probe evaluates may still fail.
+// A residual must see all the original matches. Move the entire conjunction to preserve the
+// evaluation order of any other predicates.
+plan::LogicalNodePtr FilterGroupedProbe(const plan::FilterNode& filter) {
+  const auto* join = std::get_if<plan::JoinNode>(filter.input.get());
+  if (join == nullptr || join->kind != plan::JoinKind::kInner || !join->residual.empty() ||
+      filter.predicates.empty()) {
+    return nullptr;
+  }
+  const bool build_left = join->build == plan::BuildSide::kLeft;
+  const auto& probe = build_left ? join->right : join->left;
+  const auto* group = std::get_if<plan::GroupAggregateNode>(probe.get());
+  if (group == nullptr || group->key_ids.empty() || join->left == nullptr) {
+    return nullptr;
+  }
+  const std::size_t offset = build_left ? plan::OutputIds(*join->left).size() : 0;
+  std::vector<plan::Predicate> predicates = filter.predicates;
+  for (plan::Predicate& predicate : predicates) {
+    if (!plan::IsIntegerOrDateEquality(predicate) || !predicate.column.has_value() ||
+        predicate.column->id == plan::kNoColumnId) {
+      return nullptr;
+    }
+    // The join outputs its left columns first. Verify the resolved slot and its id before
+    // rebasing it onto the probe, including for callers that supply their own physical input.
+    const auto slot = TryNarrow<std::size_t>(predicate.column->index);
+    if (!slot.has_value() || *slot < offset || *slot - offset >= group->key_ids.size() ||
+        group->key_ids[*slot - offset] != predicate.column->id) {
+      return nullptr;
+    }
+    predicate.column->index = Narrow<int>(*slot - offset);
+  }
+  plan::JoinNode out = *join;
+  (build_left ? out.right : out.left) = std::make_shared<const plan::LogicalNode>(
+      plan::FilterNode{.input = probe, .predicates = std::move(predicates), .span = filter.span});
+  return std::make_shared<const plan::LogicalNode>(std::move(out));
+}
+
 // Resolve the existing semi/anti fallback before a consumer asks PipelineScan about its input.
 // Otherwise that consumer sees a left-building sink, chooses a serial implementation, and only
 // later discovers that Build turned the join into a streaming right build. Resolve children first:
 // a child falling back can restore the probe pipeline of its parent too. Shared producers are
 // normalized separately from the substituted consumer tree, after sharing has chosen its scans.
-plan::LogicalNodePtr NormalizeBuildSides(const plan::LogicalNodePtr& node) {
+plan::LogicalNodePtr PreparePhysicalJoins(const plan::LogicalNodePtr& node) {
   if (node == nullptr) {
     return node;
   }
   std::vector<plan::LogicalNodePtr> inputs = plan::InputsOf(*node);
   bool changed = false;
   for (auto& input : inputs) {
-    auto normalized = NormalizeBuildSides(input);
+    auto normalized = PreparePhysicalJoins(input);
     changed = changed || normalized != input;
     input = std::move(normalized);
   }
@@ -183,6 +222,11 @@ plan::LogicalNodePtr NormalizeBuildSides(const plan::LogicalNodePtr& node) {
     plan::JoinNode right = *join;
     right.build = plan::BuildSide::kRight;
     return std::make_shared<const plan::LogicalNode>(std::move(right));
+  }
+  if (const auto* filter = std::get_if<plan::FilterNode>(current.get())) {
+    if (auto pushed = FilterGroupedProbe(*filter)) {
+      return pushed;
+    }
   }
   return current;
 }
@@ -1796,9 +1840,14 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   // sees a DAG -- the sharing lives entirely in a shared_ptr<Table> that ScanNode already holds.
   std::vector<SharedBuild> shared;
   std::unordered_map<const plan::LogicalNode*, plan::LogicalNodePtr> replacements;
+  std::optional<plan::SharedConsumerFilters> consumer_filters;
   for (const plan::SharedSubPlan& group : plan::MaterializableSubPlans(plan)) {
-    const plan::LogicalNodePtr& widest = group.members[group.widest];
-    auto make_producer = [node = NormalizeBuildSides(widest)] { return Build(node); };
+    if (!consumer_filters.has_value()) {
+      consumer_filters.emplace(plan);
+    }
+    auto make_producer = [node = PreparePhysicalJoins(consumer_filters->Producer(group))] {
+      return Build(node);
+    };
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, make_producer());
     auto table = std::make_shared<MaterializedTable>(op->output_schema());
     for (std::size_t i = 0; i < group.members.size(); ++i) {
@@ -1820,7 +1869,7 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   }
 
   const plan::LogicalNodePtr root_node =
-      NormalizeBuildSides(replacements.empty() ? plan.root : Substituted(plan.root, replacements));
+      PreparePhysicalJoins(replacements.empty() ? plan.root : Substituted(plan.root, replacements));
   ARROW_ASSIGN_OR_RAISE(auto root, Build(root_node, std::nullopt, profile));
   if (std::cmp_not_equal(root->output_schema()->num_fields(), plan.output.size())) {
     return arrow::Status::Invalid("the physical plan has ", root->output_schema()->num_fields(),
@@ -1831,7 +1880,7 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   }
   auto builds = std::make_unique<SharedBuildsOperator>(
       std::move(root), std::move(shared), [original = plan.root](ProfileNode* fallback_profile) {
-        return Build(NormalizeBuildSides(original), std::nullopt, fallback_profile);
+        return Build(PreparePhysicalJoins(original), std::nullopt, fallback_profile);
       });
   // Profiled into the root's own node, so the shared results' time and rows are visible without
   // the profile tree changing shape. The sub-plans themselves are unprofiled: a reader sees what
