@@ -153,8 +153,8 @@ which ADR 0037 completes with phase 9; it answers general SQL that DuckDB answer
 | SQ16 | Grouping sets that mix `()` with other sets inside a correlated block, which is static and multi-row at once, with GROUPING()'s empty value | SQ4b, SQ6 |
 | SQ17 | Correlated values in an aggregate's FILTER clause and in window arguments, read with the empty values | phase 9; FILTER itself |
 
-The ids follow the order in which the maintainer listed the items. They name items; they are not a build order (an
-open decision).
+The table lists the items and their dependencies. The [phase 10 update](#phase-10-build-order-and-benchmarks)
+sets their build order.
 
 **3. Full DuckDB coverage after phase 10.** The shapes DuckDB answers that no phase covers follow phase 10, listed
 without ids until they are planned, each exit 4 until then:
@@ -649,8 +649,6 @@ enclosing HAVING or select list, DuckDB answers it, which antb1 does from SQ13 o
 
 Questions the maintainer has not ruled on. Each is decided by a dated update before the item it concerns:
 
-- **Phase 10's build order.** The ids of decision 2 name items; the order follows their needs and is set when phase 10
-  is planned, with ADR 0037's Plan.
 - **A size guard for a keyless D (SQ9).** The design discussion proposed refusing a keyless D over large inputs, which
   would leave relational division at scale refused; ADR 0040 rejected output-size guards for cross products.
 - **When this ADR is accepted**, after SQ8 or after phase 10, and whether ADR 0037's closing items wait for phase 10.
@@ -1225,6 +1223,34 @@ reads a column, in any block. No query completes, the ratchet stays at 82, and n
   then declines it (a COUNT-valued key, or a key computed next to a value key); constant folding in the proof
   (`COUNT(*) + 1 > 1` stays LEFT); a select alias of the enclosing block read inside a correlated subquery, a bind
   error where DuckDB answers, as in any block.
+
+## Phase 10 build order and benchmarks
+
+Update (2026-11-26). The [roadmap](0037-tpcds-roadmap.md#plan) lists the items in implementation order.
+
+1. **SQ9, the domain D.** Start with a correlated aggregate that has an equality key and a second outer column
+   used in an inequality. Keep substitution as the first choice. When an outer column has no inner equivalent,
+   use decision 18's duplicate-free domain and NULL-equal join back. Check that duplicate outer rows survive and
+   that empty inputs give zero for COUNT and NULL for SUM. Decide the open size-guard question before enabling the
+   keyless domain product. Exercise it with the existing inequality-only MIN case and check plan growth with
+   nested dependent joins. SQ15 covers the set-operation rules needed for relational division through EXCEPT.
+2. **SQ4b, the scalar single join.** Its phase 8 prerequisites are in place. Implement and test its cardinality
+   check independently of SQ9. For each probed binding, zero passing rows give NULL, one gives its value, and a
+   second raises the scalar-subquery error.
+3. **SQ10, SQ11, SQ12, then SQ13.** Extend substitution to more expressions, add keyless semi, anti and mark joins,
+   then handle three-valued membership per binding. SQ13 remaps outer references above grouping.
+4. **SQ15, then SQ16.** Apply SQ9 to correlated set-operation arms. Then use SQ4b and SQ6 for correlated grouping
+   sets that mix the empty grouping set with other sets.
+5. **SQ14, then SQ17.** Per-binding LIMIT and OFFSET use W5's partitioned ROW_NUMBER. Correlated FILTER and window
+   arguments follow the window core and W10b's window FILTER support.
+
+**Benchmark every existing query whose plan changes.** For each implementation step, including parts of one item,
+compare the logical and physical EXPLAIN plans of already supported queries against the revision immediately before
+that step. Include the workload suites and existing regression queries. If either plan changes, benchmark that
+query on both revisions with the same host, build configuration, data, thread count and cache conditions. Repeat
+the runs and report each affected query's identifier, before/after median elapsed time and peak memory in the PR,
+following the repository's data policy. Fix any repeatable performance regression and rerun the affected benchmark
+before merging.
 
 ## Consequences
 
