@@ -55,29 +55,20 @@ void MaterializedTable::Reset(MemoryBudget* budget) {
   memory_.Reset(budget);
 }
 
-arrow::Status MaterializedTable::Append(std::shared_ptr<arrow::RecordBatch> batch) {
-  if (batch == nullptr) {
-    return arrow::Status::OK();
-  }
+arrow::Result<bool> MaterializedTable::TryAppend(std::shared_ptr<arrow::RecordBatch> batch) {
   const std::scoped_lock lock(mutex_);
-  const int64_t bytes = memory_.bytes() + BytesOf(*batch);
-  if (bytes > kMaxBytes) {
-    // Named, so that a reader of the failure knows which mechanism caused it and that turning it
-    // off is a possibility. Sharing cannot be abandoned here -- the consumers are already built to
-    // scan this table and have no sub-plan left to recompute from -- so a result past the cap is a
-    // failure rather than a fallback, which is the honest cost of deciding to share before the size
-    // is knowable.
-    return arrow::Status::OutOfMemory(
-        "a shared sub-plan produced more than ", kMaxBytes,
-        " bytes, which is the most one is held for (docs/adr/0030-shared-sub-plans.md)");
+  const int64_t bytes = BytesOf(*batch);
+  if (bytes > kMaxBytes - memory_.bytes()) {
+    return false;
   }
-  // Absolute, as MemoryReservation::Resize is: the running total plus this batch. A refusal leaves
-  // the reservation and the rows as they were (ADR 0026: memory is what broke this workload
-  // before).
-  ARROW_RETURN_NOT_OK(memory_.Resize(bytes));
-  rows_ += batch->num_rows();
+  const arrow::Status reserved = memory_.Resize(memory_.bytes() + bytes);
+  if (reserved.IsOutOfMemory()) {
+    return false;
+  }
+  ARROW_RETURN_NOT_OK(reserved);
   batches_.push_back(std::move(batch));
-  return arrow::Status::OK();
+  rows_ += batches_.back()->num_rows();
+  return true;
 }
 
 void MaterializedTable::Release() {

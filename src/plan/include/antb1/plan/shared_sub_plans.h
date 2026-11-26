@@ -86,12 +86,14 @@ class SharedConsumerFilters {
 // sharing, and a dependent join cannot reach here (plan::Optimize removes every one). Refusing is
 // always safe: it reports less.
 //
-// A UnionAll is compared like any node, its inputs in order, since its rows come in that order: a
-// union repeated whole -- a CTE referenced twice -- is one group when it has a key, which exec
-// declines to materialise (WorthSharing). **Nothing under a union is ever a member** (ADR 0036),
-// whatever its copies hold and in whatever order, so a union's branches are never shared one by one
-// either. A group above a union -- an aggregation of it, repeated -- is found as any other.
+// A repeated UnionAll is keyed by its inputs in order. The structural report stops at unions and
+// set operations and reports outermost matches regardless of their cost. Physical materialization
+// visits their branches and continues past matches that are ineligible.
 std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan);
+
+// The physical planner's non-overlapping, worthwhile producers, including compound queries
+// and candidates inside their branches. It leaves the logical EXPLAIN's structural groups alone.
+std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan);
 
 // The cap used for both the plan-time estimate and the bytes held at execution.
 inline constexpr int64_t kMaxSharedResultBytes = int64_t{256} * 1024 * 1024;

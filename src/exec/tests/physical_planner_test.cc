@@ -1835,6 +1835,33 @@ TEST_F(PhysicalPlannerTest, MalformedUnionsAreInvalidNotUnsupported) {
   }
 }
 
+TEST_F(PhysicalPlannerTest, RepeatedUnionsRejectAScanWithoutATable) {
+  const auto large = Table();
+  large->set_claimed_rows(20'000'000);
+  const auto branch = [&](std::uint32_t id, const std::shared_ptr<MemoryTable>& table) {
+    const plan::BoundColumn column{.id = plan::ColumnId{id}, .type = LogicalType::kBigInt};
+    const auto scan = Node(
+        plan::ScanNode{.table = table, .table_name = "small", .fields = {0}, .ids = {column.id}});
+    const auto input = Node(plan::ScanNode{
+        .table = large, .table_name = "large", .fields = {0}, .ids = {plan::ColumnId{id + 1}}});
+    const plan::BoundColumn count{.id = plan::ColumnId{id + 2}, .type = LogicalType::kBigInt};
+    const auto aggregate = Node(plan::AggregateNode{
+        .input = input, .aggregates = {{.kind = plan::AggKind::kCountStar, .id = count.id}}});
+    return Node(plan::UnionAllNode{.inputs = {scan, aggregate},
+                                   .columns = {{column}, {count}},
+                                   .ids = {plan::ColumnId{id + 3}}});
+  };
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  // Even when the first member is valid and worth holding, it cannot replace a malformed copy.
+  for (const auto& first : {std::shared_ptr<MemoryTable>{}, Table()}) {
+    const auto root = Node(plan::UnionAllNode{.inputs = {branch(1, first), branch(10, nullptr)},
+                                              .columns = {{x}, {x}}});
+    const auto status = BuildPhysicalPlan(PlanOf(root)).status();
+    ASSERT_TRUE(status.IsInvalid()) << status.ToString();
+    EXPECT_EQ(status.message(), "scan without a table");
+  }
+}
+
 // A set operation (docs/adr/0039-set-operations.md) over two scans, one of them filtered: each
 // input planned on its own, as a union's, its parts read on the consumer's thread. Table()'s x
 // minus Repeated()'s, and the ALL form's copies; a malformed formula is Invalid, a bug.

@@ -38,8 +38,8 @@ class MaterializedTable final : public plan::Table {
 
   // Charges what it holds to `budget` from now on (nullptr: no budget).
   void Reset(MemoryBudget* budget);
-  // Appends `batch`, charging its bytes. Called on one thread, before any consumer scans.
-  arrow::Status Append(std::shared_ptr<arrow::RecordBatch> batch);
+  // False if retaining the batch would exceed the cap or the query budget.
+  [[nodiscard]] arrow::Result<bool> TryAppend(std::shared_ptr<arrow::RecordBatch> batch);
   // Says the rows are all here. Until this, a scan is an error rather than an empty answer, and
   // exact_row_count() is unknown rather than zero.
   void Finish();

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -143,6 +144,26 @@ TEST(SharedSubPlansTest, GroupsEveryMemberTogether) {
                    "SELECT COUNT(*) FROM g AS a, g AS b, g AS c "
                    "WHERE a.k = b.k AND b.k = c.k"),
             (std::vector<std::string>{"Project 3x1"}));
+}
+
+TEST(SharedSubPlansTest, CostsARepeatedIntersectionAgainstItsFullInput) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto small = std::make_shared<testing::FakeTable>(schema, 11'000'000);
+  for (const int64_t large_rows : {int64_t{100'000'000}, std::numeric_limits<int64_t>::max()}) {
+    SCOPED_TRACE(large_rows);
+    Catalog catalog;
+    ASSERT_TRUE(catalog.Register("s", small).ok());
+    ASSERT_TRUE(
+        catalog.Register("l", std::make_shared<testing::FakeTable>(schema, large_rows)).ok());
+    const auto bound = BindSql(
+        "WITH common_keys AS (SELECT k FROM s INTERSECT SELECT k FROM l) "
+        "SELECT a.k FROM common_keys AS a JOIN common_keys AS b ON a.k = b.k",
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto groups = MaterializableSubPlans(Optimized(*bound));
+    ASSERT_EQ(groups.size(), 1U) << "the 11-million-row bound fits for one BIGINT column";
+    EXPECT_EQ(groups.front().members.size(), 2U);
+  }
 }
 
 TEST(SharedSubPlansTest, CostsTheJointDomainOfFilteredGroupingKeys) {
@@ -368,10 +389,8 @@ LogicalPlan JoinOfUnions(bool swapped, bool sorted = false) {
   return ResolvePositions(LogicalPlan{.root = join, .output = std::move(output)});
 }
 
-// A union repeated whole is one group, headed by the union, which exec declines to hold
-// (WorthSharing); nothing under it is a member, so the aggregate-topped branches are never
-// reported on their own. Held one by one, a branch of that shape can outgrow
-// MaterializedTable::kMaxBytes at large scale and fail the query instead of answering it.
+// The structural report groups the repeated union as a whole. Its physical eligibility is
+// decided separately by MaterializableSubPlans.
 TEST(SharedSubPlansTest, AUnionRepeatedWholeIsOneGroupAndItsBranchesAreNotShared) {
   EXPECT_EQ(GroupsOf(JoinOfUnions(/*swapped=*/false)), (std::vector<std::string>{"UnionAll 2x2"}));
 }
@@ -418,9 +437,7 @@ LogicalPlan JoinOf(LogicalNodePtr left, LogicalNodePtr right, ColumnId left_key,
 }
 
 // A union pruned to one branch stays a union, so two references of a CTE that keep the same branch
-// are one group headed by the union, which exec declines to hold, and their aggregate-topped
-// branch is no member: before ADR 0037's PF5 gives the cap a fallback, holding it could fail the
-// query at a large scale factor.
+// are still reported as one group headed by the union.
 TEST(SharedSubPlansTest, AUnionOfOneInputIsStillTheGroupsHead) {
   EXPECT_EQ(
       GroupsOf(JoinOf(UnionOfOneGroup(100), UnionOfOneGroup(200), ColumnId{120}, ColumnId{220})),
@@ -499,6 +516,32 @@ TEST(SharedSubPlansTest, ACopyUnderAUnionReportsNoNestedGroup) {
   }
   const LogicalNodePtr root = JoinedOnFirst(JoinedOnFirst(g(100), g(200)), Node(std::move(u)));
   EXPECT_EQ(GroupsOf(PlanOf(root)), (std::vector<std::string>{"GroupAggregate 2x2"}));
+}
+
+TEST(SharedSubPlansTest, SharesTheUncoveredCopiesOfANestedAggregate) {
+  const auto table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 20'000'000);
+  const auto count = [](LogicalNodePtr input, std::uint32_t id) {
+    return Node(AggregateNode{
+        .input = std::move(input),
+        .aggregates = {AggregateCall{.kind = AggKind::kCountStar, .id = ColumnId{id}}},
+        .span = {}});
+  };
+  const auto inner = [&](std::uint32_t id) {
+    return count(
+        Node(ScanNode{
+            .table = table, .table_name = "t", .fields = {2}, .ids = {ColumnId{id}}, .span = {}}),
+        id + 1);
+  };
+  const std::vector outer = {count(inner(10), 12), count(inner(20), 22)};
+  const std::vector outside = {inner(30), inner(40)};
+  const auto root =
+      JoinedOnFirst(JoinedOnFirst(outer[0], outer[1]), JoinedOnFirst(outside[0], outside[1]));
+
+  const auto groups = MaterializableSubPlans({.root = root, .output = {}});
+  ASSERT_EQ(groups.size(), 2U);
+  EXPECT_EQ(groups[0].members, outer);
+  EXPECT_EQ(groups[1].members, outside);
+  EXPECT_EQ(groups[1].columns, (std::vector<std::vector<int>>{{0}, {0}}));
 }
 
 // A group above a union is found as any other: an aggregation of a union, repeated, is one group

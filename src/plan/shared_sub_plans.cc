@@ -6,12 +6,14 @@
 #include <format>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -364,6 +366,9 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
       [&origins, &node](const auto& n) -> std::optional<std::string> {
         using T = std::decay_t<decltype(n)>;
         if constexpr (std::is_same_v<T, ScanNode>) {
+          if (n.table == nullptr) {
+            return std::nullopt;  // sharing a valid member must not mask a malformed scan
+          }
           return std::format("scan({})", n.table_name);
         } else if constexpr (std::is_same_v<T, FilterNode>) {
           std::string key = "filter(";
@@ -526,7 +531,8 @@ int64_t FieldUnion(const std::vector<LogicalNodePtr>& members) {
 }
 
 // ADR 0030: below this threshold, rescanning costs less than materializing a result and scanning
-// it twice. Unknown input row counts decline sharing. Saturate known totals at the threshold.
+// it twice. Unknown input row counts decline sharing. Keep the total to compare it with the
+// output of a compound candidate, saturating only when it exceeds the representable row count.
 constexpr int64_t kMinSharedRows = 10'000'000;
 
 std::optional<int64_t> InputRows(const LogicalNode& node) {
@@ -539,7 +545,7 @@ std::optional<int64_t> InputRows(const LogicalNode& node) {
     if (!child.has_value()) {
       return std::nullopt;
     }
-    rows += std::min(kMinSharedRows - rows, *child);
+    rows += std::clamp(*child, int64_t{0}, std::numeric_limits<int64_t>::max() - rows);
   }
   return rows;
 }
@@ -725,6 +731,9 @@ bool FitsSharedResult(const AggregateSize& size, int64_t columns, int& remaining
 // outputs are possible in principle (two scans reading {0,1} and {1,2}) and are reported as nothing
 // rather than as a group a consumer could not read.
 std::optional<SharedSubPlan> GroupOf(std::vector<LogicalNodePtr> members, const Origins& origins) {
+  if (members.size() < 2) {
+    return std::nullopt;
+  }
   // Each member's output columns as origin ordinals and paths inside the member: two columns match
   // when they come from the same place by the same way, which is the only sense in which the
   // members' outputs can be compared -- their ColumnIds are minted per reference and never equal,
@@ -886,19 +895,122 @@ bool WorthSharing(const SharedSubPlan& group) {
   return WorthSharing(group, remaining);
 }
 
-std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
+namespace {
+
+// A DISTINCT set whose entire key is constrained by an inner join can match each scan row at
+// most once. Bound the resulting dimension keys by the dimension's own row count.
+std::optional<int64_t> SetJoinRows(const JoinNode& join, const LogicalNode& set_input,
+                                   const LogicalNode& scan_input, bool set_on_left) {
+  const auto* set = std::get_if<SetOperationNode>(&set_input);
+  const auto* scan = std::get_if<ScanNode>(&scan_input);
+  if (set == nullptr || scan == nullptr || scan->table == nullptr || set->formula.empty() ||
+      set->formula.back().kind != SetTermKind::kIntersect || set->ids.size() != join.keys.size()) {
+    return std::nullopt;
+  }
+  const bool covers_key = std::ranges::all_of(set->ids, [&](ColumnId id) {
+    return std::ranges::any_of(join.keys, [&](const JoinKey& key) {
+      return (set_on_left ? key.left.id : key.right.id) == id;
+    });
+  });
+  return covers_key ? scan->table->exact_row_count() : std::nullopt;
+}
+
+std::optional<int64_t> CompoundRows(const LogicalNode& node) {
+  if (const auto* project = std::get_if<ProjectNode>(&node)) {
+    return CompoundRows(*project->input);
+  }
+  if (const auto* join = std::get_if<JoinNode>(&node);
+      join != nullptr && join->kind == JoinKind::kInner) {
+    auto rows = SetJoinRows(*join, *join->left, *join->right, /*set_on_left=*/true);
+    return rows.has_value() ? rows
+                            : SetJoinRows(*join, *join->right, *join->left, /*set_on_left=*/false);
+  }
+  if (std::holds_alternative<UnionAllNode>(node) ||
+      std::holds_alternative<SetOperationNode>(node)) {
+    return EstimateRows(node);
+  }
+  return std::nullopt;
+}
+
+std::span<const BoundColumn> CompoundOutput(const LogicalNode& node) {
+  if (const auto* project = std::get_if<ProjectNode>(&node)) {
+    return project->columns;
+  }
+  if (const auto* union_all = std::get_if<UnionAllNode>(&node);
+      union_all != nullptr && !union_all->columns.empty()) {
+    return union_all->columns.front();
+  }
+  if (const auto* set = std::get_if<SetOperationNode>(&node);
+      set != nullptr && !set->columns.empty()) {
+    return set->columns.front();
+  }
+  return {};
+}
+
+bool WorthSharingCompound(const LogicalNode& node) {
+  const auto columns = CompoundOutput(node);
+  if (columns.empty()) {
+    return false;
+  }
+  // InputRows also checks that each scan has a table before CompoundRows asks for its metadata.
+  const int64_t input_rows = InputRows(node).value_or(0);
+  if (input_rows < kMinSharedRows) {
+    return false;
+  }
+  const auto rows = CompoundRows(node);
+  if (!rows.has_value() || *rows >= input_rows) {
+    return false;
+  }
+  int64_t width = 0;
+  for (const BoundColumn& column : columns) {
+    const int64_t bytes = FixedBytes(column.type);
+    if (bytes == 0) {
+      return false;
+    }
+    width += bytes + 1;  // room for validity even in one-row batches
+  }
+  return *rows <= kMaxSharedResultBytes / width;
+}
+
+void Cover(const LogicalNodePtr& node, std::unordered_set<const LogicalNode*>& covered) {
+  if (node != nullptr && covered.insert(node.get()).second) {
+    for (const LogicalNodePtr& input : InputsOf(*node)) {
+      Cover(input, covered);
+    }
+  }
+}
+
+bool Overlaps(const LogicalNodePtr& node, const std::unordered_set<const LogicalNode*>& covered) {
+  return node != nullptr && (covered.contains(node.get()) ||
+                             std::ranges::any_of(InputsOf(*node), [&](const auto& input) {
+                               return Overlaps(input, covered);
+                             }));
+}
+
+std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool executable) {
   if (plan.root == nullptr) {
     return {};
   }
   Origins origins;
   origins.Walk(plan.root);
   KeyMemo memo;
+  std::unordered_set<const LogicalNode*> covered;
 
   // Every candidate sub-tree by key, in the order a walk from the root meets it. A node that
   // appears twice as the same pointer is already shared and is counted once.
   std::unordered_map<std::string, std::vector<LogicalNodePtr>> by_key;
   const std::function<void(const LogicalNodePtr&)> collect = [&](const LogicalNodePtr& node) {
     if (node == nullptr) {
+      return;
+    }
+    if (const auto* limit = std::get_if<LimitNode>(node.get());
+        executable && limit != nullptr && limit->limit.has_value() &&
+        (*limit->limit == 0 || std::get_if<SortNode>(limit->input.get()) == nullptr)) {
+      // A streaming LIMIT can omit whole UNION ALL branches or stop between their batches.
+      // Preparing a producer here would open scans the limit may skip. Replacing it with a
+      // scan could also make a consumer evaluate a whole part before yielding its first batch.
+      // A positive LIMIT on a Sort consumes its input for top-N; OFFSET alone drains its input.
+      Cover(node, covered);
       return;
     }
     if (const std::optional<std::string>& key = SubtreeKey(node, origins, memo); key.has_value()) {
@@ -908,14 +1020,10 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
         members.push_back(node);
       }
     }
-    // **Nothing under a union is a candidate** (ADR 0036). The union itself is: repeated whole and
-    // with a key, it is one group, which exec declines to hold (WorthSharing). Below it nothing is
-    // collected, so a branch is never held on its own either -- whatever the copies hold that has
-    // no key (a Sort, a RowCount), and in whatever order they list their branches. An
-    // aggregate-topped branch held alone can outgrow MaterializedTable::kMaxBytes, and a result
-    // past the cap fails the query. Nor under a set operation, for the same reason (ADR 0039).
-    if (std::holds_alternative<UnionAllNode>(*node) ||
-        std::holds_alternative<SetOperationNode>(*node)) {
+    // Keep the structural report's compound boundary. Physical planning can share an eligible
+    // branch now that a shared build can fall back to recomputation (ADR 0037, PF5).
+    if (!executable && (std::holds_alternative<UnionAllNode>(*node) ||
+                        std::holds_alternative<SetOperationNode>(*node))) {
       return;
     }
     for (const LogicalNodePtr& input : InputsOf(*node)) {
@@ -929,25 +1037,38 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
   // reports exactly those, in the order the plan meets them.
   std::vector<SharedSubPlan> out;
   std::set<std::string> reported;
+  int remaining = kSharingEstimateBudget;
   const std::function<void(const LogicalNodePtr&)> emit = [&](const LogicalNodePtr& node) {
-    if (node == nullptr) {
+    if (node == nullptr || covered.contains(node.get())) {
       return;
     }
     const std::optional<std::string>& key = SubtreeKey(node, origins, memo);
     if (key.has_value() && by_key[*key].size() > 1) {
       if (reported.insert(*key).second) {
-        if (std::optional<SharedSubPlan> group = GroupOf(by_key[*key], origins);
-            group.has_value()) {
-          out.push_back(*std::move(group));
+        auto members = by_key[*key];
+        if (executable && !covered.empty()) {
+          std::erase_if(members, [&](const auto& member) { return Overlaps(member, covered); });
+        }
+        auto group = GroupOf(std::move(members), origins);
+        if (group.has_value() && (!executable || WorthSharing(*group, remaining) ||
+                                  WorthSharingCompound(*group->members[group->widest]))) {
+          if (executable) {
+            for (const LogicalNodePtr& member : group->members) {
+              Cover(member, covered);
+            }
+          }
+          out.push_back(std::move(*group));
         }
       }
-      return;  // no descending into a member: its children repeat too, and only this is maximal
+      // This occurrence might contain a previously selected member. Other occurrences of the
+      // same key can still form a group, while its own uncovered children remain candidates.
+      if (!executable || covered.contains(node.get())) {
+        return;
+      }
     }
-    // Nor below a union, where no member is: a copy of a sub-plan under a union would otherwise
-    // report a group whose members another group already holds, which exec would then compute and
-    // hold for no consumer. Nor below a set operation (ADR 0039).
-    if (std::holds_alternative<UnionAllNode>(*node) ||
-        std::holds_alternative<SetOperationNode>(*node)) {
+    // Match the structural report's discovery boundary.
+    if (!executable && (std::holds_alternative<UnionAllNode>(*node) ||
+                        std::holds_alternative<SetOperationNode>(*node))) {
       return;
     }
     for (const LogicalNodePtr& input : InputsOf(*node)) {
@@ -956,6 +1077,16 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
   };
   emit(plan.root);
   return out;
+}
+
+}  // namespace
+
+std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
+  return FindSharedSubPlans(plan, /*executable=*/false);
+}
+
+std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan) {
+  return FindSharedSubPlans(plan, /*executable=*/true);
 }
 
 }  // namespace antb1::plan
