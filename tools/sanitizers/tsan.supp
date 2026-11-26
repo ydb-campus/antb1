@@ -13,20 +13,24 @@ race:libparquet.so
 
 # DuckDB 2.0.0 (conda-forge, test oracle). Recheck these Linux reports with pixi run tsan on
 # the next DuckDB upgrade. Access stacks: https://github.com/ydb-campus/antb1/issues/271
-# Nightly runs 45616991058 and 45819101495 cover the signatures below.
+# Nightly runs 45616991058, 45819101495 and 45824073976 cover the signatures below.
 #
 # Parquet scans: a worker releases its read-ahead task as the consumer frees the job. Other
-# reports pair the worker's file read with a Thrift buffer read, or buffer allocation with
-# destruction of the consumer's ReadHead vector. Reproduced by oracle and differential tests.
+# reports pair the worker's file read with a Thrift buffer read, growth of its buffer handle
+# vector with destruction of the reader's cached handles, and BlockHandle construction with
+# unpinning that block. Reproduced by oracle and differential tests.
 race:duckdb::ReadAheadIOTask::~ReadAheadIOTask(
 race:duckdb::ThriftFileTransport::read(
-race:std::vector<duckdb::shared_ptr<duckdb::ReadHead,*>::_M_erase_at_end(
+race:_M_realloc_append<duckdb::FileBufferHandleGroup::MemoryHandle>(
+race:duckdb::StandardBufferManager::Unpin(duckdb::shared_ptr<duckdb::BlockHandle, true>&)
 
-# Parquet fixture creation: row-group preparation races with writer initialization, and copies
-# of column names race with allocation of the integer or struct column writer. The dictionary
-# predicate integration test also reports a worker copying identifiers as DuckDB reads them.
+# Parquet fixture creation: row-group preparation and batch flushes race with writer and file
+# initialization. Copies of column names race with allocation of integer or struct column writers.
+# The dictionary predicate integration test also reports a worker copying identifiers as DuckDB reads them.
 race:duckdb::ParquetWriter::PrepareRowGroup(
+race:duckdb::CopyToFileGlobalState::InitializeFileState(duckdb::PendingFileState)
 race:duckdb::make_uniq<duckdb::StandardColumnWriter<long, long, duckdb::ParquetCastOperator>,
+race:duckdb::make_uniq<duckdb::StandardColumnWriter<short, int, duckdb::ParquetCastOperator>,
 race:duckdb::make_uniq<duckdb::StructColumnWriter,
 race:duckdb::IdentifiersToStrings[abi:cxx11](
 
