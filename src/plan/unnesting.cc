@@ -92,14 +92,13 @@ struct KeyParts {
   bool null_equal = false;  // IS NOT DISTINCT FROM: a NULL matches a NULL
 };
 
-std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_ids) {
+std::optional<KeyParts> ComparedColumns(const Expr& expr, const std::set<ColumnId>& outer_ids) {
   const auto* predicate = std::get_if<PredicateExpr>(&expr.node);
   if (predicate == nullptr || predicate->operands.size() != 2) {
     return std::nullopt;
   }
   const bool null_equal = predicate->predicate.kind == Predicate::Kind::kIsNotDistinct;
-  if (!null_equal && (predicate->predicate.kind != Predicate::Kind::kCompareColumns ||
-                      predicate->predicate.op != CompareOp::kEq)) {
+  if (!null_equal && predicate->predicate.kind != Predicate::Kind::kCompareColumns) {
     return std::nullopt;
   }
   const auto* a = std::get_if<ColumnExpr>(&predicate->operands[0]->node);
@@ -131,6 +130,17 @@ std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_
                   .inner_name = name_of(a_outer ? second : first, inner_expr),
                   .outer_name = name_of(a_outer ? first : second, outer_expr),
                   .null_equal = null_equal};
+}
+
+bool IsEquality(const Expr& expr) {
+  const auto* p = std::get_if<PredicateExpr>(&expr.node);
+  return p != nullptr && (p->predicate.kind == Predicate::Kind::kIsNotDistinct ||
+                          (p->predicate.kind == Predicate::Kind::kCompareColumns &&
+                           p->predicate.op == CompareOp::kEq));
+}
+
+std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_ids) {
+  return IsEquality(expr) ? ComparedColumns(expr, outer_ids) : std::nullopt;
 }
 
 // How many times the aggregation's own input must exceed the outer side before restricting it to
@@ -1398,12 +1408,102 @@ struct Representatives {
   std::set<const NullEqualLink*> used_links;
 };
 
+// A scalar or a mark appends one value per left row. Stacked subqueries over left columns can
+// therefore use the same binding source without recursively copying the pending dependent joins.
+// Keep filters, computed keys and padded rows: evaluating aggregates for extra bindings can raise
+// errors even though the final join would discard them.
+LogicalNodePtr ExactBindingSource(LogicalNodePtr node, const std::vector<ColumnId>& bindings) {
+  while (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
+    const JoinKindTraits traits = Traits(dependent->kind);
+    if (!traits.one_row && !traits.appends_mark) {
+      return nullptr;
+    }
+    node = dependent->left;
+  }
+  const std::vector<ColumnId> outputs = OutputIds(*node);
+  if (FirstDependentJoin(node) != nullptr || !FreeVariables(*node).empty() || UnsafeToClone(node) ||
+      !std::ranges::all_of(bindings, [&outputs](ColumnId id) {
+        return std::ranges::find(outputs, id) != outputs.end();
+      })) {
+    return nullptr;
+  }
+  return node;
+}
+
+// SQ9's keyed terminal. D has one row per complete outer binding. The attachment enforces
+// the original equalities; the remaining comparisons read D below the scalar aggregate.
+arrow::Result<Representatives> KeyedDomain(const Correlation& correlation, const Spine& spine,
+                                           Equivalences& equivalences, LogicalNodePtr& input) {
+  const auto refuse = [&correlation] {
+    return correlation.Refuse("with an outer column that has no inner equivalent");
+  };
+  const std::vector<ColumnId> bindings = FreeVariables(*correlation.join.right);
+  const LogicalNodePtr source = ExactBindingSource(correlation.join.left, bindings);
+  if (source == nullptr || !FreeVariables(*input).empty()) {
+    return refuse();
+  }
+  const std::vector<ColumnId> inner = OutputIds(*input);
+  std::map<ColumnId, BoundColumn> columns;
+  std::vector<JoinKey> anchors;
+  std::vector<const Expr*> residual;
+  ARROW_ASSIGN_OR_RAISE(const auto conjuncts, ConjunctsOf(correlation, spine));
+  for (const ExprPtr* conjunct : conjuncts) {
+    const auto pair = ComparedColumns(**conjunct, correlation.outer);
+    if (!pair.has_value() || pair->inner_type != pair->outer_type ||
+        std::ranges::find(inner, pair->inner.id) == inner.end()) {
+      return refuse();
+    }
+    BoundColumn outer{.id = pair->outer.id, .name = pair->outer_name, .type = pair->outer_type};
+    columns.emplace(outer.id, outer);
+    if (IsEquality(**conjunct)) {
+      anchors.push_back(JoinKey{
+          .left =
+              BoundColumn{.id = pair->inner.id, .name = pair->inner_name, .type = pair->inner_type},
+          .right = std::move(outer),
+          .null_equal = pair->null_equal});
+    } else {
+      residual.push_back(conjunct->get());
+    }
+  }
+  if (anchors.empty() ||
+      !std::ranges::all_of(bindings, [&columns](ColumnId id) { return columns.contains(id); })) {
+    return refuse();
+  }
+  const ClonedInput clone = CloneInput(source, correlation.last_id);
+  GroupAggregateNode domain{.input = clone.node, .span = correlation.join.span};
+  Representatives out;
+  for (const auto& [id, column] : columns) {
+    domain.keys.push_back(clone.Rename(column));
+    const ColumnId fresh{std::to_underlying(correlation.last_id) + 1};
+    correlation.last_id = fresh;
+    domain.key_ids.push_back(fresh);
+    BoundColumn grouped = column;
+    grouped.id = fresh;
+    equivalences.described.insert_or_assign(id, column);
+    equivalences.described.emplace(fresh, std::move(grouped));
+    out.of.emplace(id, fresh);
+    out.null_equal.insert(id);  // the join back identifies the binding, including NULL
+  }
+  for (JoinKey& key : anchors) {
+    key.right.id = out.of.at(key.right.id);
+  }
+  input = Make(JoinNode{.kind = JoinKind::kInner,
+                        .left = std::move(input),
+                        .right = Make(std::move(domain)),
+                        .keys = std::move(anchors),
+                        .build = BuildSide::kRight,
+                        .span = correlation.join.span});
+  equivalences.kept = std::move(residual);
+  return out;
+}
+
 // Every outer column the subquery reads needs a representative among the columns below the
 // correlated filter, and gets its OWN key: one key per class would drop a second outer column's
-// constraint and keep rows SQL rejects. Phase 8 has no other terminal step: an outer column without
-// one is refused (the domain D is SQ9's).
+// constraint and keep rows SQL rejects. A scalar aggregate can also obtain its representatives
+// from the distinct bindings attached to its input.
 arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation, const Spine& spine,
-                                                 Equivalences& equivalences) {
+                                                 Equivalences& equivalences,
+                                                 LogicalNodePtr* domain_input = nullptr) {
   const std::vector<ColumnId> inner_ids = OutputIds(*spine.below);
   const std::set<ColumnId> inner(inner_ids.begin(), inner_ids.end());
   Representatives out;
@@ -1430,6 +1530,9 @@ arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation,
       }
     }
     if (found == kNoColumnId) {
+      if (domain_input != nullptr) {
+        return KeyedDomain(correlation, spine, equivalences, *domain_input);
+      }
       return correlation.Refuse("with an outer column that has no inner equivalent");
     }
     out.of.emplace(id, found);
@@ -1590,8 +1693,11 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   std::map<ColumnId, EmptyValue> values;
   ARROW_RETURN_NOT_OK(CheckStatic(correlation, spine, values));
   ARROW_ASSIGN_OR_RAISE(Equivalences equivalences, EquivalencesOf(correlation, spine));
+  LogicalNodePtr right = spine.below;
   ARROW_ASSIGN_OR_RAISE(const Representatives representatives,
-                        RepresentativesOf(correlation, spine, equivalences));
+                        RepresentativesOf(correlation, spine, equivalences,
+                                          correlation.mode == Mode::kValue ? &right : nullptr));
+  const bool has_domain = right != spine.below;
   // Decision 20's proof, over the values the subquery appends: INNER only where the reader of each
   // value rejects its empty value, LEFT otherwise (decision 21).
   std::map<ColumnId, EmptyValue> appended;
@@ -1700,7 +1806,6 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     });
   };
   // Bottom-up: the kept conjuncts over the terminal, then the steps.
-  LogicalNodePtr right = spine.below;
   if (!equivalences.kept.empty()) {
     std::vector<ExprPtr> exprs;
     std::vector<ColumnId> ids;
@@ -1741,9 +1846,11 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
       }
       case Role::kStatic: {
         GroupAggregateNode node = grouped;  // the one static step
-        node.input =
-            RestrictToTheOuterKeys(std::move(right), join, equivalent, representatives.null_equal,
-                                   described, join_back, last_id, correlation.build_side_ratio);
+        node.input = has_domain
+                         ? std::move(right)
+                         : RestrictToTheOuterKeys(std::move(right), join, equivalent,
+                                                  representatives.null_equal, described, join_back,
+                                                  last_id, correlation.build_side_ratio);
         right = Make(std::move(node));
         break;
       }

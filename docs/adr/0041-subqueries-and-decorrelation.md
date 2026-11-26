@@ -1252,6 +1252,12 @@ the runs and report each affected query's identifier, before/after median elapse
 following the repository's data policy. Fix any repeatable performance regression and rerun the affected benchmark
 before merging.
 
+Update (2026-11-27, SQ9 keyed scalar aggregates). The first slice uses the complete binding tuple when
+substitution finds no inner equivalent. It preserves filters and outer-join padding in the binding source.
+Stacked scalar subqueries reading the same outer columns each clone the source once. A pending correlated
+filter in the binding source still requires left-first unnesting. The keyless product and its size policy
+remain open.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.
