@@ -1343,10 +1343,10 @@ block left, once a condition has ruled blocks out; its inputs follow in written 
 a `UNION ALL`, referenced twice with the same conditions, prints `[shared #1 of 2, ...]` on the highest node the two
 references repeat, since [ADR 0030](adr/0030-shared-sub-plans.md) finds the repeat: their `UnionAll` lines when every
 condition went into the blocks and a block is left, else the `Filter` above the union (the `FALSE` when no block is
-left, or a condition the binder computes). The executor never holds a `UNION ALL`'s rows all the same: each reference
-computes its own (`--physical` shows no shared source). A `SetOperation` line shows the number of its inputs, its
-formula over them in written order (`0 UNION 1 UNION 2`, parenthesized where a term nests) and its columns, named as
-the first block names them; nothing below it is shared, and no result topped by one is.
+left, or a condition the binder computes). A `SetOperation` line shows the number of its inputs, its
+formula over them in written order (`0 UNION 1 UNION 2`, parenthesized where a term nests) and its columns,
+named as the first block names them. Use `--physical` to see which repeated results the executor plans to
+materialize. Their consumers read a `Scan` marked `source=shared`.
 
 ```text
 Output: x:INTEGER n:BIGINT
@@ -1391,8 +1391,12 @@ estimate exceeds the cap, a filter on a scan can bound combinations of grouping 
 branch of an OR admits four pairs and another admits one pair, their union admits at most five.
 Grouping keys from other scans need table-wide bounds, and the refined size allows for output
 validity bitmaps. The sharing candidates in each planning stage use one fixed analysis budget.
-The runtime cap and query memory budget apply to the actual materialized result, including
-variable-width columns.
+The planner also considers repeated unions, set operations and projections of a join between a distinct
+intersection and a table. Their estimated output must be smaller than the total input and fit the cap.
+A finite streaming `LIMIT` keeps its original input plan so it can stop between batches and skip later
+union branches. A positive `LIMIT` directly above a sort can still share work because top-N reads its input.
+The runtime cap and query memory budget apply to the actual materialized result, including variable-width
+columns.
 
 It shows what no logical plan holds, because the physical planner is what decides it:
 
@@ -1484,6 +1488,11 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     adjusts scan lookahead. The narrow target requests one outstanding part per worker and the wide target
     requests four. Memory pressure may reduce the actual number of outstanding parts.
   - `part_time` (the part tasks' time, summed);
+  - on the query's root, `shared` is time spent preparing shared sub-plans and `shared_rows` is
+    the number of rows retained when sharing succeeds. If a shared result exceeds the 256 MiB cap,
+    the query budget refuses a reservation, or preparation fails, antb1 releases the shared results
+    and producer working memory before opening the original plan. In that case,
+    `shared_fallbacks` counts the retry and the root includes the original plan as an additional input.
   - `wait` (for parts);
   - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;

@@ -1796,21 +1796,10 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   // sees a DAG -- the sharing lives entirely in a shared_ptr<Table> that ScanNode already holds.
   std::vector<SharedBuild> shared;
   std::unordered_map<const plan::LogicalNode*, plan::LogicalNodePtr> replacements;
-  int estimate_budget = plan::kSharingEstimateBudget;
-  for (const plan::SharedSubPlan& group : plan::SharedSubPlans(plan)) {
-    if (!plan::WorthSharing(group, estimate_budget)) {
-      continue;
-    }
-    // A group with a member inside an already-chosen one is left alone: nested sharing would have
-    // to decide which result the inner consumers read, and E1 reports the outermost first.
-    if (std::ranges::any_of(group.members, [&replacements](const plan::LogicalNodePtr& member) {
-          return replacements.contains(member.get());
-        })) {
-      continue;
-    }
+  for (const plan::SharedSubPlan& group : plan::MaterializableSubPlans(plan)) {
     const plan::LogicalNodePtr& widest = group.members[group.widest];
-    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op,
-                          Build(NormalizeBuildSides(widest), std::nullopt, nullptr));
+    auto make_producer = [node = NormalizeBuildSides(widest)] { return Build(node); };
+    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, make_producer());
     auto table = std::make_shared<MaterializedTable>(op->output_schema());
     for (std::size_t i = 0; i < group.members.size(); ++i) {
       const plan::LogicalNodePtr& member = group.members[i];
@@ -1825,7 +1814,9 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
                                              .ids = std::move(ids),
                                          }));
     }
-    shared.push_back(SharedBuild{.table = std::move(table), .op = std::move(op)});
+    shared.push_back(SharedBuild{.table = std::move(table),
+                                 .first_producer = std::move(op),
+                                 .make_producer = std::move(make_producer)});
   }
 
   const plan::LogicalNodePtr root_node =
@@ -1838,7 +1829,10 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   if (shared.empty()) {
     return root;
   }
-  auto builds = std::make_unique<SharedBuildsOperator>(std::move(root), std::move(shared));
+  auto builds = std::make_unique<SharedBuildsOperator>(
+      std::move(root), std::move(shared), [original = plan.root](ProfileNode* fallback_profile) {
+        return Build(NormalizeBuildSides(original), std::nullopt, fallback_profile);
+      });
   // Profiled into the root's own node, so the shared results' time and rows are visible without
   // the profile tree changing shape. The sub-plans themselves are unprofiled: a reader sees what
   // sharing cost and what it produced, and the consumers' `Scan ... source=shared` lines say who

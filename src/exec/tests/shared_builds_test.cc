@@ -5,6 +5,8 @@
 // derived from the ColumnIds the binder mints. A hand-built plan leaves them unset, so nothing
 // would ever be found to share and the test would pass while testing nothing.
 
+#include "../shared_builds.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -73,31 +75,37 @@ arrow::Result<plan::LogicalPlan> PlanOf(std::string_view sql,
   return plan::Optimize(bound);
 }
 
-struct Run {
+struct ExecutionResult {
   std::shared_ptr<arrow::Table> rows;
   int parts_scanned = 0;               // how many part scans the base table served
   std::optional<int64_t> shared_rows;  // the profile's count, absent when nothing was shared
+  int64_t shared_fallbacks = 0;
 };
 
-arrow::Result<Run> ExecutePlan(const plan::LogicalPlan& plan,
-                               const std::shared_ptr<MemoryTable>& table) {
+arrow::Result<ExecutionResult> ExecutePlan(const plan::LogicalPlan& plan,
+                                           const std::shared_ptr<MemoryTable>& table) {
   ProfileNode profile;
   ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, BuildPhysicalPlan(plan, &profile));
   MemoryBudget budget(int64_t{1024} * 1024 * 1024);
   ExecContext ctx{.pool = arrow::default_memory_pool(), .budget = &budget};
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Table> rows, Drain(*op, ctx));
   std::optional<int64_t> shared_rows;
+  int64_t shared_fallbacks = 0;
   for (const ProfileMetric& metric : profile.metrics()) {
     if (metric.name == "shared_rows") {
       shared_rows = metric.value;
+    } else if (metric.name == "shared_fallbacks") {
+      shared_fallbacks = metric.value;
     }
   }
-  return Run{.rows = std::move(rows),
-             .parts_scanned = static_cast<int>(table->scanned_parts().size()),
-             .shared_rows = shared_rows};
+  return ExecutionResult{.rows = std::move(rows),
+                         .parts_scanned = static_cast<int>(table->scanned_parts().size()),
+                         .shared_rows = shared_rows,
+                         .shared_fallbacks = shared_fallbacks};
 }
 
-arrow::Result<Run> Execute(std::string_view sql, const std::shared_ptr<MemoryTable>& table) {
+arrow::Result<ExecutionResult> Execute(std::string_view sql,
+                                       const std::shared_ptr<MemoryTable>& table) {
   ARROW_ASSIGN_OR_RAISE(const plan::LogicalPlan plan, PlanOf(sql, table));
   return ExecutePlan(plan, table);
 }
@@ -130,6 +138,90 @@ TEST_F(SharedBuildsTest, ComputesARepeatedSubPlanOnceAndKeepsTheAnswer) {
       << "sharing changes what is computed, never what is answered\n"
       << with->rows->ToString() << "\nagainst\n"
       << without->rows->ToString();
+}
+
+TEST_F(SharedBuildsTest, ReleasesOversizedResultAndReopensWithTheOriginalPlan) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto values =
+      testing::Int64s(std::vector<std::optional<int64_t>>(std::size_t{128} * 1024, 7));
+  const auto large = arrow::RecordBatch::Make(schema, values->length(), {values});
+  const auto small = large->Slice(0, 1);
+  // Reuse one buffer behind many batches. The table charges each batch it retains.
+  int producer_builds = 0;
+  const auto make_producer = [&] {
+    ++producer_builds;
+    return std::make_unique<testing::ScriptedSource>(schema,
+                                                     std::vector<Batch>(257, Batch{.data = large}));
+  };
+  auto shared_scan = std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{});
+  const auto* shared_scan_calls = shared_scan.get();
+  std::vector<SharedBuild> builds;
+  builds.push_back({.table = std::make_shared<MaterializedTable>(schema),
+                    .first_producer = make_producer(),
+                    .make_producer = make_producer});
+  MemoryBudget budget(int64_t{512} * 1024 * 1024);
+  int fallback_builds = 0;
+  SharedBuildsOperator op(std::move(shared_scan), std::move(builds), [&](ProfileNode*) {
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+    ++fallback_builds;
+    return std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = small}});
+  });
+  ExecContext ctx{.budget = &budget};
+  for (int run = 0; run < 2; ++run) {
+    const auto rows = Drain(op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status();
+    EXPECT_EQ(testing::SingleInt64(**rows), 7);
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+  EXPECT_EQ(producer_builds, 2);
+  EXPECT_EQ(shared_scan_calls->opens(), 0);
+  EXPECT_EQ(fallback_builds, 1);
+}
+
+TEST_F(SharedBuildsTest, ReleasesBothProducersAndTheirReservationsBeforeBudgetFallback) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  constexpr int64_t kRows = 8;
+  constexpr int64_t kBatchBytes = kRows * 8;
+  MemoryBudget budget(4 * kBatchBytes);
+  const auto make_producer = [&](std::size_t batches) -> arrow::Result<std::unique_ptr<Operator>> {
+    // The source itself retains its buffer after Close, just as an aggregate can retain its
+    // grouper.
+    ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateBuffer(kBatchBytes, &budget));
+    std::fill_n(buffer->mutable_data(), kBatchBytes, uint8_t{0});
+    auto values = std::make_shared<arrow::Int64Array>(kRows, std::move(buffer));
+    const auto batch = arrow::RecordBatch::Make(schema, kRows, {std::move(values)});
+    return std::make_unique<testing::ScriptedSource>(schema,
+                                                     std::vector<Batch>(batches, {.data = batch}));
+  };
+  const auto first_table = std::make_shared<MaterializedTable>(schema);
+  const auto second_table = std::make_shared<MaterializedTable>(schema);
+  std::vector<SharedBuild> builds;
+  builds.push_back({.table = first_table, .make_producer = [&] { return make_producer(1); }});
+  builds.push_back({.table = second_table, .make_producer = [&] {
+                      EXPECT_EQ(first_table->exact_row_count(), kRows);
+                      EXPECT_EQ(budget.bytes_allocated(), 2 * kBatchBytes);
+                      return make_producer(2);
+                    }});
+  auto consumer = std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{});
+  const auto* consumer_calls = consumer.get();
+  int fallbacks = 0;
+  SharedBuildsOperator op(std::move(consumer), std::move(builds), [&](ProfileNode*) {
+    ++fallbacks;
+    // Both 64-byte buffers and their first table reservations fit. The second table's next
+    // reservation is refused, even though each table is well below the per-table cap.
+    EXPECT_EQ(budget.max_memory(), 4 * kBatchBytes);
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+    EXPECT_FALSE(first_table->exact_row_count().has_value());
+    EXPECT_FALSE(second_table->exact_row_count().has_value());
+    const auto answer = arrow::RecordBatch::Make(schema, 1, {testing::Int64s({42})});
+    return std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = answer}});
+  });
+  const auto rows = Drain(op, ExecContext{.budget = &budget});
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ(testing::SingleInt64(**rows), 42);
+  EXPECT_EQ(consumer_calls->opens(), 0);
+  EXPECT_EQ(fallbacks, 1);
+  EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
 // A reducing shape alone does not make its output small. Sparse, multi-column key domains can
@@ -457,14 +549,7 @@ TEST_F(SharedBuildsTest, ASharedAggregateProbeKeepsASemiOrAntiJoinsLeftBuild) {
   }
 }
 
-// **Nothing under a union is held** (ADR 0036). A union repeated whole is one group, which the gate
-// refuses, and a branch is never held on its own -- however the two copies list their branches, and
-// whatever they hold that has no key. A branch's result held alone can outgrow
-// MaterializedTable::kMaxBytes at a large scale factor, and a result past the cap fails the query.
-//
-// The control is the point of the hand-built ids: the same aggregate-topped sub-plan repeated
-// outside a union *is* shared, so the ids are what the pass follows and the union cases test it.
-TEST_F(SharedBuildsTest, HoldsNothingUnderAUnion) {
+TEST_F(SharedBuildsTest, SharesEligibleProducersInsideUnionBranches) {
   const auto table = KeyedTable();
   table->set_claimed_rows(20'000'000);  // past the gate, while holding 60 rows
   auto control = ExecutePlan(Joined(Grouped(table, 1), Grouped(table, 11)), table);
@@ -492,7 +577,7 @@ TEST_F(SharedBuildsTest, HoldsNothingUnderAUnion) {
     SCOPED_TRACE(c.name);
     auto run = ExecutePlan(c.plan, table);
     ASSERT_TRUE(run.ok()) << run.status().ToString();
-    EXPECT_EQ(run->shared_rows, std::nullopt) << "nothing under a union is held";
+    EXPECT_EQ(run->shared_rows, 14);
     ASSERT_NE(run->rows, nullptr);
     EXPECT_EQ(testing::SingleInt64(*run->rows), 28) << "each key twice on either side";
   }
@@ -508,9 +593,7 @@ plan::LogicalNodePtr UnionOfOne(const plan::LogicalNodePtr& a, std::uint32_t fir
   return Node(std::move(node));
 }
 
-// A union of one input is still a union: nothing under it is held, whether its branch repeats under
-// another such union or outside any, until ADR 0037's PF5 gives the cap a fallback.
-TEST_F(SharedBuildsTest, HoldsNothingUnderAUnionOfOneInput) {
+TEST_F(SharedBuildsTest, SharesAUnionOfOneInputOrItsRepeatedBranch) {
   const auto table = KeyedTable();
   table->set_claimed_rows(20'000'000);
   for (const plan::LogicalPlan& plan :
@@ -518,16 +601,13 @@ TEST_F(SharedBuildsTest, HoldsNothingUnderAUnionOfOneInput) {
         Joined(UnionOfOne(Grouped(table, 100), 120), Grouped(table, 200))}) {
     auto run = ExecutePlan(plan, table);
     ASSERT_TRUE(run.ok()) << run.status().ToString();
-    EXPECT_EQ(run->shared_rows, std::nullopt) << "nothing under a union is held";
+    EXPECT_EQ(run->shared_rows, 7);
     ASSERT_NE(run->rows, nullptr);
     EXPECT_EQ(testing::SingleInt64(*run->rows), 7) << "each key once on either side";
   }
 }
 
-// Two references of a CTE whose body is a union of two aggregate-topped blocks, both keeping the
-// block tagged 'a' (ADR 0036's X7a): each reference runs that block alone, and the two copies of it
-// are not held, though they repeat and read past the gate.
-TEST_F(SharedBuildsTest, ThePrunedReferencesOfAUnionCteShareNothing) {
+TEST_F(SharedBuildsTest, ThePrunedReferencesOfAUnionCteShareTheirSurvivingBranch) {
   const auto table = KeyedTable();
   table->set_claimed_rows(20'000'000);
   auto run = Execute(
@@ -536,10 +616,116 @@ TEST_F(SharedBuildsTest, ThePrunedReferencesOfAUnionCteShareNothing) {
       "q.tag = 'a'",
       table);
   ASSERT_TRUE(run.ok()) << run.status().ToString();
-  EXPECT_EQ(run->shared_rows, std::nullopt);
-  EXPECT_EQ(run->parts_scanned, 6) << "one block of three parts per reference, not two";
+  EXPECT_EQ(run->shared_rows, 7);
+  EXPECT_EQ(run->parts_scanned, 3);
   ASSERT_NE(run->rows, nullptr);
   EXPECT_EQ(testing::SingleInt64(*run->rows), 7);
+}
+
+TEST_F(SharedBuildsTest, SharesAnIntersectJoinAndScalarAggregateAcrossUnionBranches) {
+  constexpr std::string_view kQuery =
+      "WITH m AS (SELECT k FROM t INTERSECT SELECT v FROM t), "
+      "g AS (SELECT d.k FROM d JOIN m ON d.k = m.k), "
+      "s AS (SELECT MAX(v) AS cutoff FROM t) "
+      "SELECT g.k FROM g, s WHERE g.k < s.cutoff "
+      "UNION ALL SELECT g.k FROM g, s WHERE g.k >= s.cutoff";
+  const auto parsed = sql::Parse(kQuery);
+  ASSERT_TRUE(parsed.has_value());
+
+  const auto run = [&](const std::shared_ptr<MemoryTable>& fact) -> arrow::Result<ExecutionResult> {
+    plan::Catalog catalog;
+    ARROW_RETURN_NOT_OK(catalog.Register("t", fact));
+    ARROW_RETURN_NOT_OK(catalog.Register("d", KeyedTable()));
+    ARROW_ASSIGN_OR_RAISE(const auto bound, plan::Bind(*parsed, catalog, plan::BindOptions{}));
+    ARROW_ASSIGN_OR_RAISE(const auto optimized, plan::Optimize(bound));
+    return ExecutePlan(optimized, fact);
+  };
+  const auto fact = KeyedTable();
+  fact->set_claimed_rows(100'000'000);
+  const auto shared = run(fact);
+  const auto control = run(KeyedTable());
+  ASSERT_TRUE(shared.ok()) << shared.status();
+  ASSERT_TRUE(control.ok()) << control.status();
+  EXPECT_EQ(shared->shared_rows, 61);  // 60 projected dimension rows and one scalar
+  EXPECT_EQ(shared->parts_scanned, 9);
+  EXPECT_EQ(control->parts_scanned, 18);
+  auto shared_keys = testing::Int64Column(*shared->rows, 0);
+  auto control_keys = testing::Int64Column(*control->rows, 0);
+  std::ranges::sort(shared_keys);
+  std::ranges::sort(control_keys);
+  EXPECT_EQ(shared_keys, control_keys);
+}
+
+TEST_F(SharedBuildsTest, LimitStopsBeforeALaterBatchWithAFailingCast) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(schema, 2, {testing::Int64s({7, 100'000})});
+  const auto table =
+      std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, /*split=*/true);
+  table->set_claimed_rows(20'000'000);
+  constexpr std::string_view kQuery =
+      "WITH g AS (SELECT MIN(k) AS v FROM t UNION ALL SELECT MAX(k) AS v FROM t) "
+      "SELECT n FROM (SELECT CAST(v AS SMALLINT) AS n FROM g UNION ALL SELECT v FROM g) u";
+  const auto limited = Execute(std::string(kQuery) + " LIMIT 1", table);
+  ASSERT_TRUE(limited.ok()) << limited.status();
+  EXPECT_EQ(testing::SingleInt64(*limited->rows), 7);
+  EXPECT_EQ(limited->parts_scanned, 1);
+
+  // Reading the second batch really does evaluate the narrowing cast.
+  const auto unlimited = Execute(kQuery, table);
+  ASSERT_FALSE(unlimited.ok());
+  EXPECT_TRUE(unlimited.status().message().contains("out of range")) << unlimited.status();
+}
+
+TEST_F(SharedBuildsTest, LimitLeavesSharedProducersInLaterUnionBranchesUnopened) {
+  const auto table = KeyedTable();
+  table->set_claimed_rows(20'000'000);
+  table->set_track_scan_contexts(true);
+  constexpr std::string_view kQuery =
+      "WITH g AS (SELECT k, MAX(v) AS n FROM t GROUP BY k) "
+      "SELECT k FROM (SELECT k FROM t UNION ALL SELECT k FROM g WHERE n > 0 "
+      "UNION ALL SELECT k FROM g WHERE n < 0) u";
+  const auto limited = Execute(std::string(kQuery) + " LIMIT 1", table);
+  ASSERT_TRUE(limited.ok()) << limited.status();
+  ASSERT_EQ(limited->rows->num_rows(), 1);
+  ASSERT_FALSE(table->scan_calls().empty());
+  for (const auto& scan : table->scan_calls()) {
+    EXPECT_EQ(scan.fields, std::vector<int>({0})) << "only the first branch may open its scans";
+  }
+
+  // Even an ordered LIMIT 0 can skip the sort and every input it would read.
+  table->ClearScanCalls();
+  const auto empty = Execute(std::string(kQuery) + " ORDER BY k LIMIT 0", table);
+  ASSERT_TRUE(empty.ok()) << empty.status();
+  EXPECT_EQ(empty->rows->num_rows(), 0);
+  EXPECT_TRUE(table->scan_calls().empty());
+
+  // A positive ordered limit needs every union branch to determine its first row.
+  const auto ordered = Execute(std::string(kQuery) + " ORDER BY k LIMIT 1", table);
+  ASSERT_TRUE(ordered.ok()) << ordered.status();
+  EXPECT_EQ(ordered->shared_rows, 7);
+}
+
+TEST_F(SharedBuildsTest, OnlyADemandedUnionBranchCanReportItsOverflow) {
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int64()), arrow::field("v", arrow::decimal128(38, 0))});
+  const std::string largest(38, '9');
+  const auto batch = arrow::RecordBatch::Make(
+      schema, 2, {testing::Int64s({7, 7}), testing::Decimals(38, 0, {largest, largest})});
+  const auto table =
+      std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, /*split=*/true);
+  table->set_claimed_rows(20'000'000);
+  constexpr std::string_view kQuery =
+      "WITH g AS (SELECT k, SUM(v) AS n FROM t GROUP BY k) "
+      "SELECT k FROM (SELECT k FROM t UNION ALL SELECT k FROM g WHERE n > 0 "
+      "UNION ALL SELECT k FROM g WHERE n < 0) u";
+  const auto limited = Execute(std::string(kQuery) + " LIMIT 1", table);
+  ASSERT_TRUE(limited.ok()) << limited.status();
+  EXPECT_EQ(testing::SingleInt64(*limited->rows), 7);
+  EXPECT_EQ(limited->shared_fallbacks, 0);
+  EXPECT_EQ(limited->parts_scanned, 1);
+  const auto unlimited = Execute(kQuery, table);
+  ASSERT_FALSE(unlimited.ok());
+  EXPECT_TRUE(unlimited.status().message().contains("overflow"));
 }
 
 }  // namespace
