@@ -18,10 +18,13 @@
 
 namespace antb1::exec {
 
+class UnionDistinct;
+
 // UNION [DISTINCT], INTERSECT [ALL] and EXCEPT [ALL] of one or more inputs, one tree of them
-// (plan::SetOperationNode, docs/adr/0039-set-operations.md), serial.
+// (plan::SetOperationNode, docs/adr/0039-set-operations.md). A pure union routes large
+// windows by normalized key and keeps original rows at their first input position.
 //
-// One GroupTable keyed on every column holds the distinct rows. The inputs are read in written
+// Mixed formulas use one GroupTable keyed on every column. The inputs are read in written
 // order, one at a time as UnionAllOperator reads them -- input k opens after input k - 1 has
 // closed, so one input's resources at a time -- and each input in full: the operator is blocking,
 // and the first input that fails decides the error. A starter's rows (plan::SetStarters) insert
@@ -37,6 +40,7 @@ namespace antb1::exec {
 // the consumer's thread; an input that is a part pipeline runs its own parts on the executor.
 class SetOperationOperator final : public Operator {
  public:
+  ~SetOperationOperator() override;
   // Invalid without inputs, for a formula that does not check (plan::CheckSetFormula), for a column
   // list per input that does not hold one column per type, and for an input's column outside its
   // schema or not of its type's Arrow type, as UnionAllOperator::Make.
@@ -81,9 +85,11 @@ class SetOperationOperator final : public Operator {
   bool all_root_ = false;  // the root is INTERSECT ALL or EXCEPT ALL: copies, normalized keys
   std::shared_ptr<arrow::Schema> schema_;
 
+  std::unique_ptr<UnionDistinct> distinct_;
   ExecContext ctx_;  // a copy: the inputs are opened after Open has returned
   bool opened_ = false;
   bool built_ = false;
+  arrow::Status build_status_;
   std::size_t open_input_ = 0;  // the input that is open, when input_open_
   bool input_open_ = false;
   std::unique_ptr<GroupTable> table_;

@@ -18,6 +18,8 @@
 #include "antb1/exec/profile.h"
 #include "antb1/plan/types.h"
 
+#include "union_distinct.h"
+
 namespace antb1::exec {
 namespace {
 
@@ -81,6 +83,8 @@ void Combine(SetTermKind kind, std::span<const std::vector<int64_t>> operands,
 }
 
 }  // namespace
+
+SetOperationOperator::~SetOperationOperator() = default;
 
 arrow::Result<std::unique_ptr<SetOperationOperator>> SetOperationOperator::Make(
     std::vector<std::unique_ptr<Operator>> inputs, std::vector<std::vector<int>> columns,
@@ -150,6 +154,15 @@ arrow::Status SetOperationOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
   ctx_ = ctx;
   memory_.Reset(ctx.budget);
+  if (std::ranges::all_of(formula_, [](const auto& term) {
+        return term.kind == SetTermKind::kInput || term.kind == SetTermKind::kUnion;
+      })) {
+    return KeyTableNoBadAlloc([&] {
+      distinct_ = std::make_unique<UnionDistinct>(ctx);
+      opened_ = true;
+      return arrow::Status::OK();
+    });
+  }
   std::vector<plan::BoundColumn> keys;
   keys.reserve(types_.size());
   for (std::size_t i = 0; i < types_.size(); ++i) {
@@ -236,6 +249,11 @@ arrow::Status SetOperationOperator::Build() {
       if (rows->num_rows() == 0) {
         continue;
       }
+      if (distinct_ != nullptr) {
+        starter_rows += rows->num_rows();
+        ARROW_RETURN_NOT_OK(distinct_->Append(rows));
+        continue;
+      }
       // Hoisted: a write through bits (uint8_t) may alias anything, so the compiler would reload
       // counted_[k] and each vector's data on every row.
       const bool counted = counted_[k];
@@ -287,17 +305,26 @@ arrow::Status SetOperationOperator::Build() {
         add([bits](std::uint32_t group) { bits[group] = 1; });
       }
     }
+    if (distinct_ != nullptr) {
+      ARROW_RETURN_NOT_OK(distinct_->Flush());
+    }
     // Closed before the next input opens: its builds and its parts' windows are gone by then.
     input_open_ = false;
     ARROW_RETURN_NOT_OK(input.Close());
   }
-  ARROW_RETURN_NOT_OK(Grow());
-  ARROW_RETURN_NOT_OK(Evaluate());
+  if (distinct_ == nullptr) {
+    ARROW_RETURN_NOT_OK(Grow());
+    ARROW_RETURN_NOT_OK(Evaluate());
+  } else {
+    distinct_->Finish(profile());
+  }
   if (ProfileNode* node = profile(); node != nullptr) {
     node->Add("starter_rows", MetricUnit::kCount, starter_rows);
     node->Add("lookup_rows", MetricUnit::kCount, lookup_rows);
     node->Add("lookup_hits", MetricUnit::kCount, lookup_hits);
-    node->Add("groups", MetricUnit::kCount, table_->num_groups());
+    if (table_ != nullptr) {
+      node->Add("groups", MetricUnit::kCount, table_->num_groups());
+    }
   }
   return arrow::Status::OK();
 }
@@ -343,8 +370,12 @@ arrow::Result<Batch> SetOperationOperator::Next() {
     return arrow::Status::Invalid("set operation: Next() before Open() or after Close()");
   }
   if (!built_) {
-    ARROW_RETURN_NOT_OK(Build());
+    build_status_ = KeyTableNoBadAlloc([&] { return Build(); });
     built_ = true;
+  }
+  ARROW_RETURN_NOT_OK(build_status_);
+  if (distinct_ != nullptr) {
+    return distinct_->Next();
   }
   if (table_ == nullptr) {
     return Batch{};
@@ -438,6 +469,7 @@ arrow::Status SetOperationOperator::Close() {
     input_open_ = false;
     status = inputs_[open_input_]->Close();  // stops its parts and waits for them
   }
+  distinct_.reset();
   table_.reset();
   uniques_.reset();
   bits_.clear();
@@ -447,6 +479,7 @@ arrow::Status SetOperationOperator::Close() {
   memory_.Release();
   opened_ = false;
   built_ = false;
+  build_status_ = arrow::Status::OK();
   next_group_ = 0;
   pending_copies_ = 0;
   return status;
