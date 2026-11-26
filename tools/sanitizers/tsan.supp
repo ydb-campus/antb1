@@ -10,3 +10,26 @@
 # library is reported as "unlock of an unlocked mutex". Races confined to our own code are still reported.
 race:libarrow.so
 race:libparquet.so
+
+# DuckDB 2.0.0 (conda-forge, test oracle). Recheck these Linux reports with pixi run tsan on
+# the next DuckDB upgrade. Access stacks: https://github.com/ydb-campus/antb1/issues/271
+# Nightly runs 45616991058 and 45819101495 cover the signatures below.
+#
+# Parquet scans: a worker releases its read-ahead task as the consumer frees the job. Other
+# reports pair the worker's file read with a Thrift buffer read, or buffer allocation with
+# destruction of the consumer's ReadHead vector. Reproduced by oracle and differential tests.
+race:duckdb::ReadAheadIOTask::~ReadAheadIOTask(
+race:duckdb::ThriftFileTransport::read(
+race:std::vector<duckdb::shared_ptr<duckdb::ReadHead,*>::_M_erase_at_end(
+
+# Parquet fixture creation: row-group preparation races with writer initialization, and copies
+# of column names race with allocation of the integer or struct column writer. The dictionary
+# predicate integration test also reports a worker copying identifiers as DuckDB reads them.
+race:duckdb::ParquetWriter::PrepareRowGroup(
+race:duckdb::make_uniq<duckdb::StandardColumnWriter<long, long, duckdb::ParquetCastOperator>,
+race:duckdb::make_uniq<duckdb::StructColumnWriter,
+race:duckdb::IdentifiersToStrings[abi:cxx11](
+
+# Differential tests also report DuckDB's bundled jemalloc initializing a decay mutex while
+# another thread acquires it. Match the initializer specific to DuckDB's copy of jemalloc.
+race:^duckdb_je_decay_init$
