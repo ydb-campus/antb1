@@ -28,6 +28,7 @@
 #include "antb1/common/narrow.h"
 #include "antb1/exec/compute.h"
 #include "antb1/exec/join_table.h"
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/profile.h"
@@ -315,6 +316,7 @@ void JoinBuild::Release() {
   values_.reset();
   marks_.reset();
   key_filter_.reset();
+  needs_pruning_retry_ = false;
   ReleaseBuilds(builds_);
 }
 
@@ -436,6 +438,15 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     // Before Finish: it frees the parts the per-row hashes live in (ADR 0029's D1).
     ARROW_ASSIGN_OR_RAISE(key_filter_, builder->MakeKeyFilter());
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
+    if (ctx.join_filter != CombinedJoinFilter::kOrdinary && !table_->empty()) {
+      // Above the publication limit independent copies of the same build also have at most its
+      // range. Below it, a reservation refusal here could lose exact keys a reader would retain.
+      const bool same_range = ctx.join_filter == CombinedJoinFilter::kUnchangedBuild &&
+                              key_filter_ != nullptr &&
+                              key_filter_->keys() > KeyFilter::kMaxPublishedKeys;
+      needs_pruning_retry_ =
+          !same_range && (key_filter_ == nullptr || !key_filter_->has_exact_keys());
+    }
     if (verify_dimension_business_field_) {
       const ProfileTimer check(profile_, "dimension_check");
       ARROW_ASSIGN_OR_RAISE(const bool verified,

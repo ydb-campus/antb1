@@ -1,5 +1,6 @@
 #include "shared_builds.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -36,6 +37,9 @@ arrow::Result<bool> FillTable(Operator& producer, MaterializedTable& table,
 arrow::Result<bool> Prepare(SharedBuild& build, ExecContext& ctx) {
   build.table->Reset(ctx.budget);
   auto producer = std::move(build.first_producer);
+  ExecContext combined = ctx;
+  combined.join_filter = build.join_filter;
+  ExecContext& run = build.join_filter == CombinedJoinFilter::kOrdinary ? ctx : combined;
   bool kept = false;
   try {
     if (producer == nullptr) {
@@ -45,9 +49,9 @@ arrow::Result<bool> Prepare(SharedBuild& build, ExecContext& ctx) {
       }
       producer = std::move(*rebuilt);
     }
-    const arrow::Status opened = producer->Open(ctx);
+    const arrow::Status opened = producer->Open(run);
     if (opened.ok()) {
-      const auto filled = FillTable(*producer, *build.table, ctx);
+      const auto filled = FillTable(*producer, *build.table, run);
       kept = filled.ok() && *filled;
     }
     // A producer can fail when its original consumers would have skipped it. Let the original
@@ -70,6 +74,7 @@ arrow::Result<bool> Prepare(SharedBuild& build, ExecContext& ctx) {
 
 arrow::Status SharedBuildsOperator::Open(ExecContext& ctx) {
   use_fallback_ = false;
+  retry_if_empty_ = false;
   int64_t shared_rows = 0;
   for (SharedBuild& build : builds_) {
     const ProfileTimer timer(profile(), "shared");
@@ -84,6 +89,7 @@ arrow::Status SharedBuildsOperator::Open(ExecContext& ctx) {
       break;
     }
     shared_rows += build.table->exact_row_count().value_or(0);
+    retry_if_empty_ |= build.join_filter != CombinedJoinFilter::kOrdinary;
   }
   if (!use_fallback_ && profile() != nullptr) {
     profile()->Add("shared_rows", MetricUnit::kCount, shared_rows);
@@ -117,12 +123,29 @@ arrow::Status SharedBuildsOperator::PrepareFallback(ExecContext& ctx) {
   }
 }
 
-arrow::Result<Batch> SharedBuildsOperator::Next() { return ActiveInput().Next(); }
+arrow::Result<Batch> SharedBuildsOperator::Next() {
+  ARROW_ASSIGN_OR_RAISE(auto batch, ActiveInput().Next());
+  if (retry_if_empty_ && !use_fallback_) {
+    // A row from the guarded inner joins proves every fact branch was used. An empty result
+    // could have skipped a probe entirely. Let the guard retry before publishing any scans.
+    if (batch.end()) {
+      return arrow::Status::Invalid("cannot verify the scans of an empty combined join");
+    }
+    retry_if_empty_ = batch.selected_rows() == 0;
+  }
+  return batch;
+}
 
 arrow::Status SharedBuildsOperator::Close() {
   const arrow::Status status = ActiveInput().Close();
   ReleaseBuilds();
   return status;
+}
+
+bool SharedBuildsOperator::UsedCombinedDomains() const {
+  return !use_fallback_ && std::ranges::any_of(builds_, [](const SharedBuild& build) {
+    return build.join_filter != CombinedJoinFilter::kOrdinary;
+  });
 }
 
 void SharedBuildsOperator::ReleaseBuilds() {

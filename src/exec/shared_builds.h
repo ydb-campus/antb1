@@ -23,6 +23,7 @@ struct SharedBuild {
   std::shared_ptr<MaterializedTable> table;
   std::unique_ptr<Operator> first_producer;
   std::function<arrow::Result<std::unique_ptr<Operator>>()> make_producer;
+  CombinedJoinFilter join_filter = CombinedJoinFilter::kOrdinary;
 };
 
 // Runs every shared sub-plan to completion before it opens `input`, and owns the results.
@@ -55,6 +56,9 @@ class SharedBuildsOperator final : public Operator {
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override;
+  // The deferred-dimension guard can retry this run with independent groups after dropping
+  // the entire consumer and its retained output. PF5 may already have made that switch.
+  [[nodiscard]] bool UsedCombinedDomains() const;
 
  private:
   [[nodiscard]] Operator& ActiveInput() const { return use_fallback_ ? *unshared_ : *input_; }
@@ -66,6 +70,7 @@ class SharedBuildsOperator final : public Operator {
   Fallback fallback_;
   std::unique_ptr<Operator> unshared_;
   bool use_fallback_ = false;
+  bool retry_if_empty_ = false;
 };
 
 }  // namespace antb1::exec

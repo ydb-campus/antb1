@@ -465,6 +465,23 @@ of sorted output and validates the scans before releasing any rows. The query al
 winning plan's files at completion. If the proof fails or the attempt cannot finish within its
 memory allowance, the executor releases the attempt and runs the original plan.
 
+Within this guarded plan, branches that compute the same exact aggregates for different values of
+a retained grouping key can share a producer. The producer reads the requested values together
+and groups by the original keys, including the restricted key. Each reader selects its own value
+from the materialized groups. The planner requires matching inputs and aggregate expressions,
+at least ten million input rows, and at most nine distinct filter values. For a direct scan,
+it skips sharing when part statistics prove that each reader would scan different parts.
+When estimating the combined result against the 256 MiB cap, it counts one value for each
+other grouping key fixed by a common equality.
+
+If widening a lookup build could make its key range span extra probe parts, the producer must
+retain the exact lookup keys. An unchanged build that exceeds the exact-key limit can use the
+same range as the independent aggregates. The planner skips a widened build when the footers
+prove that whole parts pass the lookup filter and contain more non-NULL keys than the limit.
+If the shared attempt fails or returns an empty joined result, the executor can retry the
+independent aggregates with deferred lookup and a fresh scan context. Only the winning attempt
+contributes files to final validation.
+
 | Operator | Logical node | Does |
 | --- | --- | --- |
 | `TableScanOperator` | `Scan` | `plan::Table::ScanPart` (in a part pipeline) or `Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |

@@ -19,10 +19,10 @@
 
 namespace antb1::plan {
 
-// One group of equivalent sub-plans.
+// A shared result and its readers. With a combined producer, each reader takes one disjoint
+// group-key partition; otherwise every member computes the same rows.
 struct SharedSubPlan {
-  // Two or more, distinct nodes, in the order a walk from the root meets them. Every member
-  // computes the same rows in the same order as every other.
+  // Two or more distinct nodes, in the order a walk from the root meets them.
   std::vector<LogicalNodePtr> members;
   // The member whose output columns contain every other member's: the one a later item would
   // actually compute, the others reading a subset of its result. A group whose members' outputs do
@@ -36,6 +36,11 @@ struct SharedSubPlan {
   // the sum of those. A member reads at most this many, so the difference is what sharing would
   // decode for a consumer that does not want it.
   int64_t fields = 0;
+  LogicalNodePtr combined_producer;
+  // True when widening the equality changes the input to the producer's lookup build.
+  bool widens_join_build = false;
+  // Empty for exact matches, otherwise one equality on each member's own output column.
+  std::vector<Predicate> reader_predicates;
 };
 
 // Direct consumer filters, indexed once when the physical planner admits its first shared
@@ -93,7 +98,10 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan);
 
 // The physical planner's non-overlapping, worthwhile producers, including compound queries
 // and candidates inside their branches. It leaves the logical EXPLAIN's structural groups alone.
-std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan);
+// Only the guarded deferred-dimension alternative opts into sharing different constant
+// partitions: it consumes exact aggregate states and orders the observable output.
+std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan,
+                                                  bool share_filtered_groups = false);
 
 // The cap used for both the plan-time estimate and the bytes held at execution.
 inline constexpr int64_t kMaxSharedResultBytes = int64_t{256} * 1024 * 1024;

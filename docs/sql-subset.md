@@ -1513,7 +1513,11 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - `DeferredDimensionJoin` shows a guarded plan that fetches dimension attributes after joining grouped
     branches on an integer key. Its final `HashBuild` reports `dimension_check`, the time spent verifying the keys.
     `dimension_verified` counts completed runs of the guarded plan. `dimension_fallbacks` counts retries
-    with the original plan, which appears as a second input when executed.
+    with the original plan, which appears as a second input when executed. Inside the guarded plan,
+    grouped branches that differ only by an integer or DATE equality on a retained key can share
+    one aggregate. Each reader filters the materialized groups for its own value. The guarded
+    input reports `shared_rows` for a completed shared build. Its `shared_fallbacks` counter
+    includes retries that keep the deferred lookup and run the per-value aggregates independently.
   - on the query's root, `shared` is time spent preparing shared sub-plans and `shared_rows` is
     the number of rows retained when sharing succeeds. If a shared result exceeds the 256 MiB cap,
     the query budget refuses a reservation, or preparation fails, antb1 releases the shared results

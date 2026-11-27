@@ -36,6 +36,7 @@
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/join_table.h"
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
@@ -4999,6 +5000,54 @@ TEST_F(HashJoinPlanTest, ADirectBuildTakesNoRowFilterAndStillPrunesParts) {
     EXPECT_EQ(RowsOf(**got), RowsOf(**control));
     EXPECT_FALSE(RowsOf(**got).empty());
   }
+}
+
+TEST_F(HashJoinPlanTest, CombinedDomainsRequireExactPartPruningBeforeTheProbeOpens) {
+  // The two domains match a row in the first and last probe parts. Each has an exact key
+  // filter by itself, but their union exceeds the limit and its min/max spans the middle part.
+  constexpr int64_t kRows = (KeyFilter::kMaxPublishedKeys / 2) + 1;
+  constexpr int64_t kGap = 100'000;
+  const auto keys = [](int64_t i) { return i < kRows ? i : (2 * kGap) + i - kRows; };
+  const auto run = [&](int64_t first, int64_t rows, CombinedJoinFilter join_filter,
+                       const std::vector<int64_t>& expected_parts) {
+    const auto probe = MixedTable("p", 3, 1, [](int64_t i) { return i * kGap; });
+    const auto build = MixedTable("b", 1, rows, [&](int64_t i) { return keys(first + i); });
+    const auto plan = PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(probe, "p"), ScanOf(build, "b"),
+                                    {MixedColumn("p", 0)}, {MixedColumn("b", 0)}),
+                             6);
+    const auto result = RunPlan(plan, {.join_filter = join_filter});
+    if (expected_parts.empty()) {
+      EXPECT_TRUE(result.status().IsInvalid()) << result.status();
+      EXPECT_TRUE(result.status().message().contains("preserve part pruning")) << result.status();
+    } else {
+      ASSERT_TRUE(result.ok()) << result.status();
+      EXPECT_EQ((*result)->num_rows(), rows > KeyFilter::kMaxPublishedKeys ? 2 : 1);
+    }
+    EXPECT_EQ(probe->scanned_parts(), expected_parts);
+  };
+  run(0, 2 * kRows, CombinedJoinFilter::kWidenedBuild, {});
+  run(0, kRows, CombinedJoinFilter::kOrdinary, {0});
+  run(kRows, kRows, CombinedJoinFilter::kOrdinary, {2});
+  run(kRows - 1, 2, CombinedJoinFilter::kWidenedBuild, {2});  // exact keys skip the gap
+  // Widening the probe's predicates also visits the middle part in both independent joins.
+  run(0, 2 * kRows, CombinedJoinFilter::kUnchangedBuild, {0, 1, 2});
+}
+
+TEST_F(HashJoinPlanTest, CombinedDomainsAcceptARangeWhenTheProbeKeyIsComputed) {
+  const auto probe = MixedTable("p", 2, 1, [](int64_t i) { return i; });
+  const auto build =
+      MixedTable("b", 1, KeyFilter::kMaxPublishedKeys + 1, [](int64_t i) { return i; });
+  // The pipeline cannot pass the build's filter through a Compute. The probe reads both parts
+  // for each independent reader too, irrespective of the range the combined build publishes.
+  const auto key = std::make_shared<plan::Expr>(plan::Expr{.node = plan::ColumnExpr{.index = 0}});
+  const auto input = Node(plan::ComputeNode{.input = ScanOf(probe, "p"), .exprs = {key}});
+  const auto plan = PlanOf(JoinOf(plan::JoinKind::kInner, input, ScanOf(build, "b"),
+                                  {Column(3, "k", LogicalType::kBigInt)}, {MixedColumn("b", 0)}),
+                           7);
+  const auto result = RunPlan(plan, {.join_filter = CombinedJoinFilter::kWidenedBuild});
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ((*result)->num_rows(), 2);
+  EXPECT_EQ(probe->scanned_parts(), (std::vector<int64_t>{0, 1}));
 }
 
 // ADR 0029's D2: a part of the probe's scan whose key column spans no key the build published is

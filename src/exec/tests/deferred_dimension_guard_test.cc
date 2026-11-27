@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -76,6 +77,21 @@ TEST_F(DeferredDimensionGuardTest, RetriesWhenTheRetainedOutputExceedsTheSizeCap
   const auto result = Drain(**guarded, {});
   ASSERT_TRUE(result.ok()) << result.status();
   EXPECT_EQ((*result)->num_rows(), 1);
+}
+
+TEST_F(DeferredDimensionGuardTest, KeepsDeferredLookupAfterACombinedPlanCannotBeBuilt) {
+  const auto refused = [](const plan::LogicalPlan&,
+                          ProfileNode*) -> arrow::Result<std::unique_ptr<Operator>> {
+    return arrow::Status::OutOfMemory("cannot build combined plan");
+  };
+  const auto batch = Payload(kKiB);
+  ProfileNode profile;
+  auto guarded = MakeDeferredDimensionJoin(Payloads({batch, batch}), Payloads({batch}), &profile,
+                                           BuildPhysicalPlan, refused);
+  ASSERT_TRUE(guarded.ok()) << guarded.status();
+  const auto result = Drain(**guarded, {});
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ((*result)->num_rows(), 2);
 }
 
 // The speculative input emits a row, then fails while retaining its working buffer until
@@ -167,6 +183,64 @@ TEST_F(DeferredDimensionGuardTest, DiscardsPartialResultsAndWorkingMemoryBeforeE
   EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
+TEST_F(DeferredDimensionGuardTest, RetriesAFailedCombinedConsumerBeforeDroppingDeferredLookup) {
+  const auto schema = arrow::schema({arrow::field("n", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(schema, 1, {testing::Int64s({33})});
+  const auto table =
+      std::make_shared<testing::MemoryTable>(schema, arrow::RecordBatchVector{batch});
+  const auto plan_for = [&](const char* name) {
+    const auto root = std::make_shared<plan::LogicalNode>(plan::ScanNode{
+        .table = table, .table_name = name, .fields = {0}, .ids = {plan::ColumnId{1}}});
+    return plan::LogicalPlan{.root = root, .output = {{.name = "n", .id = plan::ColumnId{1}}}};
+  };
+  const auto independent = [](const plan::LogicalPlan& logical,
+                              ProfileNode* profile) -> arrow::Result<std::unique_ptr<Operator>> {
+    if (std::get<plan::ScanNode>(*logical.root).table_name == "original") {
+      return BuildPhysicalPlan(logical, profile);
+    }
+    return std::make_unique<RetryInput>(false);  // checks all failed working memory was released
+  };
+  const auto combined = [](const plan::LogicalPlan& logical,
+                           ProfileNode* profile) -> arrow::Result<std::unique_ptr<Operator>> {
+    const auto& scan = std::get<plan::ScanNode>(*logical.root);
+    auto fail_after_prefix = [](ProfileNode* node) {
+      auto input = std::make_unique<RetryInput>(true);
+      input->set_profile(node);
+      return input;
+    };
+    std::vector<SharedBuild> producers;
+    producers.push_back({.table = std::make_shared<MaterializedTable>(scan.table->schema()),
+                         .make_producer = [scan] -> arrow::Result<std::unique_ptr<Operator>> {
+                           if (scan.table_name == "producer failure") {
+                             return arrow::Status::OutOfMemory("combined producer refused");
+                           }
+                           return std::make_unique<TableScanOperator>(scan.table, scan.fields);
+                         },
+                         .join_filter = CombinedJoinFilter::kUnchangedBuild});
+    auto op = std::make_unique<SharedBuildsOperator>(fail_after_prefix(profile),
+                                                     std::move(producers), fail_after_prefix);
+    op->set_profile(profile);
+    return op;
+  };
+  for (const bool producer_fails : {false, true}) {
+    SCOPED_TRACE(producer_fails);
+    ProfileNode profile;
+    const auto fast = plan_for(producer_fails ? "producer failure" : "consumer failure");
+    auto op =
+        MakeDeferredDimensionJoin(fast, plan_for("original"), &profile, independent, combined);
+    ASSERT_TRUE(op.ok()) << op.status();
+    MemoryBudget budget(16 * 1024 * 1024);
+    for (int run = 0; run < 2; ++run) {
+      const auto result = Drain(**op, {.pool = &budget, .budget = &budget});
+      ASSERT_TRUE(result.ok()) << result.status();
+      // PF5 already tried an independent consumer after a producer failure. Its subsequent
+      // failure goes straight to the original. A failed combined consumer gets the guarded retry.
+      EXPECT_EQ(testing::SingleInt64(**result), producer_fails ? 33 : 22);
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
 class GuardScanState final : public plan::TableScanState {
  public:
   arrow::Status FinishPart(int64_t /*part*/, arrow::MemoryPool* /*pool*/) override {
@@ -175,6 +249,7 @@ class GuardScanState final : public plan::TableScanState {
   }
   arrow::Status status;
   int checks = 0;
+  int reads = 0;
 };
 
 class GuardScanTable final : public plan::Table {
@@ -190,6 +265,7 @@ class GuardScanTable final : public plan::Table {
       const std::vector<int>& /*fields*/, int64_t /*size*/, arrow::MemoryPool* /*pool*/,
       const std::shared_ptr<plan::ScanContext>& context) const override {
     ARROW_RETURN_NOT_OK(context->Get(*this).status());
+    ++state->reads;
     auto row = arrow::RecordBatch::Make(schema_, 1, {testing::Int64s({42})});
     return std::make_unique<testing::VectorReader>(schema_, arrow::RecordBatchVector{row});
   }
@@ -197,6 +273,60 @@ class GuardScanTable final : public plan::Table {
  private:
   const std::shared_ptr<arrow::Schema> schema_ = arrow::schema({arrow::field("n", arrow::int64())});
 };
+
+TEST_F(DeferredDimensionGuardTest, EmptyJoinedResultDiscardsUnusedProducerScans) {
+  const auto probe = std::make_shared<GuardScanTable>();
+  const auto empty = std::make_shared<testing::MemoryTable>(
+      probe->schema(), arrow::RecordBatchVector{}, /*split=*/true);
+  const auto scan = [](std::shared_ptr<plan::Table> table, plan::ColumnId id) {
+    return std::make_shared<plan::LogicalNode>(
+        plan::ScanNode{.table = std::move(table), .fields = {0}, .ids = {id}});
+  };
+  const plan::ColumnId left{1};
+  const plan::ColumnId right{2};
+  const plan::JoinNode join{.kind = plan::JoinKind::kInner,
+                            .left = scan(probe, left),
+                            .right = scan(empty, right),
+                            .keys = {{.left = {.id = left}, .right = {.id = right}}}};
+  const plan::LogicalPlan joined{
+      .root = std::make_shared<plan::LogicalNode>(join),
+      .output = {{.name = "left", .id = left}, {.name = "right", .id = right}}};
+  const auto candidate = [](const plan::LogicalPlan& plan,
+                            ProfileNode* profile) -> arrow::Result<std::unique_ptr<Operator>> {
+    ARROW_ASSIGN_OR_RAISE(auto inner, BuildPhysicalPlan(plan, profile));
+    const auto& input = std::get<plan::JoinNode>(*plan.root).left;
+    const auto table = std::get<plan::ScanNode>(*input).table;
+    std::vector<SharedBuild> producers;
+    producers.push_back({.table = std::make_shared<MaterializedTable>(table->schema()),
+                         .make_producer = [table] -> arrow::Result<std::unique_ptr<Operator>> {
+                           return std::make_unique<TableScanOperator>(table, std::vector<int>{0});
+                         },
+                         .join_filter = CombinedJoinFilter::kUnchangedBuild});
+    return std::make_unique<SharedBuildsOperator>(
+        std::move(inner), std::move(producers),
+        [plan](ProfileNode* fallback) { return BuildPhysicalPlan(plan, fallback); });
+  };
+  ProfileNode profile;
+  const auto op = MakeDeferredDimensionJoin(joined, joined, &profile, BuildPhysicalPlan, candidate);
+  ASSERT_TRUE(op.ok()) << op.status();
+  ExecContext ctx{.scans = std::make_shared<plan::ScanContext>()};
+  ASSERT_TRUE((*op)->Open(ctx).ok());
+  const auto end = (*op)->Next();
+  ASSERT_TRUE(end.ok()) << end.status();
+  EXPECT_TRUE(end->end());
+  ASSERT_TRUE((*op)->Close().ok());
+  EXPECT_EQ(probe->state->reads, 1);  // the eager producer only: both joins skip the probe
+  probe->state->status = arrow::Status::IOError("probe file removed after the join");
+  EXPECT_TRUE(ctx.scans->Finish(ctx.pool).ok());
+  EXPECT_EQ(probe->state->checks, 0);
+  EXPECT_TRUE(std::ranges::any_of(profile.metrics(), [](const ProfileMetric& metric) {
+    return metric.name == "dimension_verified" && metric.value == 1;
+  }));
+  ASSERT_EQ(profile.children().size(), 1U);
+  EXPECT_TRUE(std::ranges::any_of(profile.children().front()->metrics(), [](const auto& metric) {
+    return metric.name == "shared_fallbacks" && metric.value == 1;
+  }));
+}
 
 TEST_F(DeferredDimensionGuardTest, CallerFinishesOnlyTheChosenScansAfterReceivingTheirRows) {
   const auto plan_for = [](const std::shared_ptr<GuardScanTable>& table, const char* name) {

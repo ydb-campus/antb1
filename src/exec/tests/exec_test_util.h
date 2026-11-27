@@ -365,6 +365,10 @@ class MemoryTable final : public plan::Table {
   }
   // ScanPart(part) fails with an IOError naming the part (each part this is called for).
   void FailPart(int64_t part) { failing_parts_.push_back(part); }
+  void FailNextPart() {
+    const std::scoped_lock lock(mutex_);
+    fail_next_part_ = true;
+  }
   // ScanPart of `field` (with any other fields) fails with an IOError naming the field.
   void FailField(int field) { failing_field_ = field; }
   // With `split`: exact statistics of the columns ParquetTable reports them for -- integer-valued
@@ -463,6 +467,9 @@ class MemoryTable final : public plan::Table {
     {
       const std::scoped_lock lock(mutex_);
       scanned_parts_.push_back(part);
+      if (std::exchange(fail_next_part_, false)) {
+        return arrow::Status::IOError("transient read failure in part ", part);
+      }
     }
     if (std::ranges::find(failing_parts_, part) != failing_parts_.end()) {
       return arrow::Status::IOError("part ", part, " is broken");
@@ -619,6 +626,7 @@ class MemoryTable final : public plan::Table {
   mutable std::atomic<int> filtered_scans_ = 0;
   mutable std::atomic<int> scans_ = 0;
   mutable std::mutex mutex_;
+  mutable bool fail_next_part_ = false;
   mutable std::vector<int64_t> scanned_parts_;
 };
 

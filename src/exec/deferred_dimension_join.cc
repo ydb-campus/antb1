@@ -21,6 +21,7 @@
 #include "key_table.h"
 #include "profiled_operator.h"
 #include "scan_finish.h"
+#include "shared_builds.h"
 
 namespace antb1::exec {
 namespace {
@@ -40,11 +41,13 @@ bool SameTypes(const arrow::Schema& first, const arrow::Schema& second) {
 class DeferredDimensionJoinOperator final : public Operator {
  public:
   DeferredDimensionJoinOperator(plan::LogicalPlan fast, plan::LogicalPlan original,
-                                DimensionPlanBuilder build, std::shared_ptr<arrow::Schema> schema,
+                                DimensionPlanBuilder build, DimensionPlanBuilder build_fast,
+                                std::shared_ptr<arrow::Schema> schema,
                                 std::unique_ptr<Operator> first)
       : fast_(std::move(fast)),
         original_(std::move(original)),
         build_(build),
+        build_fast_(build_fast),
         schema_(std::move(schema)),
         first_(std::move(first)) {}
 
@@ -166,15 +169,11 @@ class DeferredDimensionJoinOperator final : public Operator {
     }
   }
 
-  arrow::Result<bool> TryCandidate(const ExecContext& ctx) {
+  arrow::Result<bool> Verify(Operator& fast, const ExecContext& ctx) {
     ExecContext run = ctx;
     run.scans = std::make_shared<plan::ScanContext>();
-    auto fast = std::move(first_);
-    if (fast == nullptr) {
-      ARROW_ASSIGN_OR_RAISE(fast, build_(fast_, Child(0)));
-    }
-    const auto kept = KeyTableNoBadAlloc([&] { return Collect(*fast, run); });
-    const auto closed = fast->Close();
+    const auto kept = KeyTableNoBadAlloc([&] { return Collect(fast, run); });
+    const auto closed = fast.Close();
     if (!closed.ok() || !kept.ok() || !*kept) {
       return false;
     }
@@ -185,9 +184,44 @@ class DeferredDimensionJoinOperator final : public Operator {
     return true;
   }
 
+  arrow::Result<bool> TryCandidate(const ExecContext& ctx) {
+    auto fast = std::move(first_);
+    if (fast == nullptr) {
+      auto built = KeyTableNoBadAlloc([&] { return build_fast_(fast_, Child(0)); });
+      if (built.ok()) {
+        fast = *std::move(built);
+      } else if (build_fast_ == build_) {
+        return false;
+      }
+    }
+    if (fast != nullptr) {
+      const auto kept = KeyTableNoBadAlloc([&] { return Verify(*fast, ctx); });
+      if (kept.ok() && *kept) {
+        return true;
+      }
+      const auto* shared = dynamic_cast<const SharedBuildsOperator*>(fast.get());
+      if (shared == nullptr || !shared->UsedCombinedDomains()) {
+        return false;
+      }
+    }
+    // Widening can exhaust the budget in the consumer, or reach EOF before proving which
+    // scans were needed. Drop that attempt, including any buffered prefix, and keep the
+    // deferred lookup while retrying the independent per-value aggregates.
+    fast.reset();
+    DiscardOutput();
+    ProfileNode* retry = Child(0);
+    if (retry != nullptr) {
+      retry->AddNoThrow("shared_fallbacks", MetricUnit::kCount, 1);
+      retry = retry->Child(retry->children().size());
+    }
+    ARROW_ASSIGN_OR_RAISE(auto independent, build_(fast_, retry));
+    return Verify(*independent, ctx);
+  }
+
   plan::LogicalPlan fast_;
   plan::LogicalPlan original_;
   DimensionPlanBuilder build_;
+  DimensionPlanBuilder build_fast_;
   std::shared_ptr<arrow::Schema> schema_;
   std::unique_ptr<Operator> first_;
   std::unique_ptr<Operator> original_op_;
@@ -201,10 +235,9 @@ class DeferredDimensionJoinOperator final : public Operator {
 
 }  // namespace
 
-arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(plan::LogicalPlan fast,
-                                                                   plan::LogicalPlan original,
-                                                                   ProfileNode* profile,
-                                                                   DimensionPlanBuilder build) {
+arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(
+    plan::LogicalPlan fast, plan::LogicalPlan original, ProfileNode* profile,
+    DimensionPlanBuilder build, DimensionPlanBuilder build_fast) {
   ARROW_ASSIGN_OR_RAISE(auto ordinary, build(original, nullptr));
   auto schema = ordinary->output_schema();
   ordinary.reset();
@@ -213,8 +246,22 @@ arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(plan::Logical
     profile->set_detail("verify unique, non-NULL surrogate and business keys");
   }
   ProfileNode* child = profile == nullptr ? nullptr : profile->Child(0);
-  auto first = KeyTableNoBadAlloc([&] { return build(fast, child); });
-  if (!first.ok() || !SameTypes(*schema, *(*first)->output_schema())) {
+  if (build_fast == nullptr) {
+    build_fast = build;
+  }
+  const auto candidate = [&] -> arrow::Result<std::unique_ptr<Operator>> {
+    ARROW_ASSIGN_OR_RAISE(auto op, build_fast(fast, child));
+    if (!SameTypes(*schema, *op->output_schema())) {
+      return arrow::Status::Invalid("deferred dimension join candidate has incompatible types");
+    }
+    return op;
+  };
+  auto first = KeyTableNoBadAlloc(candidate);
+  if (!first.ok() && build_fast != build) {
+    build_fast = build;
+    first = KeyTableNoBadAlloc(candidate);
+  }
+  if (!first.ok()) {
     // An optional physical shape may cost more to construct than the ordinary tree.
     if (profile == nullptr) {
       return build(original, nullptr);
@@ -224,7 +271,8 @@ arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(plan::Logical
     return std::make_unique<ProfiledOperator>(std::move(fallback), profile);
   }
   auto guarded = std::make_unique<DeferredDimensionJoinOperator>(
-      std::move(fast), std::move(original), build, std::move(schema), *std::move(first));
+      std::move(fast), std::move(original), build, build_fast, std::move(schema),
+      *std::move(first));
   if (profile == nullptr) {
     return guarded;
   }
