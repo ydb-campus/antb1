@@ -32,8 +32,10 @@
 #include "antb1/exec/operator.h"
 #include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/shared_sub_plans.h"
 
 #include "gather.h"
+#include "key_table.h"
 #include "part_operators.h"
 #include "part_scheduler.h"
 
@@ -41,6 +43,33 @@ namespace antb1::exec {
 namespace {
 
 using BuildPart = std::shared_ptr<const JoinBuildPart>;
+
+// Deferred dimension joins replace equality on a business key with equality on the surrogate
+// key of this build. Verify the *same retained values* the join probes and gathers. The join
+// index already determined uniqueness and counted NULL surrogate keys when it was built.
+arrow::Result<bool> VerifyDimension(const JoinTable& table, int business_field,
+                                    const ExecContext& ctx) {
+  if (table.empty() || table.has_null() || !table.unique() || business_field < 0 ||
+      business_field >= table.spec().schema()->num_fields() ||
+      !table.spec().retains(business_field)) {
+    return false;
+  }
+  MemoryBudget scratch(plan::kMaxSharedResultBytes, ctx.pool);
+  arrow::compute::ExecContext kernels(&scratch);
+  const auto& type = table.spec().schema()->field(business_field)->type();
+  ARROW_ASSIGN_OR_RAISE(auto business_keys, MakeKeyTable({type}, &kernels, {}, ctx.budget));
+  for (const auto& batch : table.chunks()) {
+    const auto& column = batch->column(business_field);
+    if (column->null_count() != 0) {
+      return false;
+    }
+    ARROW_ASSIGN_OR_RAISE(const auto ids, business_keys->Consume({{column}, column->length()}));
+    if (ids.after - ids.before != column->length()) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // Frees the memory of `values` (clear() keeps it).
 template <class T>
@@ -226,19 +255,26 @@ bool IsDeterministic(const plan::ExprPtr& expr) {
 
 JoinBuild::JoinBuild(std::shared_ptr<const JoinBuildSpec> spec, PartPipeline pipeline,
                      int64_t num_parts, std::vector<std::shared_ptr<JoinBuild>> builds,
-                     ProfileNode* profile, plan::JoinKind kind)
+                     ProfileNode* profile, plan::JoinKind kind,
+                     std::optional<int> verify_dimension_business_field)
     : spec_(std::move(spec)),
       pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       builds_(std::move(builds)),
       profile_(profile),
-      kind_(kind) {
+      kind_(kind),
+      verify_dimension_business_field_(verify_dimension_business_field) {
   ANTB1_CHECK(spec_ != nullptr && *pipeline_);
 }
 
 JoinBuild::JoinBuild(std::shared_ptr<const JoinBuildSpec> spec, std::unique_ptr<Operator> input,
-                     ProfileNode* profile, plan::JoinKind kind)
-    : spec_(std::move(spec)), input_(std::move(input)), profile_(profile), kind_(kind) {
+                     ProfileNode* profile, plan::JoinKind kind,
+                     std::optional<int> verify_dimension_business_field)
+    : spec_(std::move(spec)),
+      input_(std::move(input)),
+      profile_(profile),
+      kind_(kind),
+      verify_dimension_business_field_(verify_dimension_business_field) {
   ANTB1_CHECK(spec_ != nullptr && input_ != nullptr);
 }
 
@@ -399,6 +435,14 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     // Before Finish: it frees the parts the per-row hashes live in (ADR 0029's D1).
     ARROW_ASSIGN_OR_RAISE(key_filter_, builder->MakeKeyFilter());
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
+    if (verify_dimension_business_field_) {
+      const ProfileTimer check(profile_, "dimension_check");
+      ARROW_ASSIGN_OR_RAISE(const bool verified,
+                            VerifyDimension(*table_, *verify_dimension_business_field_, ctx));
+      if (!verified) {
+        return arrow::Status::Invalid("dimension keys do not identify unique non-NULL rows");
+      }
+    }
     ARROW_ASSIGN_OR_RAISE(columns_, MakeJoinColumns(table_, ctx.budget));
     if (plan::Traits(kind_).one_row) {
       // A planner bug, never an answer: SQL plans only an aggregate without groups here, a scalar

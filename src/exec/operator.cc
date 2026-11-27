@@ -15,6 +15,7 @@
 #include "antb1/plan/table.h"
 
 #include "part_scheduler.h"
+#include "scan_finish.h"
 #include "slice.h"
 
 namespace antb1::exec {
@@ -130,6 +131,12 @@ arrow::Status FinishScanState(plan::TableScanState& state, arrow::MemoryPool* po
 
 }  // namespace
 
+arrow::Status FinishScans(const ExecContext& ctx) {
+  return ctx.scans->Finish(ctx.pool, [&ctx](plan::TableScanState& state, arrow::MemoryPool* pool) {
+    return FinishScanState(state, pool, ctx);
+  });
+}
+
 arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, const ExecContext& ctx) {
   ExecContext run = ctx;
   try {
@@ -142,10 +149,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, const ExecConte
   const arrow::Status closed = op.Close();  // also after a failure: release files and readers
   ARROW_RETURN_NOT_OK(batches.status());
   ARROW_RETURN_NOT_OK(closed);
-  ARROW_RETURN_NOT_OK(
-      run.scans->Finish(run.pool, [&run](plan::TableScanState& state, arrow::MemoryPool* pool) {
-        return FinishScanState(state, pool, run);
-      }));
+  ARROW_RETURN_NOT_OK(FinishScans(run));
   return arrow::Table::FromRecordBatches(op.output_schema(), *batches);
 }
 

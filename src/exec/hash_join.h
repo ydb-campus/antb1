@@ -96,10 +96,11 @@ class JoinBuild {
   // `spec`'s schema, which probes `builds`.
   JoinBuild(std::shared_ptr<const JoinBuildSpec> spec, PartPipeline pipeline, int64_t num_parts,
             std::vector<std::shared_ptr<JoinBuild>> builds, ProfileNode* profile,
-            plan::JoinKind kind);
+            plan::JoinKind kind, std::optional<int> verify_dimension_business_field = {});
   // A build for a join of `kind` of the batches of `input`, whose schema is `spec`'s.
   JoinBuild(std::shared_ptr<const JoinBuildSpec> spec, std::unique_ptr<Operator> input,
-            ProfileNode* profile, plan::JoinKind kind);
+            ProfileNode* profile, plan::JoinKind kind,
+            std::optional<int> verify_dimension_business_field = {});
   JoinBuild(const JoinBuild&) = delete;
   JoinBuild& operator=(const JoinBuild&) = delete;
   JoinBuild(JoinBuild&&) = delete;
@@ -149,6 +150,7 @@ class JoinBuild {
   std::vector<std::shared_ptr<JoinBuild>> builds_;  // the builds the pipeline input probes
   ProfileNode* profile_;
   plan::JoinKind kind_;
+  std::optional<int> verify_dimension_business_field_;
   std::shared_ptr<const JoinTable> table_;
   std::shared_ptr<const JoinColumns> columns_;
   std::shared_ptr<const OneRowValues> values_;

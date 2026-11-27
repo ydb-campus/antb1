@@ -41,6 +41,7 @@ antb1_add_module(
     key_filter.cc
     materialized_table.cc
     shared_builds.cc
+    deferred_dimension_join.cc
     limit.cc
     set_operation.cc
     union_distinct.cc
@@ -94,6 +95,8 @@ if(ANTB1_BUILD_TESTS)
       tests/set_operation_test.cc
       tests/union_all_test.cc
       tests/union_aggregate_test.cc
+      tests/deferred_dimension_join_test.cc
+      tests/deferred_dimension_guard_test.cc
     LIBS ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}
   )
   # Replaces the global operator new and delete (an allocation-failure hook), so it is an executable of its own.

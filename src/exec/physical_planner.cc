@@ -29,12 +29,14 @@
 #include "antb1/exec/sort.h"
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/catalog.h"
+#include "antb1/plan/deferred_dimension_join.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
+#include "deferred_dimension_join.h"
 #include "grouping_sets_shape.h"
 #include "hash_join.h"
 #include "materialized_table.h"
@@ -436,6 +438,10 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
         retain[i] = retain[i] || std::ranges::find(reads, ids[i]) != reads.end();
       }
     }
+    if (join.verify_dimension_business_field && *join.verify_dimension_business_field >= 0 &&
+        *join.verify_dimension_business_field < schema.num_fields()) {
+      retain[Narrow<std::size_t>(*join.verify_dimension_business_field)] = true;
+    }
     return retain;
   };
   const auto spec_of = [&](std::shared_ptr<arrow::Schema> schema) {
@@ -456,12 +462,13 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
     return std::make_shared<JoinBuild>(
         std::move(spec), std::move(parts.pipeline), parts.count,
         parts.builds == nullptr ? std::vector<std::shared_ptr<JoinBuild>>{} : parts.builds->builds,
-        slot, join.kind);
+        slot, join.kind, join.verify_dimension_business_field);
   }
   ARROW_ASSIGN_OR_RAISE(
       auto input, Build(shape.build, std::nullopt, slot == nullptr ? nullptr : slot->Child(0)));
   ARROW_ASSIGN_OR_RAISE(auto spec, spec_of(input->output_schema()));
-  return std::make_shared<JoinBuild>(std::move(spec), std::move(input), slot, join.kind);
+  return std::make_shared<JoinBuild>(std::move(spec), std::move(input), slot, join.kind,
+                                     join.verify_dimension_business_field);
 }
 
 // The builds of the joins in the part pipeline whose top is `top`, outermost first; nullptr when it
@@ -1847,10 +1854,7 @@ plan::LogicalNodePtr Substituted(
   return changed ? plan::WithInputs(*root, std::move(inputs)) : root;
 }
 
-}  // namespace
-
-arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPlan& plan,
-                                                           ProfileNode* profile) {
+OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode* profile) {
   if (!plan.root || plan.output.empty()) {
     return arrow::Status::Invalid("empty logical plan");
   }
@@ -1909,6 +1913,16 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   // what ADR 0030's consequences ask for; less than a full accounting.
   builds->set_profile(profile);
   return builds;
+}
+
+}  // namespace
+
+arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPlan& plan,
+                                                           ProfileNode* profile) {
+  if (auto candidate = plan::FindDeferredDimensionJoin(plan)) {
+    return MakeDeferredDimensionJoin(std::move(*candidate), plan, profile, BuildUnconditionalPlan);
+  }
+  return BuildUnconditionalPlan(plan, profile);
 }
 
 }  // namespace antb1::exec

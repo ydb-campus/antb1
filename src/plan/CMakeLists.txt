@@ -12,6 +12,7 @@ antb1_add_module(
     predicate_domain.cc
     or_factoring.cc
     aggregate_placement.cc
+    deferred_dimension_join.cc
     union_aggregate.cc
     arithmetic_rewrite.cc
     relation_count.cc
@@ -40,6 +41,7 @@ if(ANTB1_BUILD_TESTS)
       tests/join_order_test.cc
       tests/or_factoring_test.cc
       tests/aggregate_placement_test.cc
+      tests/deferred_dimension_join_test.cc
       tests/arithmetic_rewrite_test.cc
       tests/relation_count_test.cc
       tests/column_ids_test.cc

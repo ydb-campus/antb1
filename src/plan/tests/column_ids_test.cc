@@ -194,6 +194,19 @@ TEST(ColumnIdsTest, MapColumnsKeepsUnchangedExpressions) {
   EXPECT_EQ(std::get<ColumnExpr>(arith.right->node).id, kB);
 }
 
+TEST(ColumnIdsTest, PositionMismatchReportsMissingInputsAndExpressions) {
+  EXPECT_EQ(PositionMismatch({.root = Node(FilterNode{})}), "plan node without an input");
+  EXPECT_EQ(PositionMismatch(
+                Plan(Node(ComputeNode{.input = Scan(), .exprs = {nullptr}, .ids = {ColumnId{4}}}))),
+            "Compute without an expression");
+  EXPECT_EQ(PositionMismatch(Plan(
+                Node(JoinNode{.left = Scan(),
+                              .right = Scan({ColumnId{4}, ColumnId{5}, ColumnId{6}}),
+                              .keys = {{.left = Column(kA, 0), .right = Column(ColumnId{4}, 0)}},
+                              .residual = {nullptr}}))),
+            "Join without its residual expression");
+}
+
 TEST(ColumnIdsTest, PositionMismatchNamesTheFirstBrokenInvariant) {
   EXPECT_EQ(PositionMismatch(FilterPlan(Column(kNoColumnId, 0))),
             "Filter: a reference without an id");

@@ -580,6 +580,9 @@ struct JoinNode {
   // outputs and keeps everything when one is not. There is no runtime net below that check.
   std::vector<ColumnId> needed_above;
   SourceSpan span;  // the join in the query
+  // Only on the lookup join in a deferred-dimension alternative. Verify that this column of
+  // the right build and its surrogate join key each identify one non-NULL row before probing.
+  std::optional<int> verify_dimension_business_field;
 };
 
 // A correlated subquery before unnesting (ADR 0023), the formalization's dependent join: for each

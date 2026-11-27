@@ -453,6 +453,18 @@ prepared. An anti, null-aware anti, left or full join reads its probe input what
 with a NULL key, the null-aware one keeps no row but reads them all, as DuckDB does). Errors follow the serial order:
 the builds, outermost first and each after the builds its input probes, then the probe's parts.
 
+**Deferred dimension joins.** Several grouped branches can join the same dimension to translate an
+integer fact key into a business identifier and collect descriptive fields. The planner can keep
+the integer key through the joins and fetch the dimension fields once before sorting when each
+branch produces at most one group per integer key. A branch may also group by a period fixed by
+an equality filter. This bound keeps a key missing from the dimension from multiplying rows
+when two branches match on it.
+The final hash build proves that its integer keys are unique and non-NULL and checks the business
+identifiers in the same retained rows for duplicates and NULLs. The executor buffers up to 256 MiB
+of sorted output and validates the scans before releasing any rows. The query also validates the
+winning plan's files at completion. If the proof fails or the attempt cannot finish within its
+memory allowance, the executor releases the attempt and runs the original plan.
+
 | Operator | Logical node | Does |
 | --- | --- | --- |
 | `TableScanOperator` | `Scan` | `plan::Table::ScanPart` (in a part pipeline) or `Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |
