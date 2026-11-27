@@ -18,6 +18,7 @@ enum class JoinKind : std::uint8_t {
   kAnti,           // each left row without a match
   kNullAwareAnti,  // as SQL's NOT IN: no left row when the right has a NULL key; every left row
                    // when it is empty; else each left row with a non-NULL key and no match
+  kSingle,         // one matched right row per probe, NULL for none, an error on a second
   kOneRow,         // each left row with the right input's single row (no keys)
   kFull,           // every match, each left row without one padded with NULLs, and each right row
                    // without one padded with NULLs (ADR 0037's OJ2)
@@ -68,6 +69,7 @@ struct JoinKindTraits {
   // Each left row comes out exactly once, its columns followed by one BOOLEAN column, its mark
   // (ADR 0041's decisions 12 and 13); no right column is output.
   bool appends_mark = false;
+  bool single_match = false;  // a second passing pair for the same probe row is an error
 };
 
 // The row of `kind` in the table above. An exhaustive switch: a new kind does not compile without
@@ -91,6 +93,8 @@ constexpr JoinKindTraits Traits(JoinKind kind) {
       return {.filters_left = true, .residuals = true, .may_build_left = true};
     case JoinKind::kNullAwareAnti:
       return {.filters_left = true, .null_aware = true};
+    case JoinKind::kSingle:
+      return {.outputs_right = true, .pads_right = true, .residuals = true, .single_match = true};
     case JoinKind::kOneRow:
       return {.outputs_right = true, .one_row = true};
     case JoinKind::kFull:
@@ -122,7 +126,7 @@ constexpr bool OutputsMatchesOnly(JoinKind kind) {
 // FULL join outputs at most that.
 constexpr int64_t PaddedJoinRows(JoinKind kind, int64_t matches, int64_t left, int64_t right) {
   const JoinKindTraits traits = Traits(kind);
-  if (traits.appends_mark) {
+  if (traits.appends_mark || traits.single_match) {
     return left;  // each left row exactly once, whatever matches
   }
   if (traits.pads_left && traits.pads_right) {

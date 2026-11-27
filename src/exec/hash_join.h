@@ -463,7 +463,7 @@ class HashJoinOperator final : public Operator {
   // candidate of a row none of whose pairs passed, which becomes a padded row; `passing` passing
   // slots (PassingSlots); `continues`: the first slot's row had candidates in the slots before.
   // The slots kept, at the front of probe_rows_ and build_rows_.
-  int64_t KeepPassingOrPadded(int64_t count, int64_t passing, bool continues);
+  arrow::Result<int64_t> KeepPassingOrPadded(int64_t count, int64_t passing, bool continues);
   // The probe batch's columns of rows `rows` (a Take).
   arrow::Result<arrow::ArrayVector> TakeProbe(std::span<const std::uint32_t> rows);
   // The build's columns of build_rows_[0, rows).
@@ -530,6 +530,7 @@ class HashJoinOperator final : public Operator {
   std::uint32_t taken_ = 0;           // and how many of its matches were emitted
   int64_t window_ = 0;  // 1:1, semi, anti, null-aware anti, one-row: the next window's first row
   bool evaluated_ = false;   // a semi, anti or mark join: passed_ holds batch_'s rows
+  JoinRowRef single_row_{};  // first passing candidate, retained until this probe row is complete
   bool row_passed_ = false;  // a left join with residuals: a pair of row_ passed in earlier slots
   std::vector<std::uint32_t> probe_rows_;  // an output batch's probe rows, or the slots'
   std::vector<JoinRowRef> build_rows_;     // and build rows

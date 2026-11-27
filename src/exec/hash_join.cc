@@ -36,6 +36,7 @@
 #include "gather.h"
 #include "part_operators.h"
 #include "part_scheduler.h"
+#include "scalar_subquery.h"
 
 namespace antb1::exec {
 namespace {
@@ -1093,6 +1094,7 @@ arrow::Status HashJoinOperator::Start() {
     case plan::JoinKind::kInner:
     case plan::JoinKind::kSemi:
     case plan::JoinKind::kLeft:
+    case plan::JoinKind::kSingle:
     case plan::JoinKind::kFull:
       keep_ = Keep::kMatched;
       break;
@@ -1136,6 +1138,8 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
   switch (kind_) {
     case plan::JoinKind::kInner:
       return table_->unique() ? NextWindow() : NextPairs();
+    case plan::JoinKind::kSingle:
+      return residual_.empty() ? NextLeftWindow() : NextPadded();
     case plan::JoinKind::kLeft:
     // A FULL join probes as a left join does, and marks the build rows its pairs match on the way
     // (marks_), so that the rows no mark selects come out after the probe (ADR 0037's OJ2).
@@ -1202,6 +1206,14 @@ arrow::Status HashJoinOperator::Pull() {
           table_->FindEvery(in.data->num_rows(), in.selection.get(), ctx_.pool, matches_));
     } else {
       ARROW_RETURN_NOT_OK(table_->Find(keys_, in.selection.get(), ctx_.pool, matches_));
+    }
+  }
+  if (plan::Traits(kind_).single_match && residual_.empty() && !table_->unique()) {
+    // Find gives unselected rows empty ranges. Duplicates of unprobed keys never reach this check.
+    if (std::ranges::any_of(
+            std::span(matches_).first(static_cast<std::size_t>(in.data->num_rows())),
+            [](const JoinMatches& m) { return m.end - m.begin > 1; })) {
+      return ScalarCardinalityError();
     }
   }
   batch_ = std::move(in);
@@ -1420,7 +1432,7 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextPadded() {
         marks_->Mark(build_positions_[pair_slots_[static_cast<std::size_t>(i)]]);
       }
     }
-    rows = KeepPassingOrPadded(rows, passing, continues);
+    ARROW_ASSIGN_OR_RAISE(rows, KeepPassingOrPadded(rows, passing, continues));
     if (rows == 0) {
       return std::nullopt;
     }
@@ -1432,7 +1444,8 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextPadded() {
   return Batch{.data = Assemble(probe, build, rows), .selection = {}};
 }
 
-int64_t HashJoinOperator::KeepPassingOrPadded(int64_t count, int64_t passing, bool continues) {
+arrow::Result<int64_t> HashJoinOperator::KeepPassingOrPadded(int64_t count, int64_t passing,
+                                                             bool continues) {
   // Each row's pairs come in slot order, its last candidate last; `any`: one of the current row's
   // pairs passed, in these slots or (for a row that continues) in the slots before.
   int64_t current = -1;
@@ -1455,12 +1468,23 @@ int64_t HashJoinOperator::KeepPassingOrPadded(int64_t count, int64_t passing, bo
       if (next_passing < passing &&
           std::cmp_equal(pair_slots_[static_cast<std::size_t>(next_passing)], s)) {
         ++next_passing;
+        if (plan::Traits(kind_).single_match) {
+          if (any) {
+            return ScalarCardinalityError();
+          }
+          single_row_ = ref;
+        }
         any = true;
+      } else if (last_[slot] != 0 && any && plan::Traits(kind_).single_match) {
+        ref = single_row_;
       } else if (last_[slot] != 0 && !any) {
         ref = JoinRowRef{.chunk = kNoChunk, .row = 0};  // no candidate of the row passed
       } else {
         continue;
       }
+    }
+    if (plan::Traits(kind_).single_match && last_[slot] == 0) {
+      continue;  // another window may still contain the second passing candidate
     }
     probe_rows_[static_cast<std::size_t>(kept)] = row;
     build_rows_[static_cast<std::size_t>(kept)] = ref;

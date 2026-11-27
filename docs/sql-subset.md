@@ -630,6 +630,11 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   their left input, including through aliases in a derived table's select list. A binding source that
   needs a pending subquery's result, or contains a LIMIT, a window, or an unresolved correlated filter
   is unsupported.
+  A correlated scalar select can return an ordinary row or a group (SQ4b). For each outer row, zero
+  qualifying rows give NULL, one gives its selected value, and two raise the scalar-subquery row
+  error (exit 1), even if both values are equal or NULL. HAVING filters groups before this check.
+  Grouping by exactly the correlation keys needs only a LEFT join. See divergence D39 for which
+  outer rows reach the check.
   Correlated `IN` and `NOT IN` as conjuncts of `WHERE` or an inner `ON` use the same keyed decorrelation
   (SQ8c). `IN` is a semi join on the correlation and membership comparison. `NOT IN` rejects an outer row when
   a surviving inner row matches its probe or either membership value is NULL. For equality-only correlations,
@@ -650,7 +655,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `OFFSET` that selects set values remains SQ14 (`LIMIT 0` is an empty set).
   Every other correlated shape
   is exit code 4: a correlated `EXISTS` without a key or whose grouping or offset needs an outer column
-  without an inner equivalent, a correlated scalar subquery with `GROUP BY`, `LIMIT` or `OFFSET` or whose outer
+  without an inner equivalent, a correlated scalar subquery with `LIMIT` or `OFFSET` or whose outer
   column has neither an inner equivalent nor a supported scalar binding domain, an `IN` or `NOT IN` conjunct in a
   correlated scalar subquery's `HAVING`, a compound
   with an arm that reads an enclosing block; at the subquery
@@ -1976,6 +1981,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D36 | Which error a query reports when several of its subqueries fail | prepares the builds of a slot's value and mark joins outermost first -- the value bound last -- and reports the first build that fails, so of two failing values the one bound last, the one written last unless OR factoring binds a shared conjunct's value first or a value written twice binds at its first occurrence (decision 10): `ct_pop > (SELECT MAX(i32) * 2 FROM edge) AND ct_id > (SELECT zn_city FROM zones)` reports the row error (live since ADR 0041's SQ4a) | reports an overflow before a row error (`More than one row returned by a subquery used as an expression`), whichever is written first, so that query reports its overflow; both exit with code 1 | the answers and the exit codes agree; the `.slt` records hold one failing subquery each, so the message each matches is both engines' |
 | D37 | An `ORDER BY` expression over the alias of a select item that holds a subquery | binds the item's expression again inside the `ORDER BY` expression, which reads the same value or mark, one join (ADR 0041's decision 10), a correlated value's too (SQ5b), and answers: `SELECT ct_id, (SELECT COUNT(*) FROM cities) AS n FROM cities ORDER BY n - ct_id` | a bind error, `Alias "n" referenced in a SELECT clause - but the expression has a subquery`, where the item still holds the value once its `GROUP BY` keys and aggregates are taken out; it answers the alias alone, the item's position, and the alias of a `GROUP BY` key or of an aggregate over a value | `tests/slt/cases/subqueries/select_values.slt`, `group_values.slt`, `in_marks.slt` and `correlated_values.slt` pin both engines' outcomes under `onlyif`; the random generator orders by no expression over the alias of an item that holds a value or a mark |
 | D38 | A `GROUP BY` key that holds a subquery, written again in the select list, `HAVING` or `ORDER BY` | matches the key only where the subquery is written alike as parsed (ADR 0041's SQ2b): another select alias inside it, or another case or quoting of a name, is another expression, whose columns are not grouped, a bind error (exit code 1): `SELECT zn_city + (SELECT MIN(CT_ID) FROM cities), COUNT(*) FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities)`; for a correlated value that expression is a correlated value above the aggregation, exit code 4 until ADR 0041's SQ13 | ignores both and answers | `tests/slt/cases/subqueries/group_values.slt` pins both engines' outcomes under `onlyif`, and `correlated_values.slt` the correlated one pending SQ13; the alias or the position of the key's item answers in both, and the generator repeats no key |
+| D39 | Cardinality errors in correlated scalar subqueries | checks each outer row that reaches the single join after pushed filters and earlier subquery joins | the optimizer can expose different outer bindings to its check | both return NULL for zero rows and raise the scalar row error on the second qualifying row of any binding they check |
 
 ## ClickBench status
 

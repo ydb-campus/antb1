@@ -1492,17 +1492,15 @@ SMALLINT
 5
 6
 
-# ---- DuckDB only until SQ4b gets a PR (ADR 0041: GROUP BY inside a correlated scalar subquery exits 4) ----
+# SQ4b: ordinary grouping has no empty-input row.
 
 # A missing group gives no row, so NULL and not 0.
-onlyif duckdb
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city) = 0 ORDER BY 1
 ----
 SMALLINT
 
-onlyif duckdb
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city) IS NULL ORDER BY 1

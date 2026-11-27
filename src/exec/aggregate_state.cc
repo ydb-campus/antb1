@@ -26,6 +26,7 @@
 #include "decimal_bytes.h"
 #include "double_key.h"
 #include "row_mask.h"
+#include "scalar_subquery.h"
 #include "temporal_average.h"
 #include "variance.h"
 
@@ -665,11 +666,6 @@ class MinMaxState final : public AggregateState {
 
 // ---- the single value of a scalar subquery ----
 
-// DuckDB 1.5.6's first sentence; the rest of its message names a setting antb1 does not offer.
-constexpr std::string_view kMoreThanOneRow =
-    "More than one row returned by a subquery used as an expression - scalar subqueries can only "
-    "return a single row";
-
 // The value of an uncorrelated scalar subquery (ADR 0041's decision 4): the selected rows, NULL
 // values counted as rows, and a copy of the first one, so that no batch stays pinned. Over no row
 // it is NULL, over one row that row's value; over more it fails, at Finalize only, so that an
@@ -710,7 +706,7 @@ class SingleValueState final : public AggregateState {
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
       arrow::MemoryPool* pool) const override {
     if (rows_ > 1) {
-      return arrow::Status::ExecutionError(kMoreThanOneRow);
+      return ScalarCardinalityError();
     }
     return rows_ == 0 ? arrow::MakeArrayOfNull(type_, 1, pool) : first_;
   }

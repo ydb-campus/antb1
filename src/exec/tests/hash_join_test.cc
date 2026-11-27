@@ -3532,6 +3532,23 @@ TEST_F(HashJoinTest, LeftJoinResidualsPadAfterTheLastCandidate) {
       auto batches = Batches(*join, ContextOf(nullptr, batch_size));
       ASSERT_TRUE(batches.ok()) << batches.status().ToString();
       EXPECT_EQ(RowsOf(join->output_schema(), *batches), expected);
+
+      auto single = MakeJoin(SourceOf(probe_schema, probe),
+                             ScanBuild(plan::JoinKind::kSingle, build_table, {0}), {0},
+                             /*prepares=*/true, BuildSide::kRight, {residual});
+      ASSERT_NE(single, nullptr);
+      auto ctx = ContextOf(nullptr, batch_size);
+      if (residual == positive) {
+        // The first probe has five passing partners. Even at batch size one its first
+        // Next must report the duplicate before a LIMIT can take the first match.
+        ASSERT_TRUE(single->Open(ctx).ok());
+        EXPECT_TRUE(single->Next().status().IsExecutionError());
+        ASSERT_TRUE(single->Close().ok());
+      } else {
+        auto scalar_batches = Batches(*single, ctx);
+        ASSERT_TRUE(scalar_batches.ok()) << scalar_batches.status();
+        EXPECT_EQ(RowsOf(single->output_schema(), *scalar_batches), expected);
+      }
     }
   }
 }

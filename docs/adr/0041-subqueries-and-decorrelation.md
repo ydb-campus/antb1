@@ -1263,6 +1263,11 @@ bindings contribute only once to |D|. Scalar aggregate predicates over plain inn
 inequalities and boolean combinations. Only a top-level equality conjunct supplies a hash key. Outer references
 in aggregate arguments without a representative, and bindings needed across query blocks, remain open.
 
+Update (2026-11-27, SQ4b). The single join builds the scalar block and checks qualifying rows per
+probed binding. A group determined by the binding uses a LEFT join. Nonempty grouping sets pass
+through HAVING before the check, and a single empty grouping set retains the static aggregate's
+empty value. Divergence D39 records which outer bindings reach the check.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

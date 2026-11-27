@@ -545,6 +545,8 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
   mark.build = BuildSide::kLeft;
   EXPECT_EQ(PositionMismatch(Plan(Node(mark))),
             "Join: NULL-AWARE MARK join builds on its left input");
+  EXPECT_EQ(PositionMismatch(Plan(Node(Join(JoinKind::kSingle, BuildSide::kLeft)))),
+            "Join: SINGLE join builds on its left input");
   JoinNode two_valued = Join(JoinKind::kMark);
   EXPECT_EQ(PositionMismatch(Plan(Node(two_valued))), "Join: MARK join without a mark");
   two_valued.mark = ColumnId{9};
