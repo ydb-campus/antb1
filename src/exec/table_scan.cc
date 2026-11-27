@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -14,6 +15,8 @@
 #include "antb1/exec/scan_filter.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
+
+#include "materialized_table.h"
 
 namespace antb1::exec {
 
@@ -171,7 +174,12 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
                           table_->ScanPart(*part_, scan_fields_, ctx.batch_size, ctx.pool, filter,
                                            /*positions=*/false, returned_, ctx.scans));
   } else {
-    ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size, ctx.pool, ctx.scans));
+    // Group readers replace a blocking aggregate. Its batch size is set by the group table;
+    // splitting that output at the scan batch size could change a parent's evaluation windows.
+    const auto batch_size = dynamic_cast<const MaterializedGroupPartition*>(table_.get()) != nullptr
+                                ? std::numeric_limits<int64_t>::max()
+                                : ctx.batch_size;
+    ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, batch_size, ctx.pool, ctx.scans));
   }
   return arrow::Status::OK();
 }

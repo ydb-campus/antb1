@@ -753,6 +753,10 @@ LogicalNodePtr ResolveSubtreePositions(
 LogicalPlan ResolvePositions(const LogicalPlan& plan,
                              std::source_location location = std::source_location::current());
 
+// A sorted join whose outer projection is completely ordered, optionally limited after sorting.
+// Rewrites that can change the order of tied rows can still use it when their values are equal.
+const SortNode* FullyOrderedJoin(const LogicalPlan& plan);
+
 // Why the plan is not resolved, or std::nullopt: the first broken invariant (a reference without an
 // id, or whose id is not exactly once among the ids it reads; a column defined twice in the plan,
 // or without an id; a list of ids whose length differs from its columns'; output ids that are not

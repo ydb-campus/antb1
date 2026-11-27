@@ -28,7 +28,8 @@ struct SharedBuild {
 
 // Runs every shared sub-plan to completion before it opens `input`, and owns the results.
 // If a producer fails or its result cannot be retained, it releases all shared builds and opens
-// the original plan. The result stream always comes from one plan for the entire run.
+// the original plan. With no fallback, its enclosing guard owns that retry. The result stream
+// always comes from one plan for the entire run.
 //
 // On the JoinBuild pattern (hash_join.cc's PrepareBuilds), and for the same reason: a consumer
 // cannot read a result that is not there yet, and here the consumers may sit anywhere in the plan

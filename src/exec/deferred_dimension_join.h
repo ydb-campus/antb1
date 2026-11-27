@@ -18,4 +18,11 @@ arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(
     plan::LogicalPlan fast, plan::LogicalPlan original, ProfileNode* profile,
     DimensionPlanBuilder build, DimensionPlanBuilder build_fast = nullptr);
 
+// An empty combined inner join need not have read both original inputs. Verify the sorted
+// attempt and its scans before returning any rows; otherwise retry the independent groups.
+arrow::Result<std::unique_ptr<Operator>> MakeGuardedSharedGroups(const plan::LogicalPlan& plan,
+                                                                 ProfileNode* profile,
+                                                                 DimensionPlanBuilder independent,
+                                                                 DimensionPlanBuilder combined);
+
 }  // namespace antb1::exec

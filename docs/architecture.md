@@ -496,6 +496,21 @@ If the shared attempt fails or returns an empty joined result, the executor can 
 independent aggregates with deferred lookup and a fresh scan context. Only the winning attempt
 contributes files to final validation.
 
+**Sharing a fact scan between grouped sums.** Two branches of an inner join may sum the same
+DOUBLE expression for different values of a lookup column. When both group by that column and
+one other key, one producer can read the two lookup values together and probe the fact table once.
+Within each fact part it routes joined rows to separate aggregate states. Each value keeps its
+own partition merges in fact-part order and its own output batches. Each consumer sees only the
+batches for its original equality. This preserves floating-point addition order and avoids
+materializing the joined fact rows.
+
+The planner considers fact inputs with at least ten million rows and checks the combined group
+estimate against the 256 MiB materialization cap. It requires the final sort to cover all
+observable columns and a result row to depend on both readers. The executor buffers the sorted
+result and validates the scans before publication. An empty result can mean that a join skipped
+a reader. In that case, or if the attempt fails, the original execution determines the result
+and the files to validate.
+
 | Operator | Logical node | Does |
 | --- | --- | --- |
 | `TableScanOperator` | `Scan` | `plan::Table::ScanPart` (in a part pipeline) or `Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |

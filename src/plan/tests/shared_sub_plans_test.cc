@@ -203,6 +203,114 @@ class SharedSubPlansFilteredGroupsTest : public ::testing::Test {
   std::shared_ptr<testing::FakeTable> packets_;
 };
 
+// Both readers bind their own two-key aggregate. Each needs its own floating-point progress
+// within a fact part and the same partition emission order it had as an independent aggregate.
+std::string BandSum(int band) {
+  return BandCount(std::format("d.band={}", band), "d.band", "SUM(p.voltage*d.voltage)",
+                   "packets p JOIN lookup d ON p.slot=d.slot");
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, OrderedJoinSharesTwoLookupBandsWithIndependentSums) {
+  ASSERT_TRUE(
+      catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 20))
+          .ok());
+  const auto from =
+      std::format(" FROM ({}) AS a JOIN ({}) AS b ON a.slot=b.slot", BandSum(4), BandSum(7));
+  const auto sql = "SELECT a.n AS x,b.n AS y" + from;
+  const auto bound = BindSql(sql + " ORDER BY x,y LIMIT 3", catalog_);
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto plan = Optimized(*bound);
+  const auto groups = MaterializableSubPlans(plan);
+  const auto matched = std::ranges::find(groups, true, &SharedSubPlan::separate_partition_states);
+  ASSERT_NE(matched, groups.end());
+  EXPECT_TRUE(matched->widens_join_build);
+  ASSERT_EQ(matched->reader_predicates.size(), 2U);
+  EXPECT_EQ(std::get<Int128>(matched->reader_predicates[0].constant.value), 4);
+  EXPECT_EQ(std::get<Int128>(matched->reader_predicates[1].constant.value), 7);
+  auto projection = std::get<ProjectNode>(*plan.root);
+  projection.columns.front().index = projection.columns.back().index;
+  const LogicalPlan stale{.root = std::make_shared<LogicalNode>(std::move(projection)),
+                          .output = plan.output};
+  EXPECT_TRUE(PositionMismatch(stale));
+  const auto invalid = MaterializableSubPlans(stale);
+  EXPECT_FALSE(std::ranges::any_of(invalid, &SharedSubPlan::separate_partition_states));
+  for (const auto& tail : {"", " LIMIT 3", " ORDER BY x", " ORDER BY x,y LIMIT 0"}) {
+    EXPECT_TRUE(Combined(sql + tail, false).empty()) << tail;
+  }
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, SeparateSumsRequireBothReadersForANonemptyResult) {
+  ASSERT_TRUE(
+      catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 20))
+          .ok());
+  const auto left = BandSum(4);
+  const auto right = BandSum(7);
+  for (const auto& query :
+       {std::format(
+            "SELECT a.n AS x,b.n AS y FROM ({}) a LEFT JOIN ({}) b ON a.slot=b.slot ORDER BY x,y",
+            left, right),
+        std::format("SELECT a.n AS x,b.n AS y FROM ({}) a JOIN ({} UNION ALL {}) b ON "
+                    "a.slot=b.slot ORDER BY x,y",
+                    left, right, BandSum(8)),
+        std::format("SELECT a.n AS x,b.n AS y FROM ({}) a JOIN (SELECT COUNT(*) AS n FROM ({} ) z) "
+                    "b ON a.slot=b.n ORDER BY x,y",
+                    left, right),
+        std::format("SELECT a.n AS x,b.n AS y,c.n AS z FROM ({}) a JOIN ({}) b ON a.slot=b.slot "
+                    "JOIN ({}) c ON b.slot=c.slot ORDER BY x,y,z",
+                    left, right, BandSum(8))}) {
+    EXPECT_TRUE(Combined(query, false).empty()) << query;
+  }
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, SeparateSumsNeedALargeProbeAndOneLookupEquality) {
+  ASSERT_TRUE(
+      catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 20))
+          .ok());
+  const auto small = std::make_shared<testing::FakeTable>(packets_->schema(), 4'000);
+  ASSERT_TRUE(catalog_.Register("small", small).ok());
+  const auto count = [&](std::string_view input, std::string_view aggregate, std::string_view key,
+                         std::string_view conditions, std::string_view extra_filter) {
+    const auto member = [&](int band) {
+      return BandCount(std::format("d.band={} {}", band, extra_filter), key, aggregate,
+                       std::format("{} p JOIN lookup d ON {}", input, conditions));
+    };
+    return Combined(std::format("SELECT a.n AS x,b.n AS y FROM ({}) a JOIN ({}) b "
+                                "ON a.slot=b.slot ORDER BY x,y",
+                                member(4), member(7)),
+                    false)
+        .size();
+  };
+  EXPECT_EQ(count("packets", "SUM(p.voltage)", "d.band", "p.slot=d.slot", ""), 1U);
+  EXPECT_EQ(count("small", "SUM(p.voltage)", "d.band", "p.slot=d.slot", ""), 0U);
+  EXPECT_EQ(count("packets", "MAX(p.voltage)", "d.band", "p.slot=d.slot", ""), 0U);
+  EXPECT_EQ(count("packets", "SUM(p.slot)", "d.band", "p.slot=d.slot", ""), 0U);
+  EXPECT_EQ(count("packets", "SUM(p.voltage)", "p.band", "p.slot=d.slot", ""), 0U);
+  EXPECT_EQ(count("packets", "SUM(p.voltage)", "d.band", "p.slot=d.slot AND p.band=d.band", ""),
+            0U);
+  EXPECT_EQ(count("packets", "SUM(p.voltage)", "d.band", "p.slot=d.slot", "AND d.slot>4"), 0U);
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, IndependentPlanRediscoversAnOverlappingExactAggregate) {
+  ASSERT_TRUE(
+      catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 20))
+          .ok());
+  // Only a and b are required by every output row. An ordinary plan instead shares b with
+  // its identical copy in the union. Simply dropping the combined a/b group would lose it.
+  const auto sql = std::format(
+      "SELECT a.n AS x,b.n AS y,c.n AS z FROM ({}) a JOIN ({}) b ON a.slot=b.slot "
+      "JOIN ({} UNION ALL {}) c ON b.slot=c.slot ORDER BY x,y,z",
+      BandSum(4), BandSum(7), BandSum(7), BandSum(9));
+  const auto plan = BindSql(sql, catalog_);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  const auto combined = MaterializableSubPlans(*plan);
+  ASSERT_EQ(combined.size(), 1U);
+  EXPECT_TRUE(combined.front().separate_partition_states);
+  const auto independent = MaterializableIndependentSubPlans(*plan);
+  ASSERT_EQ(independent.size(), 1U);
+  EXPECT_EQ(independent.front().combined_producer, nullptr);
+  EXPECT_EQ(independent.front().members.size(), 2U);
+}
+
 TEST_F(SharedSubPlansFilteredGroupsTest, MapsEachReaderToItsOwnOutputKeyAndLiteral) {
   const auto query = BandCount("p.band = 7") + " UNION ALL " + BandCount("p.band = 3") +
                      " UNION ALL " + BandCount("p.band = 5");

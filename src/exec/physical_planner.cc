@@ -158,7 +158,12 @@ const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node,
       return nullptr;
     }
     if (const auto* scan = std::get_if<plan::ScanNode>(n)) {
-      return scan->table == nullptr ? nullptr : scan;
+      // A materialized group partition stands in the same place as the blocking aggregate.
+      // Do not turn a parent into a part pipeline or offer it a new dynamic row filter.
+      return scan->table &&
+                     dynamic_cast<const MaterializedGroupPartition*>(scan->table.get()) == nullptr
+                 ? scan
+                 : nullptr;
     }
   }
   return nullptr;
@@ -1468,7 +1473,9 @@ struct Builder {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
     return std::make_unique<ScalarAggregateOperator>(std::move(input), node.aggregates);
   }
-  OperatorResult Grouped(const plan::GroupAggregateNode& node, bool check_widened_build) const {
+  OperatorResult Grouped(const plan::GroupAggregateNode& node, bool check_widened_build,
+                         const std::vector<plan::Predicate>* split = nullptr,
+                         ProfileNode* guard_profile = nullptr) const {
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
       // A filter the join above offered, if its key is one this aggregate **groups by**: then the
       // filter drops whole groups and never changes a surviving group's value, which is the whole
@@ -1496,6 +1503,19 @@ struct Builder {
       }
       ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
       const int width = sample->output_schema()->num_fields();
+      std::vector<PredicateEvaluator> domain_predicates;
+      if (split != nullptr) {
+        for (auto predicate : *split) {
+          if (!predicate.column || predicate.column->index < 0 ||
+              std::cmp_greater_equal(predicate.column->index, node.keys.size())) {
+            return arrow::Status::Invalid("split group: invalid domain key");
+          }
+          predicate.column = node.keys[Narrow<std::size_t>(predicate.column->index)];
+          ARROW_ASSIGN_OR_RAISE(auto evaluator,
+                                PredicateEvaluator::Make(predicate, *sample->output_schema()));
+          domain_predicates.push_back(std::move(evaluator));
+        }
+      }
       // The output schema, as the serial operator names it.
       const GroupAggregateOperator serial(std::move(sample), node.keys, node.aggregates);
       if (TwoLevelAggregation(node.keys, node.aggregates)) {
@@ -1512,11 +1532,18 @@ struct Builder {
            top_n == nullptr ? std::string()
                             : std::format("{} top-N per partition keep={}",
                                           plan::ExplainNode(plan::LogicalNode(node)), top_n->keep));
-      return WithBuilds(std::make_unique<PartGroupAggregateOperator>(
-                            std::move(parts.pipeline), parts.count, width, node.keys,
-                            node.aggregates, serial.output_schema(),
-                            top_n == nullptr ? std::nullopt : std::optional<PartitionTopN>(*top_n)),
-                        parts.builds, slot);
+      auto op = std::make_unique<PartGroupAggregateOperator>(
+          std::move(parts.pipeline), parts.count, width, node.keys, node.aggregates,
+          serial.output_schema(),
+          top_n == nullptr ? std::nullopt : std::optional<PartitionTopN>(*top_n));
+      if (!domain_predicates.empty()) {
+        op->SplitDomains(std::move(domain_predicates),
+                         guard_profile == nullptr ? nullptr : guard_profile->Child(0));
+      }
+      return WithBuilds(std::move(op), parts.builds, slot);
+    }
+    if (split != nullptr) {
+      return std::unique_ptr<Operator>{};
     }
     Name("GroupAggregate");
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
@@ -1889,7 +1916,8 @@ plan::LogicalNodePtr Substituted(
 }
 
 OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode* profile,
-                                      bool share_filtered_groups = false) {
+                                      const std::vector<plan::SharedSubPlan>& groups,
+                                      bool require_split = false) {
   if (!plan.root || plan.output.empty()) {
     return arrow::Status::Invalid("empty logical plan");
   }
@@ -1898,23 +1926,27 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
   // object, carrying its own column ids, so nothing above a consumer is rewritten and no pass ever
   // sees a DAG -- the sharing lives entirely in a shared_ptr<Table> that ScanNode already holds.
   std::vector<SharedBuild> shared;
+  bool has_split = false;
   std::unordered_map<const plan::LogicalNode*, plan::LogicalNodePtr> replacements;
   std::optional<plan::SharedConsumerFilters> consumer_filters;
-  for (const plan::SharedSubPlan& group :
-       plan::MaterializableSubPlans(plan, share_filtered_groups)) {
+  for (const plan::SharedSubPlan& group : groups) {
     if (!consumer_filters.has_value()) {
       consumer_filters.emplace(plan);
     }
     auto node = PreparePhysicalJoins(consumer_filters->Producer(group));
-    auto make_producer = [node] { return Build(node); };
     const auto* widened =
         group.widens_join_build ? std::get_if<plan::GroupAggregateNode>(node.get()) : nullptr;
-    ARROW_ASSIGN_OR_RAISE(auto op, widened
-                                       ? Builder{}.Grouped(*widened, /*check_widened_build=*/true)
-                                       : make_producer());
+    const bool split = group.separate_partition_states;
+    auto make_producer = [node, widened, split, predicates = group.reader_predicates, profile] {
+      return widened ? Builder{}.Grouped(*widened, /*check_widened_build=*/true,
+                                         split ? &predicates : nullptr, profile)
+                     : Build(node);
+    };
+    ARROW_ASSIGN_OR_RAISE(auto op, make_producer());
     if (!op) {
       continue;
     }
+    has_split |= split;
     auto table = std::make_shared<MaterializedTable>(op->output_schema());
     for (std::size_t i = 0; i < group.members.size(); ++i) {
       const plan::LogicalNodePtr& member = group.members[i];
@@ -1922,12 +1954,20 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
       if (ids.size() != group.columns[i].size()) {
         return arrow::Status::Invalid("a shared sub-plan's columns do not match its output");
       }
+      std::shared_ptr<plan::Table> source = table;
+      if (split) {
+        const auto& equality = group.reader_predicates[i];
+        ARROW_ASSIGN_OR_RAISE(auto value, plan::ToArrowScalar(equality.constant));
+        const auto output = Narrow<std::size_t>(equality.column->index);
+        source = std::make_shared<MaterializedGroupPartition>(table, group.columns[i][output],
+                                                              std::move(value));
+      }
       plan::LogicalNodePtr reader =
-          std::make_shared<const plan::LogicalNode>(plan::ScanNode{.table = table,
+          std::make_shared<const plan::LogicalNode>(plan::ScanNode{.table = std::move(source),
                                                                    .table_name = "shared",
                                                                    .fields = group.columns[i],
                                                                    .ids = std::move(ids)});
-      if (!group.reader_predicates.empty()) {
+      if (!split && !group.reader_predicates.empty()) {
         const plan::Predicate& equality = group.reader_predicates[i];
         reader = std::make_shared<const plan::LogicalNode>(plan::FilterNode{
             .input = std::move(reader), .predicates = {equality}, .span = equality.span});
@@ -1945,6 +1985,14 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
                                  .join_filter = join_filter});
   }
 
+  if (require_split) {
+    // No physical split survived (e.g. its lookup exceeds the exact-key cap). Leave the guard's
+    // profile untouched so the ordinary plan can use its original root and scan boundaries.
+    if (!has_split) {
+      return std::unique_ptr<Operator>{};
+    }
+    profile = profile == nullptr ? nullptr : profile->Child(0);
+  }
   const plan::LogicalNodePtr root_node =
       PreparePhysicalJoins(replacements.empty() ? plan.root : Substituted(plan.root, replacements));
   ARROW_ASSIGN_OR_RAISE(auto root, Build(root_node, std::nullopt, profile));
@@ -1955,10 +2003,14 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
   if (shared.empty()) {
     return root;
   }
-  auto builds = std::make_unique<SharedBuildsOperator>(
-      std::move(root), std::move(shared), [original = plan.root](ProfileNode* fallback_profile) {
-        return Build(PreparePhysicalJoins(original), std::nullopt, fallback_profile);
-      });
+  SharedBuildsOperator::Fallback fallback;
+  if (!require_split) {
+    fallback = [original = plan.root](ProfileNode* fallback_profile) {
+      return Build(PreparePhysicalJoins(original), std::nullopt, fallback_profile);
+    };
+  }
+  auto builds = std::make_unique<SharedBuildsOperator>(std::move(root), std::move(shared),
+                                                       std::move(fallback));
   // Profiled into the root's own node, so the shared results' time and rows are visible without
   // the profile tree changing shape. The sub-plans themselves are unprofiled: a reader sees what
   // sharing cost and what it produced, and the consumers' `Scan ... source=shared` lines say who
@@ -1968,6 +2020,10 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
   return builds;
 }
 
+OperatorResult BuildIndependentGroups(const plan::LogicalPlan& plan, ProfileNode* profile) {
+  return BuildUnconditionalPlan(plan, profile, plan::MaterializableIndependentSubPlans(plan));
+}
+
 }  // namespace
 
 arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPlan& plan,
@@ -1975,15 +2031,22 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   if (auto candidate = plan::FindDeferredDimensionJoin(plan)) {
     // Sharing differently filtered aggregates may change group emission order. Only the
     // dimension candidate has proved that its fully ordered output can be buffered and retried.
-    const auto ordinary = [](const plan::LogicalPlan& p, ProfileNode* slot) {
-      return BuildUnconditionalPlan(p, slot);
-    };
     const auto guarded = [](const plan::LogicalPlan& p, ProfileNode* slot) {
-      return BuildUnconditionalPlan(p, slot, /*share_filtered_groups=*/true);
+      return BuildUnconditionalPlan(
+          p, slot, plan::MaterializableSubPlans(p, /*share_filtered_groups=*/true));
     };
-    return MakeDeferredDimensionJoin(std::move(*candidate), plan, profile, ordinary, guarded);
+    return MakeDeferredDimensionJoin(std::move(*candidate), plan, profile, BuildIndependentGroups,
+                                     guarded);
   }
-  return BuildUnconditionalPlan(plan, profile);
+  const auto groups = plan::MaterializableSubPlans(plan);
+  if (std::ranges::any_of(groups, &plan::SharedSubPlan::separate_partition_states)) {
+    const auto combined = [](const plan::LogicalPlan& p, ProfileNode* slot) {
+      return BuildUnconditionalPlan(p, slot, plan::MaterializableSubPlans(p),
+                                    /*require_split=*/true);
+    };
+    return MakeGuardedSharedGroups(plan, profile, BuildIndependentGroups, combined);
+  }
+  return BuildUnconditionalPlan(plan, profile, groups);
 }
 
 }  // namespace antb1::exec

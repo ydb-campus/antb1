@@ -8,7 +8,9 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/array.h>
 #include <arrow/record_batch.h>
+#include <arrow/scalar.h>
 #include <arrow/status.h>
 #include <arrow/type.h>
 #include <arrow/util/byte_size.h>
@@ -94,6 +96,11 @@ std::optional<int64_t> MaterializedTable::exact_row_count() const {
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MaterializedTable::DoScan(
     const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* /*pool*/,
     const std::shared_ptr<plan::ScanContext>& /*context*/) const {
+  return ProjectBatches(fields, batch_size);
+}
+
+arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MaterializedTable::ProjectBatches(
+    const std::vector<int>& fields, int64_t batch_size, int key, const arrow::Scalar* value) const {
   // The batches are taken under the lock and sliced outside it: filling is over before any scan
   // starts, so this only publishes the handover, and holding it through the slicing would serialise
   // consumers that open at the same time -- which the ones this exists for do.
@@ -119,6 +126,14 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MaterializedTable::DoSc
   auto out_schema = arrow::schema(std::move(out_fields));
   arrow::RecordBatchVector out;
   for (const std::shared_ptr<arrow::RecordBatch>& batch : batches) {
+    if (value != nullptr) {
+      // The partition lanes build batches for exactly one key value, and FillTable omits empty
+      // ones.
+      ARROW_ASSIGN_OR_RAISE(auto actual, batch->column(key)->GetScalar(0));
+      if (!actual->Equals(*value)) {
+        continue;
+      }
+    }
     for (int64_t start = 0; start < batch->num_rows(); start += batch_size) {
       const std::shared_ptr<arrow::RecordBatch> slice = batch->Slice(start, batch_size);
       arrow::ArrayVector columns;

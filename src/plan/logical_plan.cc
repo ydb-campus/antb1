@@ -1878,6 +1878,33 @@ LogicalPlan ResolvePositions(const LogicalPlan& plan, std::source_location locat
   return LogicalPlan{.root = std::move(root.node), .output = plan.output};
 }
 
+const SortNode* FullyOrderedJoin(const LogicalPlan& plan) {
+  const auto* output = std::get_if<ProjectNode>(plan.root.get());
+  if (output == nullptr ||
+      (!output->constants.empty() && output->constants.size() != output->columns.size())) {
+    return nullptr;
+  }
+  const auto* limit = std::get_if<LimitNode>(output->input.get());
+  if (limit != nullptr && limit->limit == 0) {
+    return nullptr;
+  }
+  const auto* sort =
+      std::get_if<SortNode>(limit != nullptr ? limit->input.get() : output->input.get());
+  if (sort == nullptr || std::get_if<JoinNode>(sort->input.get()) == nullptr) {
+    return nullptr;
+  }
+  // Sort consumes the whole candidate before emitting anything. Cover all observable values
+  // as well: changing a hash join's keys can change the choice among otherwise tied rows.
+  for (const auto& column : output->columns) {
+    if (column.id != kNoColumnId && !std::ranges::any_of(sort->keys, [&](const SortKey& key) {
+          return key.column.id == column.id;
+        })) {
+      return nullptr;
+    }
+  }
+  return sort;
+}
+
 std::optional<std::string> PositionMismatch(const LogicalPlan& plan) {
   if (plan.root == nullptr) {
     return std::nullopt;

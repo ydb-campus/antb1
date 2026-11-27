@@ -39,6 +39,8 @@ struct SharedSubPlan {
   LogicalNodePtr combined_producer;
   // True when widening the equality changes the input to the producer's lookup build.
   bool widens_join_build = false;
+  // Each reader needs its own per-part accumulation, merge and emission order for DOUBLE SUM.
+  bool separate_partition_states = false;
   // Empty for exact matches, otherwise one equality on each member's own output column.
   std::vector<Predicate> reader_predicates;
 };
@@ -100,10 +102,14 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan);
 
 // The physical planner's non-overlapping, worthwhile producers, including compound queries
 // and candidates inside their branches. It leaves the logical EXPLAIN's structural groups alone.
-// Only the guarded deferred-dimension alternative opts into sharing different constant
-// partitions: it consumes exact aggregate states and orders the observable output.
+// Ordered inner joins can share a scan between two differently filtered DOUBLE sums using
+// independent states. The guarded deferred-dimension alternative also admits exact aggregates.
 std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan,
                                                   bool share_filtered_groups = false);
+
+// Recompute non-overlapping exact shares for the fallback. A previously chosen partition
+// must not prevent the independent plan from selecting a different overlapping producer.
+std::vector<SharedSubPlan> MaterializableIndependentSubPlans(const LogicalPlan& plan);
 
 // The cap used for both the plan-time estimate and the bytes held at execution.
 inline constexpr int64_t kMaxSharedResultBytes = int64_t{256} * 1024 * 1024;

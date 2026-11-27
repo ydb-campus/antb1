@@ -1206,23 +1206,73 @@ LogicalNodePtr WithPartitions(const LogicalNodePtr& node, const Predicate* equal
   return node;
 }
 
+// Widen only the lookup side of an equijoin over one large fact scan. The part executor
+// reads each matching fact part once and preserves both readers' original summation orders.
+bool CanSeparateStates(const GroupAggregateNode& group) {
+  if (group.keys.size() != 2 || group.aggregates.size() != 1) {
+    return false;
+  }
+  const auto& sum = group.aggregates.front();
+  if (sum.kind != AggKind::kSum || sum.type != LogicalType::kDouble || !sum.arg ||
+      sum.arg->type != LogicalType::kDouble) {
+    return false;
+  }
+  const auto* input = group.input.get();
+  if (const auto* compute = std::get_if<ComputeNode>(input)) {
+    input = compute->input.get();
+  }
+  const auto* join = std::get_if<JoinNode>(input);
+  if (join == nullptr || join->kind != JoinKind::kInner || join->keys.size() != 1 ||
+      join->keys.front().null_equal || !join->residual.empty()) {
+    return false;
+  }
+  const bool left_build = join->build == BuildSide::kLeft;
+  const auto* fact = std::get_if<ScanNode>((left_build ? join->right : join->left).get());
+  const auto* lookup = std::get_if<FilterNode>((left_build ? join->left : join->right).get());
+  return fact != nullptr && fact->table &&
+         fact->table->exact_row_count().value_or(0) >= kMinSharedRows && lookup != nullptr &&
+         lookup->predicates.size() == 1 && IsIntegerOrDateEquality(lookup->predicates.front()) &&
+         std::get_if<ScanNode>(lookup->input.get()) != nullptr;
+}
+
+// A row from the sorted result proves these inputs were actually used. A preserved outer
+// input, an empty global aggregate, or a sibling UNION ALL branch cannot prove that.
+bool NonemptyRequiresInputs(const LogicalNode& node) {
+  if (const auto* join = std::get_if<JoinNode>(&node)) {
+    return join->kind == JoinKind::kInner && !join->keys.empty();
+  }
+  if (const auto* group = std::get_if<GroupAggregateNode>(&node)) {
+    return !group->keys.empty();
+  }
+  if (const auto* u = std::get_if<UnionAllNode>(&node)) {
+    return u->inputs.size() == 1;
+  }
+  return std::holds_alternative<FilterNode>(node) || std::holds_alternative<ProjectNode>(node) ||
+         std::holds_alternative<ComputeNode>(node);
+}
+
 class FilteredGroups {
  public:
+  explicit FilteredGroups(const LogicalPlan* ordered_join) : ordered_join_(ordered_join) {}
+
   void Collect(const LogicalNodePtr& node, const Origins& origins) {
     const auto* group = std::get_if<GroupAggregateNode>(node.get());
     if (group == nullptr || group->keys.empty() || group->keys.size() > kMaxPredicateDomainKeys ||
         group->key_ids.size() != group->keys.size() || candidates_.contains(node.get()) ||
-        !std::ranges::all_of(group->keys,
-                             [](const auto& key) {
-                               return key.id != kNoColumnId && FixedBytes(key.type) > 0 &&
-                                      key.type != LogicalType::kDouble;
-                             }) ||
-        !std::ranges::all_of(group->aggregates, [](const auto& call) {
-          return FixedBytes(call.type) > 0 && call.type != LogicalType::kDouble &&
-                 (call.kind == AggKind::kCountStar || call.kind == AggKind::kCount ||
-                  call.kind == AggKind::kSum || call.kind == AggKind::kMin ||
-                  call.kind == AggKind::kMax);
+        !std::ranges::all_of(group->keys, [](const auto& key) {
+          return key.id != kNoColumnId && FixedBytes(key.type) > 0 &&
+                 key.type != LogicalType::kDouble;
         })) {
+      return;
+    }
+    if (ordered_join_ != nullptr
+            ? !CanSeparateStates(*group)
+            : !std::ranges::all_of(group->aggregates, [](const auto& call) {
+                return FixedBytes(call.type) > 0 && call.type != LogicalType::kDouble &&
+                       (call.kind == AggKind::kCountStar || call.kind == AggKind::kCount ||
+                        call.kind == AggKind::kSum || call.kind == AggKind::kMin ||
+                        call.kind == AggKind::kMax);
+              })) {
       return;
     }
     for (const auto& partition : PartitionsOf(node, *group)) {
@@ -1241,7 +1291,7 @@ class FilteredGroups {
   std::optional<SharedSubPlan> Select(const LogicalNodePtr& node, const Origins& origins,
                                       const std::unordered_set<const LogicalNode*>& covered) {
     const auto found = candidates_.find(node.get());
-    if (found == candidates_.end()) {
+    if (found == candidates_.end() || !valid_positions_.value_or(true)) {
       return std::nullopt;
     }
     for (auto* bucket : found->second) {
@@ -1249,7 +1299,7 @@ class FilteredGroups {
       if (!covered.empty()) {
         std::erase_if(partitions, [&](const auto& part) { return Overlaps(part.member, covered); });
       }
-      if (partitions.size() < 2) {
+      if (partitions.size() < 2 || (ordered_join_ != nullptr && partitions.size() != 2)) {
         continue;
       }
       PartitionReaders values;
@@ -1273,6 +1323,17 @@ class FilteredGroups {
       if (!WorthSharingPartitions(widest, values)) {
         continue;
       }
+      if (ordered_join_ != nullptr) {
+        // A hand-built plan can carry stale slots or malformed maps. Verify all reader paths
+        // once, after finding a pair whose scan is actually worth sharing.
+        if (!valid_positions_.has_value()) {
+          valid_positions_ = !PositionMismatch(*ordered_join_);
+        }
+        if (!*valid_positions_) {
+          return std::nullopt;
+        }
+        group->separate_partition_states = true;
+      }
       group->combined_producer =
           WithPartitions(widest.member, widest.equality, values, group->widens_join_build);
       for (const auto& part : partitions) {
@@ -1289,6 +1350,8 @@ class FilteredGroups {
   }
 
  private:
+  const LogicalPlan* ordered_join_;
+  std::optional<bool> valid_positions_;
   using Bucket = std::vector<GroupPartition>;
   // Bucket addresses survive rehashing, and a member need not store another copy of the
   // whole subtree fingerprint for each possible partition.
@@ -1296,15 +1359,19 @@ class FilteredGroups {
   std::unordered_map<const LogicalNode*, std::vector<Bucket*>> candidates_;
 };
 
-std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool executable,
-                                              bool share_filtered_groups = false) {
+enum class SharingMode { kStructural, kIndependent, kSeparateStates, kDeferredDimension };
+
+std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, SharingMode mode) {
   if (plan.root == nullptr) {
     return {};
   }
   Origins origins;
   origins.Walk(plan.root);
   KeyMemo memo;
-  FilteredGroups filtered;
+  const bool executable = mode != SharingMode::kStructural;
+  const bool share_filtered_groups = mode == SharingMode::kDeferredDimension;
+  const auto* order = mode == SharingMode::kSeparateStates ? FullyOrderedJoin(plan) : nullptr;
+  FilteredGroups filtered(order != nullptr ? &plan : nullptr);
   std::unordered_set<const LogicalNode*> covered;
 
   // Every candidate sub-tree by key, in the order a walk from the root meets it. A node that
@@ -1325,6 +1392,7 @@ std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool exec
       Cover(node, covered);
       return;
     }
+    discover_partitions |= order != nullptr && node == order->input;
     if (const std::optional<std::string>& key = SubtreeKey(node, origins, memo); key.has_value()) {
       if (discover_partitions) {
         filtered.Collect(node, origins);
@@ -1343,7 +1411,9 @@ std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool exec
     }
     // The first grouped node in each deferred dimension branch is its verified fact partial.
     // Deeper groups can feed an order-sensitive computation even when the final sort is complete.
-    const bool descend = discover_partitions && !std::holds_alternative<GroupAggregateNode>(*node);
+    const bool descend = discover_partitions &&
+                         (order != nullptr ? NonemptyRequiresInputs(*node)
+                                           : !std::holds_alternative<GroupAggregateNode>(*node));
     for (const LogicalNodePtr& input : InputsOf(*node)) {
       self(self, input, descend);
     }
@@ -1360,7 +1430,7 @@ std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool exec
     if (node == nullptr || covered.contains(node.get())) {
       return;
     }
-    if (share_filtered_groups) {
+    if (share_filtered_groups || order != nullptr) {
       if (auto group = filtered.Select(node, origins, covered)) {
         for (const auto& member : group->members) {
           Cover(member, covered);
@@ -1409,12 +1479,17 @@ std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool exec
 }  // namespace
 
 std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
-  return FindSharedSubPlans(plan, /*executable=*/false);
+  return FindSharedSubPlans(plan, SharingMode::kStructural);
 }
 
 std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan,
                                                   bool share_filtered_groups) {
-  return FindSharedSubPlans(plan, /*executable=*/true, share_filtered_groups);
+  return FindSharedSubPlans(
+      plan, share_filtered_groups ? SharingMode::kDeferredDimension : SharingMode::kSeparateStates);
+}
+
+std::vector<SharedSubPlan> MaterializableIndependentSubPlans(const LogicalPlan& plan) {
+  return FindSharedSubPlans(plan, SharingMode::kIndependent);
 }
 
 }  // namespace antb1::plan
