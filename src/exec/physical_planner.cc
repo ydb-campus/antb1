@@ -20,6 +20,7 @@
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/grouping_sets.h"
 #include "antb1/exec/join_table.h"
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/limit.h"
 #include "antb1/exec/profile.h"
 #include "antb1/exec/project.h"
@@ -1038,12 +1039,21 @@ bool CanFilterRows(const plan::ScanNode& scan, const ProbeKey& key) {
 // read: `CanFilterRows` prices the case, and a candidate that cannot pay leaves the scan as it was
 // rather than trading its rows for a worse plan. D2's part pruning follows the same key, which is
 // an addition and not a change -- where this looks up at all, there was no key to prune with.
-std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBuilds* builds,
-                                   const std::optional<LateScan>& late) {
+arrow::Result<std::optional<ProbeKey>> ProbeKeyOf(const plan::ScanNode& scan,
+                                                  const PipelineBuilds* builds,
+                                                  const std::optional<LateScan>& late) {
   const std::size_t joins = builds == nullptr ? 0 : builds->joins.size();
   for (std::size_t i = 0; i < joins; ++i) {
     const std::optional<ProbeKey> key = ProbeKeyAt(scan, builds, late, i);
-    if (!key.has_value() || key->build->key_filter() == nullptr) {
+    if (!key.has_value()) {
+      continue;
+    }
+    // This join offers its filter to this scan. A range over several domains can admit files
+    // its independent builds would skip. Retry before any such probe part is opened.
+    if (key->build->needs_pruning_retry()) {
+      return arrow::Status::Invalid("cannot preserve part pruning for a combined join build");
+    }
+    if (key->build->key_filter() == nullptr) {
       continue;
     }
     if (i == 0 || CanFilterRows(scan, *key)) {
@@ -1085,11 +1095,10 @@ bool PartHasNoKey(const plan::ScanNode& scan, const ProbeKey& key, int64_t part)
 // What a hash join's build says about part `part` of `scan`: both halves of ADR 0029, resolved
 // together because they share every condition on the join (ProbeKeyOf) and differ only in what they
 // then ask of the scan. None when neither applies.
-std::optional<TableScanOperator::KeyScan> KeyScanOf(const plan::ScanNode& scan,
-                                                    const PipelineBuilds* builds,
-                                                    const std::optional<LateScan>& late,
-                                                    int64_t part) {
-  const std::optional<ProbeKey> key = ProbeKeyOf(scan, builds, late);
+arrow::Result<std::optional<TableScanOperator::KeyScan>> KeyScanOf(
+    const plan::ScanNode& scan, const PipelineBuilds* builds, const std::optional<LateScan>& late,
+    int64_t part) {
+  ARROW_ASSIGN_OR_RAISE(const auto key, ProbeKeyOf(scan, builds, late));
   if (!key.has_value()) {
     return std::nullopt;
   }
@@ -1124,6 +1133,56 @@ AggregateFilter ProbeAggregateFilter(const plan::JoinNode& node, const JoinShape
     return {};
   }
   return AggregateFilter{.build = build, .key = key.id};
+}
+
+// An exact table count is only an upper bound after filtering. Count whole parts whose sole IN
+// predicate accepts every row, discounting NULL join keys as the inner hash build does. A mixed
+// or unknown part contributes nothing to this lower bound.
+bool ExceedsExactKeyLimit(const plan::JoinNode& join) {
+  const bool left = join.build == plan::BuildSide::kLeft;
+  const auto* filter = std::get_if<plan::FilterNode>((left ? join.left : join.right).get());
+  if (filter == nullptr || filter->predicates.size() != 1 || join.keys.size() != 1) {
+    return false;
+  }
+  const auto& predicate = filter->predicates.front();
+  const auto* scan = std::get_if<plan::ScanNode>(filter->input.get());
+  if (scan == nullptr || predicate.kind != plan::Predicate::Kind::kIn || !predicate.column) {
+    return false;
+  }
+  if (const auto rows = scan->table->exact_row_count();
+      rows && *rows <= KeyFilter::kMaxPublishedKeys) {
+    return false;
+  }
+  const auto& key = left ? join.keys.front().left : join.keys.front().right;
+  const auto key_slot = TryNarrow<std::size_t>(key.index);
+  const auto value_slot = TryNarrow<std::size_t>(predicate.column->index);
+  if (!key_slot || *key_slot >= scan->fields.size() || !value_slot ||
+      *value_slot >= scan->fields.size()) {
+    return false;
+  }
+  int64_t remaining = KeyFilter::kMaxPublishedKeys;
+  for (int64_t part = 0; part < scan->table->num_parts(); ++part) {
+    const auto values = scan->table->part_stats(part, scan->fields[*value_slot]);
+    if (!values || values->rows <= 0 || values->null_count != 0 || !values->min ||
+        values->min != values->max ||
+        !std::ranges::any_of(predicate.values, [&](const auto& constant) {
+          const auto* value = std::get_if<Int128>(&constant.value);
+          return value != nullptr && *value == *values->min;
+        })) {
+      continue;
+    }
+    const auto keys =
+        key_slot == value_slot ? values : scan->table->part_stats(part, scan->fields[*key_slot]);
+    if (keys && keys->rows == values->rows && keys->null_count >= 0 &&
+        keys->null_count <= keys->rows) {
+      const int64_t non_null = keys->rows - keys->null_count;
+      if (non_null > remaining) {
+        return true;
+      }
+      remaining -= non_null;
+    }
+  }
+  return false;
 }
 
 struct Builder {
@@ -1205,7 +1264,7 @@ struct Builder {
     // conjunction of the two (MakeBothScanFilters).
     std::optional<TableScanOperator::KeyScan> key_scan;
     if (part.has_value()) {
-      key_scan = KeyScanOf(node, builds, late_scan, *part);
+      ARROW_ASSIGN_OR_RAISE(key_scan, KeyScanOf(node, builds, late_scan, *part));
     }
     // A filter from a join above the grouped aggregate this scan feeds, where the scan still has
     // the column it groups by. Finding the key among `node.ids` is also the check that nothing
@@ -1306,8 +1365,7 @@ struct Builder {
         // (MakeBothScanFilters), which is the item that ADR deferred. A scan reaching here is
         // already decoding with a filter because of its predicates, so the key filter adds its own
         // cost and nothing else; measured 0.992x over the 22, with no query slower.
-        std::optional<TableScanOperator::KeyScan> key_scan =
-            KeyScanOf(*scan, builds, late_scan, *part);
+        ARROW_ASSIGN_OR_RAISE(auto key_scan, KeyScanOf(*scan, builds, late_scan, *part));
         if (key_scan.has_value() && input_slot != nullptr) {
           // The same two metrics as the branch above, now that the same two things can happen here:
           // a filter that runs unreported is one no test can assert and no profile can explain.
@@ -1444,7 +1502,7 @@ struct Builder {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
     return std::make_unique<ScalarAggregateOperator>(std::move(input), node.aggregates);
   }
-  OperatorResult operator()(const plan::GroupAggregateNode& node) const {
+  OperatorResult Grouped(const plan::GroupAggregateNode& node, bool check_widened_build) const {
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
       // A filter the join above offered, if its key is one this aggregate **groups by**: then the
       // filter drops whole groups and never changes a surviving group's value, which is the whole
@@ -1463,6 +1521,13 @@ struct Builder {
       }
       // Grouped per part, the parts' groups merged in part order.
       ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node.input, *scan, slot, nullptr, below));
+      // The widened producer contains at most one join. Refuse it without reading its lookup
+      // when the probe would request D2 and the lookup is certain to exceed its exact-key cap.
+      if (check_widened_build && parts.count > 0 &&
+          ProbeKeyAt(*scan, parts.builds.get(), std::nullopt, 0).has_value() &&
+          ExceedsExactKeyLimit(*parts.builds->joins.back())) {
+        return std::unique_ptr<Operator>{};
+      }
       ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
       const int width = sample->output_schema()->num_fields();
       // The output schema, as the serial operator names it.
@@ -1490,6 +1555,9 @@ struct Builder {
     Name("GroupAggregate");
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
     return std::make_unique<GroupAggregateOperator>(std::move(input), node.keys, node.aggregates);
+  }
+  OperatorResult operator()(const plan::GroupAggregateNode& node) const {
+    return Grouped(node, /*check_widened_build=*/false);
   }
   // ROLLUP, CUBE and GROUPING SETS (ADR 0038): over a part pipeline, every root set grouped per
   // part and merged in part order, the other sets merged from them; otherwise serially.
@@ -1871,10 +1939,16 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
     if (!consumer_filters.has_value()) {
       consumer_filters.emplace(plan);
     }
-    auto make_producer = [node = PreparePhysicalJoins(consumer_filters->Producer(group))] {
-      return Build(node);
-    };
-    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, make_producer());
+    auto node = PreparePhysicalJoins(consumer_filters->Producer(group));
+    auto make_producer = [node] { return Build(node); };
+    const auto* widened =
+        group.widens_join_build ? std::get_if<plan::GroupAggregateNode>(node.get()) : nullptr;
+    ARROW_ASSIGN_OR_RAISE(auto op, widened
+                                       ? Builder{}.Grouped(*widened, /*check_widened_build=*/true)
+                                       : make_producer());
+    if (!op) {
+      continue;
+    }
     auto table = std::make_shared<MaterializedTable>(op->output_schema());
     for (std::size_t i = 0; i < group.members.size(); ++i) {
       const plan::LogicalNodePtr& member = group.members[i];
@@ -1894,10 +1968,15 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
       }
       replacements.emplace(member.get(), std::move(reader));
     }
+    auto join_filter = CombinedJoinFilter::kOrdinary;
+    if (group.combined_producer) {
+      join_filter = group.widens_join_build ? CombinedJoinFilter::kWidenedBuild
+                                            : CombinedJoinFilter::kUnchangedBuild;
+    }
     shared.push_back(SharedBuild{.table = std::move(table),
                                  .first_producer = std::move(op),
                                  .make_producer = std::move(make_producer),
-                                 .combined_domains = !group.reader_predicates.empty()});
+                                 .join_filter = join_filter});
   }
 
   const plan::LogicalNodePtr root_node =

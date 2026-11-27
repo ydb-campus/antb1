@@ -294,6 +294,88 @@ TEST_F(SharedSubPlansFilteredGroupsTest, RequiresEnoughInputToAmortizeACombinedB
   }
 }
 
+TEST_F(SharedSubPlansFilteredGroupsTest, RequiresOverlappingPrunedPartsOfADirectScan) {
+  constexpr int64_t kPartRows = kRows / 4;
+  packets_->WithParts({kPartRows, kPartRows, kPartRows, kPartRows});
+  for (int part = 0; part < 4; ++part) {
+    packets_->WithStats(part, 0, {.min = 1, .max = 100, .rows = kPartRows});
+  }
+  packets_->WithStats(0, 1, {.min = 0, .max = 1, .rows = kPartRows})
+      .WithStats(1, 1, {.min = 1, .max = 2, .rows = kPartRows})
+      .WithStats(2, 1, {.null_count = kPartRows, .rows = kPartRows});
+  const auto a = BandCount("p.band=0");
+  const auto query = a + " UNION ALL " + BandCount("p.band=2");
+  // Missing stats on the last part leave it eligible for both readers.
+  EXPECT_EQ(Combined(query).size(), 1U);
+  packets_->WithStats(3, 1, {.min = 5, .max = 6, .rows = kPartRows});
+  EXPECT_TRUE(Combined(query).empty());
+  // Distinct projections keep the two readers from sharing a larger exact subtree first.
+  const auto reversed = [](int band) {
+    return std::format("SELECT band,slot,COUNT(*) FROM packets WHERE band={} GROUP BY slot,band",
+                       band);
+  };
+  EXPECT_EQ(Combined(query + " UNION ALL " + reversed(0)).size(), 1U);
+  const auto absent = BandCount("p.band=8");
+  EXPECT_TRUE(Combined(query + " UNION ALL " + absent + " UNION ALL " + reversed(8)).empty());
+  packets_->WithStats(3, 1, {.min = 0, .max = 2, .rows = kPartRows});
+  EXPECT_EQ(Combined(query).size(), 1U);
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, DisjointScanPartsCanStillShareLookupWork) {
+  packets_->WithParts({kRows / 2, kRows / 2});
+  for (int part = 0; part < 2; ++part) {
+    packets_->WithStats(part, 0, {.min = 1, .max = 100, .rows = kRows / 2})
+        .WithStats(part, 1, {.min = part, .max = part, .rows = kRows / 2});
+  }
+  const auto member = [](int band) {
+    const auto from = std::format("packets p JOIN packets d ON p.slot=d.slot AND d.band={}", band);
+    return BandCount("p.slot IS NOT NULL", "d.band", "COUNT(*)", from);
+  };
+  EXPECT_EQ(Combined(member(0) + " UNION ALL " + member(1)).size(), 1U);
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, TracksWhichSideOfALookupChanges) {
+  // The lookup stays smaller even after the fact table's equality filter.
+  const auto lookup = std::make_shared<testing::FakeTable>(packets_->schema(), 100);
+  ASSERT_TRUE(catalog_.Register("lookup", lookup).ok());
+  for (const std::string_view band : {"p.band", "d.band"}) {
+    const auto member = [&](int value) {
+      const auto from =
+          std::format("packets p JOIN lookup d ON p.slot=d.slot AND {}={}", band, value);
+      return BandCount("p.slot IS NOT NULL", band, "COUNT(*)", from);
+    };
+    const auto groups = Combined(member(0) + " UNION ALL " + member(1));
+    ASSERT_EQ(groups.size(), 1U) << band;
+    EXPECT_EQ(groups.front().widens_join_build, band == "d.band") << band;
+  }
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, CapsOtherRetainedKeysAtTheirCommonEquality) {
+  const auto readings = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("slot", arrow::int64()), arrow::field("band", arrow::int64()),
+                     arrow::field("region", arrow::int64())}),
+      kRows);
+  readings->WithStats(0, 0, {.min = 1, .max = 257, .rows = kRows})
+      .WithStats(0, 2, {.min = 0, .max = kRows, .rows = kRows});
+  ASSERT_TRUE(catalog_.Register("readings", readings).ok());
+  const auto member = [](int band, std::string_view region) {
+    return std::format(
+        "SELECT slot,band,region,COUNT(*) FROM readings WHERE band={} {} GROUP BY slot,band,region",
+        band, region);
+  };
+  EXPECT_TRUE(Combined(member(0, "") + " UNION ALL " + member(1, "")).empty());
+  const auto shared =
+      Combined(member(0, "AND region=0") + " UNION ALL " + member(1, "AND region=0"));
+  ASSERT_EQ(shared.size(), 1U);  // at most 257 slots x 2 bands x 1 region
+  const auto& group = std::get<GroupAggregateNode>(*shared.front().combined_producer);
+  const auto& predicates = std::get<FilterNode>(*group.input).predicates;
+  ASSERT_EQ(predicates.size(), 2U);
+  EXPECT_EQ(predicates[0].kind, Predicate::Kind::kIn);
+  EXPECT_TRUE(IsIntegerOrDateEquality(predicates[1]));
+  EXPECT_TRUE(
+      Combined(member(0, "AND region=0") + " UNION ALL " + member(1, "AND region=1")).empty());
+}
+
 TEST_F(SharedSubPlansFilteredGroupsTest, WidensOnlyAnEqualityOnACommonRetainedKey) {
   const auto refuses = [&](const std::string& first, const std::string& second) {
     const auto query = first + " UNION ALL " + second;
@@ -713,6 +795,33 @@ TEST_F(SharedSubPlansFilteredGroupsTest, ChecksRawFieldTypeAndPredicatePositionB
     EXPECT_TRUE(std::ranges::none_of(
         candidates, [](const auto& group) { return group.combined_producer != nullptr; }));
   }
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, AFilterAboveAComputeCannotPruneTheScan) {
+  const auto query = BandCount("p.band=1", "p.band", "SUM(p.slot+1)") + " UNION ALL " +
+                     BandCount("p.band=2", "p.band", "SUM(p.slot+1)");
+  const auto groups = Combined(query);
+  ASSERT_EQ(groups.size(), 1U);
+  packets_->WithParts({kRows / 2, kRows / 2});
+  for (int part = 0; part < 2; ++part) {
+    packets_->WithStats(part, 0, {.min = 1, .max = 100, .rows = kRows / 2})
+        .WithStats(part, 1, {.min = part + 1, .max = part + 1, .rows = kRows / 2});
+  }
+  EXPECT_TRUE(Combined(query).empty());  // in the bound queries the filter reads the scan
+  const auto above_compute = [](const LogicalNodePtr& member) {
+    auto group = std::get<GroupAggregateNode>(*member);
+    auto compute = std::get<ComputeNode>(*group.input);
+    auto filter = std::get<FilterNode>(*compute.input);
+    compute.input = filter.input;
+    filter.input = Node(std::move(compute));
+    group.input = Node(std::move(filter));
+    return Node(std::move(group));
+  };
+  const auto& members = groups.front().members;
+  const auto root = JoinedOnFirst(above_compute(members.front()), above_compute(members.back()));
+  const auto candidates = MaterializableSubPlans({.root = root, .output = {}}, true);
+  EXPECT_TRUE(std::ranges::any_of(
+      candidates, [](const auto& group) { return group.combined_producer != nullptr; }));
 }
 
 TEST_F(SharedSubPlansFilteredGroupsTest, DistinguishesTheSlotReadInsideAMemberExpression) {

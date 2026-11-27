@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <format>
 #include <functional>
@@ -1028,6 +1029,8 @@ struct GroupPartition {
   LogicalNodePtr member;
   const Predicate* equality;
   std::size_t key;
+  std::bitset<kMaxPredicateDomainKeys> fixed_keys;
+  bool prunes_only_scan = false;
 };
 
 bool ReadsSlot(const BoundColumn& column, std::span<const ColumnId> ids) {
@@ -1035,11 +1038,20 @@ bool ReadsSlot(const BoundColumn& column, std::span<const ColumnId> ids) {
   return slot && *slot < ids.size() && column.id != kNoColumnId && ids[*slot] == column.id;
 }
 
+bool PrunesScanParts(const FilterNode& filter) {
+  const auto* input = filter.input.get();
+  while (const auto* next = std::get_if<FilterNode>(input)) {
+    input = next->input.get();
+  }
+  return std::get_if<ScanNode>(input) != nullptr;
+}
+
 // A retained input key preserves its equality through row-wise nodes and inner joins. An
 // aggregate, a compound input, or a null-extending join would need a different proof.
 std::vector<GroupPartition> PartitionsOf(const LogicalNodePtr& member,
                                          const GroupAggregateNode& group) {
   std::vector<GroupPartition> partitions;
+  std::bitset<kMaxPredicateDomainKeys> fixed_keys;
   bool joined = false;
   const auto visit = [&](const auto& self, const LogicalNodePtr& node) -> bool {
     if (const auto* filter = std::get_if<FilterNode>(node.get())) {
@@ -1056,9 +1068,13 @@ std::vector<GroupPartition> PartitionsOf(const LogicalNodePtr& member,
               std::ranges::contains(partitions, &p, &GroupPartition::equality)) {
             return false;
           }
+          const auto index = Narrow<std::size_t>(key - group.keys.begin());
+          fixed_keys.set(index);
           partitions.push_back({.member = member,
                                 .equality = &p,
-                                .key = Narrow<std::size_t>(key - group.keys.begin())});
+                                .key = index,
+                                .fixed_keys = {},
+                                .prunes_only_scan = PrunesScanParts(*filter)});
         }
       }
     } else if (const auto* join = std::get_if<JoinNode>(node.get())) {
@@ -1080,13 +1096,43 @@ std::vector<GroupPartition> PartitionsOf(const LogicalNodePtr& member,
       !visit(visit, group.input)) {
     return {};
   }
+  for (auto& partition : partitions) {
+    partition.fixed_keys = fixed_keys;
+    partition.prunes_only_scan = partition.prunes_only_scan && !joined;
+  }
   return partitions;
 }
 
+using PartitionReaders = std::map<Int128, std::size_t>;
+
+// A direct scan already skips parts whose bounds exclude its equality. Sharing can save
+// a part read only if two readers may visit the same part, including two with the same value.
+bool HasSharedPart(const Table& table, int field, const PartitionReaders& readers) {
+  for (int64_t part = 0; part < table.num_parts(); ++part) {
+    const auto stats = table.part_stats(part, field);
+    if (!stats || stats->rows <= 0) {
+      return true;
+    }
+    if (stats->null_count >= stats->rows) {
+      continue;
+    }
+    if (!stats->min || !stats->max || *stats->min > *stats->max) {
+      return true;
+    }
+    const auto first = readers.lower_bound(*stats->min);
+    const auto end = readers.upper_bound(*stats->max);
+    if (first != end && (first->second > 1 || std::next(first) != end)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Unlike the cost estimate for an exact match, widening an input needs a bound for the whole
-// producer. Retained tuples belong to one row of each source scan. Cap the filtered key by the
-// actual IN list (which excludes NULL); all other bounds include NULL and cover disjoint parts.
-bool FitsPartitions(const GroupAggregateNode& group, std::size_t key, int64_t values) {
+// producer. The varying key passes the IN list and the other equalities are the same in
+// every reader. Neither admits NULL. Unconstrained bounds include NULL and cover disjoint parts.
+bool WorthSharingPartitions(const GroupPartition& partition, const PartitionReaders& readers) {
+  const auto& group = std::get<GroupAggregateNode>(*partition.member);
   std::vector<ColumnId> keys;
   int64_t width = 0;
   for (const auto& column : group.keys) {
@@ -1098,10 +1144,15 @@ bool FitsPartitions(const GroupAggregateNode& group, std::size_t key, int64_t va
   }
   std::vector<ScanKeyDomain> sources(keys.size());
   EachDistinctValues(*group.input, keys, sources);
-  auto& restricted = sources[key];
-  restricted.max_values = std::min(restricted.max_values.value_or(values), values);
-  if (restricted.max_part_values) {
-    restricted.max_part_values = std::min(*restricted.max_part_values, values);
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    if (partition.fixed_keys.test(i)) {
+      const int64_t bound = i == partition.key ? std::ssize(readers) : 1;
+      auto& source = sources[i];
+      source.max_values = std::min(source.max_values.value_or(bound), bound);
+      if (source.max_part_values) {
+        source.max_part_values = std::min(*source.max_part_values, bound);
+      }
+    }
   }
   int64_t limit = kMaxSharedResultBytes / width;
   for (std::size_t i = 0; i < sources.size(); ++i) {
@@ -1119,6 +1170,10 @@ bool FitsPartitions(const GroupAggregateNode& group, std::size_t key, int64_t va
     if (!type.ok() || *type != group.keys[i].type) {
       return false;
     }
+    if (i == partition.key && partition.prunes_only_scan && HasComparableStatistics(*type) &&
+        !HasSharedPart(*scan->table, field, readers)) {
+      return false;
+    }
     if (!std::ranges::contains(std::span(sources).first(i), scan, &ScanKeyDomain::scan)) {
       limit = AfterScan(*scan, sources, limit);
     }
@@ -1127,15 +1182,15 @@ bool FitsPartitions(const GroupAggregateNode& group, std::size_t key, int64_t va
 }
 
 LogicalNodePtr WithPartitions(const LogicalNodePtr& node, const Predicate* equality,
-                              const std::set<Int128>& values) {
+                              const PartitionReaders& values, bool& widens_join_build) {
   if (const auto* filter = std::get_if<FilterNode>(node.get())) {
     for (std::size_t i = 0; i < filter->predicates.size(); ++i) {
       if (&filter->predicates[i] == equality) {
         FilterNode copy = *filter;
         Predicate combined{
             .kind = Predicate::Kind::kIn, .column = equality->column, .span = equality->span};
-        for (const Int128 value : values) {
-          combined.values.push_back({.type = equality->constant.type, .value = value});
+        for (const auto& entry : values) {
+          combined.values.push_back({.type = equality->constant.type, .value = entry.first});
         }
         copy.predicates[i] = std::move(combined);
         return std::make_shared<LogicalNode>(std::move(copy));
@@ -1144,8 +1199,11 @@ LogicalNodePtr WithPartitions(const LogicalNodePtr& node, const Predicate* equal
   }
   auto inputs = InputsOf(*node);
   for (auto& input : inputs) {
-    auto next = WithPartitions(input, equality, values);
+    auto next = WithPartitions(input, equality, values, widens_join_build);
     if (next != input) {
+      if (const auto* join = std::get_if<JoinNode>(node.get())) {
+        widens_join_build = input == (join->build == BuildSide::kLeft ? join->left : join->right);
+      }
       input = std::move(next);
       return WithInputs(*node, std::move(inputs));
     }
@@ -1199,10 +1257,10 @@ class FilteredGroups {
       if (partitions.size() < 2) {
         continue;
       }
-      std::set<Int128> values;
+      PartitionReaders values;
       std::vector<LogicalNodePtr> members;
       for (const auto& part : partitions) {
-        values.insert(std::get<Int128>(part.equality->constant.value));
+        ++values[std::get<Int128>(part.equality->constant.value)];
         if (values.size() > kMaxSharedFilterValues) {
           break;
         }
@@ -1217,11 +1275,11 @@ class FilteredGroups {
         continue;
       }
       const auto& widest = partitions[group->widest];
-      if (!FitsPartitions(std::get<GroupAggregateNode>(*widest.member), widest.key,
-                          std::ssize(values))) {
+      if (!WorthSharingPartitions(widest, values)) {
         continue;
       }
-      group->combined_producer = WithPartitions(widest.member, widest.equality, values);
+      group->combined_producer =
+          WithPartitions(widest.member, widest.equality, values, group->widens_join_build);
       for (const auto& part : partitions) {
         const auto& aggregate = std::get<GroupAggregateNode>(*part.member);
         Predicate reader = *part.equality;

@@ -130,6 +130,8 @@ class JoinBuild {
   // the budget, or before Prepare. Whether a probe scan may *use* it is the physical planner's
   // decision, not this one: a join that emits unmatched probe rows must not drop any.
   [[nodiscard]] const std::shared_ptr<const KeyFilter>& key_filter() const { return key_filter_; }
+  // A speculative build could admit parts its independent readers would prune.
+  [[nodiscard]] bool needs_pruning_retry() const { return needs_pruning_retry_; }
   // The marks of the table's rows while it holds them, for the probes to mark into and for the
   // join to read once they are done; nullptr unless PrepareMarks made them.
   [[nodiscard]] JoinMarks* marks() const { return marks_.get(); }
@@ -156,6 +158,7 @@ class JoinBuild {
   std::shared_ptr<const OneRowValues> values_;
   std::unique_ptr<JoinMarks> marks_;
   std::shared_ptr<const KeyFilter> key_filter_;
+  bool needs_pruning_retry_ = false;
 };
 
 // Whether a join emits its build's rows, and whether the unmatched ones, are the join-kind table's

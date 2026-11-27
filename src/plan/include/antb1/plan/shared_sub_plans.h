@@ -37,6 +37,8 @@ struct SharedSubPlan {
   // decode for a consumer that does not want it.
   int64_t fields = 0;
   LogicalNodePtr combined_producer;
+  // True when widening the equality changes the input to the producer's lookup build.
+  bool widens_join_build = false;
   // Empty for exact matches, otherwise one equality on each member's own output column.
   std::vector<Predicate> reader_predicates;
 };

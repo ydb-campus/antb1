@@ -31,6 +31,9 @@ namespace antb1::exec {
 class MemoryBudget;
 class ProfileNode;
 
+// A shared producer can change the lookup's build or select more rows on its probe.
+enum class CombinedJoinFilter : std::uint8_t { kOrdinary, kUnchangedBuild, kWidenedBuild };
+
 struct ExecContext {
   // Every buffer of the query; the session's MemoryBudget when there is one.
   arrow::MemoryPool* pool = arrow::default_memory_pool();
@@ -46,7 +49,7 @@ struct ExecContext {
   // Shared by every scan of one run; Drain supplies a fresh context for each execution.
   std::shared_ptr<plan::ScanContext> scans = nullptr;
   // A combined equality-domain producer may only scan the union of its members' parts.
-  bool require_exact_join_filter = false;
+  CombinedJoinFilter join_filter = CombinedJoinFilter::kOrdinary;
 };
 
 // Rows flowing from one operator to the next: the columns and, optionally, a selection. A selection

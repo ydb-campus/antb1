@@ -1,5 +1,6 @@
 #include "shared_builds.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -37,8 +38,8 @@ arrow::Result<bool> Prepare(SharedBuild& build, ExecContext& ctx) {
   build.table->Reset(ctx.budget);
   auto producer = std::move(build.first_producer);
   ExecContext combined = ctx;
-  combined.require_exact_join_filter = true;
-  ExecContext& run = build.combined_domains ? combined : ctx;
+  combined.join_filter = build.join_filter;
+  ExecContext& run = build.join_filter == CombinedJoinFilter::kOrdinary ? ctx : combined;
   bool kept = false;
   try {
     if (producer == nullptr) {
@@ -88,7 +89,7 @@ arrow::Status SharedBuildsOperator::Open(ExecContext& ctx) {
       break;
     }
     shared_rows += build.table->exact_row_count().value_or(0);
-    retry_if_empty_ |= build.combined_domains;
+    retry_if_empty_ |= build.join_filter != CombinedJoinFilter::kOrdinary;
   }
   if (!use_fallback_ && profile() != nullptr) {
     profile()->Add("shared_rows", MetricUnit::kCount, shared_rows);
@@ -139,6 +140,12 @@ arrow::Status SharedBuildsOperator::Close() {
   const arrow::Status status = ActiveInput().Close();
   ReleaseBuilds();
   return status;
+}
+
+bool SharedBuildsOperator::UsedCombinedDomains() const {
+  return !use_fallback_ && std::ranges::any_of(builds_, [](const SharedBuild& build) {
+    return build.join_filter != CombinedJoinFilter::kOrdinary;
+  });
 }
 
 void SharedBuildsOperator::ReleaseBuilds() {

@@ -11,6 +11,7 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/physical_planner.h"
 #include "antb1/plan/binder.h"
 #include "antb1/plan/catalog.h"
@@ -145,7 +146,8 @@ class DeferredDimensionJoinTest : public testing::ExecTest {
         second_join, second_table, outputs, predicates, outputs);
   }
 
-  arrow::Result<std::shared_ptr<arrow::Table>> Execute(std::string_view sql, ProfileNode& profile) {
+  arrow::Result<std::shared_ptr<arrow::Table>> Execute(std::string_view sql, ProfileNode& profile,
+                                                       int64_t batch_size = 2) {
     const auto parsed = sql::Parse(sql);
     if (!parsed) {
       return arrow::Status::Invalid("sensor query did not parse: ", parsed.error().message);
@@ -153,7 +155,7 @@ class DeferredDimensionJoinTest : public testing::ExecTest {
     ARROW_ASSIGN_OR_RAISE(auto bound, plan::Bind(*parsed, catalog_));
     ARROW_ASSIGN_OR_RAISE(auto optimized, plan::Optimize(bound));
     ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(optimized, &profile));
-    return Drain(*op, {.pool = arrow::default_memory_pool(), .batch_size = 2});
+    return Drain(*op, {.pool = arrow::default_memory_pool(), .batch_size = batch_size});
   }
 
   static std::string TaggedQuery(std::string_view second_table) {
@@ -306,6 +308,63 @@ TEST_F(DeferredDimensionJoinTest, SharesFixedBandsAndRetriesTheirIndependentAggr
       EXPECT_EQ(MetricOf(fast, "shared_rows"), 7);
       EXPECT_EQ(packets->scanned_parts().size() - scans_before, 2U);
     }
+  }
+}
+
+TEST_F(DeferredDimensionJoinTest, DeclinesAWidenedLookupOnlyWhenItsRetainedKeysExceedTheCap) {
+  const auto sensors = Sensors(2, "a", "yard");
+  sensors->set_claimed_rows(32);
+  ASSERT_TRUE(catalog_.Register("sensors", sensors).ok());
+  const auto fields =
+      arrow::schema({arrow::field("slot", arrow::int64()), arrow::field("channel", arrow::int64()),
+                     arrow::field("reading", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(
+      fields, 3, {Int64s({1, 2, 4}), Int64s({0, 1, 2}), Int64s({17, 19, 23})});
+  const auto facts = std::make_shared<MemoryTable>(fields, arrow::RecordBatchVector{batch}, true);
+  facts->set_claimed_rows(100'000'000);
+  ASSERT_TRUE(catalog_.Register("packets", facts).ok());
+  const auto lookup_schema = arrow::schema(
+      {arrow::field("channel", arrow::int64()), arrow::field("band", arrow::int64())});
+  constexpr int64_t kRows = (KeyFilter::kMaxPublishedKeys / 2) + 1;
+  for (const bool mixed : {false, true}) {
+    SCOPED_TRACE(mixed);
+    arrow::RecordBatchVector batches;
+    for (int band = 0; band < 2; ++band) {
+      std::vector<std::optional<int64_t>> keys;
+      std::vector<std::optional<int64_t>> bands;
+      for (int64_t i = 0; i < kRows; ++i) {
+        keys.emplace_back(i);
+        bands.emplace_back(mixed && i == kRows - 1 ? 2 : band);
+      }
+      batches.push_back(
+          arrow::RecordBatch::Make(lookup_schema, kRows, {Int64s(keys), Int64s(bands)}));
+    }
+    const auto lookup = std::make_shared<MemoryTable>(lookup_schema, std::move(batches), true);
+    const std::string_view name = mixed ? "mixed" : "homogeneous";
+    ASSERT_TRUE(catalog_.Register(std::string(name), lookup).ok());
+    const auto stream = [&](int band) {
+      return std::format(
+          "SELECT d.code,d.site,d.slot,l.band,SUM(f.reading+l.channel) AS total "
+          "FROM packets f JOIN sensors d ON f.slot=d.slot JOIN {} l ON f.channel=l.channel "
+          "WHERE l.band={} GROUP BY d.code,d.site,d.slot,l.band",
+          name, band);
+    };
+    constexpr std::string_view kOutput = "a.code,a.band,b.band,a.total,b.total";
+    const auto query = std::format(
+        "WITH a AS ({}), b AS ({}) SELECT {} FROM a JOIN b "
+        "ON a.code=b.code ORDER BY {} LIMIT 20",
+        stream(0), stream(1), kOutput, kOutput);
+    ProfileNode profile;
+    auto result = Execute(query, profile, 4096);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_EQ((*result)->num_rows(), 3);
+    ASSERT_EQ(MetricOf(profile, "dimension_verified"), 1);
+    const auto& fast = *profile.children().front();
+    EXPECT_EQ(MetricOf(fast, "shared_fallbacks"), std::nullopt);
+    EXPECT_EQ(MetricOf(fast, "shared_rows"), mixed ? std::optional<int64_t>(6) : std::nullopt);
+    // Each homogeneous lookup part is read once by its independent group. The mixed parts
+    // retain exactly the cap after filtering and are read just once by the shared producer.
+    EXPECT_EQ(lookup->scanned_parts(), (std::vector<int64_t>{0, 1}));
   }
 }
 
