@@ -2772,6 +2772,43 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   EXPECT_GT(keyless_domains, 0);
 }
 
+// Both ends have 1,000 rows. Nine distinct values plus NULL fit the 10,000-pair
+// budget. One more value on either side rules out that orientation of the correlation.
+TEST(QueryGenerator, KeylessAggregateBoundsDistinctBindingsTimesInnerRows) {
+  const auto generator = [](int64_t child_distinct, int64_t parent_distinct) {
+    auto tables = Tables();
+    for (GenTable& table : tables) {
+      table.rows = 1000;
+    }
+    tables.front().refs = {GenRef{.columns = {"i"},
+                                  .table = "big",
+                                  .ref_columns = {"i"},
+                                  .stats = Stats(900, child_distinct, 100),
+                                  .ref_stats = Stats(900, parent_distinct, 100)}};
+    return MakeOver(std::move(tables), 12,
+                    {.supported = kSupportedFeatures.Minus({Feature::kCommaJoin, Feature::kJoinOn}),
+                     .target_percent = 0});
+  };
+  const auto child_only = generator(9, 10);
+  const auto parent_only = generator(10, 9);
+  int child_cases = 0;
+  int parent_cases = 0;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto child = child_only.Generate(i);
+    if (child.features.Has(Feature::kKeylessDomainAggregate)) {
+      EXPECT_EQ(child.table, "small") << child.sql;
+      ++child_cases;
+    }
+    const auto parent = parent_only.Generate(i);
+    if (parent.features.Has(Feature::kKeylessDomainAggregate)) {
+      EXPECT_EQ(parent.table, "big") << parent.sql;
+      ++parent_cases;
+    }
+  }
+  EXPECT_GT(child_cases, 0);
+  EXPECT_GT(parent_cases, 0);
+}
+
 // The variance family (ADR 0037's AG2): written in the select list only, over an integer or a
 // DECIMAL column, in each of its six spellings, never after ORDER BY, HAVING or WHERE; and from a
 // stream of its own, so a query that writes none is the query the seed wrote without the feature.

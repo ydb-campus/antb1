@@ -1299,6 +1299,7 @@ struct Binding {
 struct CorrelatedCandidate {
   const Binding* outer = nullptr;        // the FROM item the subquery reads out to
   const GenColumn* outer_key = nullptr;  // of `outer`
+  int64_t binding_bound = 0;             // distinct outer key values, including a possible NULL
   const GenTable* inner = nullptr;       // the block's only table, always named, never by path
   const GenColumn* inner_key = nullptr;  // of `inner`, of the same type as `outer_key`
 };
@@ -3283,7 +3284,9 @@ class Builder {
     Keyword("WHERE");
     InnerColumn(c, *c.inner_key);
     const bool keyless = allowed_.Has(Feature::kKeylessDomainAggregate) &&
-                         allowed_.Has(Feature::kCompareColumns) && keyless_domain_rng_.Percent(25);
+                         allowed_.Has(Feature::kCompareColumns) &&
+                         SaturatingProduct(c.binding_bound, c.inner->rows) <= kMaxJoinRows &&
+                         keyless_domain_rng_.Percent(25);
     if (keyless) {
       used_.Add(Feature::kKeylessDomainAggregate);
       used_.Add(Feature::kCompareColumns);
@@ -7286,8 +7289,15 @@ class Builder {
               (outer_key.precision != inner_key.precision || outer_key.scale != inner_key.scale)) {
             continue;  // one DECIMAL type on both ends, not merely one ValueKind
           }
+          const GenKeyStats& stats = as_child ? edge.child_stats : edge.parent_stats;
+          // A join can pad this binding even when its base column has no NULL.
+          const bool may_have_null = stats.non_null < own.rows || from_->bindings.size() > 1;
           out.push_back(CorrelatedCandidate{
-              .outer = &b, .outer_key = &outer_key, .inner = &other, .inner_key = &inner_key});
+              .outer = &b,
+              .outer_key = &outer_key,
+              .binding_bound = SaturatingSum(stats.distinct, may_have_null ? 1 : 0),
+              .inner = &other,
+              .inner_key = &inner_key});
         }
       }
     }

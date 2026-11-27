@@ -1559,12 +1559,15 @@ arrow::Result<Representatives> ScalarDomain(const Correlation& correlation, cons
     }
     residual.clear();
   }
+  // An empty inner build short-circuits the nested loop before it opens the binding domain.
+  const BuildSide build =
+      anchors.empty() && EstimateRows(*input) == 0 ? BuildSide::kLeft : BuildSide::kRight;
   input = Make(JoinNode{.kind = JoinKind::kInner,
                         .left = std::move(input),
                         .right = Make(std::move(domain)),
                         .keys = std::move(anchors),
                         .residual = std::move(residual),
-                        .build = BuildSide::kRight,
+                        .build = build,
                         .span = correlation.join.span});
   return out;
 }

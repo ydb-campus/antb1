@@ -75,6 +75,18 @@ TEST(Session, CountStarOverEveryFixtureTable) {
   }
 }
 
+TEST(Session, KeylessCountOverEmptyTableFitsTheMemoryBudget) {
+  auto session =
+      engine::Session::Make({.threads = 1, .memory_limit = 2 * 1024 * 1024}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("fleet", {Fixture("star/fleet.parquet")}).ok());
+  ASSERT_TRUE(session->RegisterParquet("promos", {Fixture("star/promos.parquet")}).ok());
+  const auto count = Count(*session,
+                           "SELECT COUNT(*) FROM fleet f WHERE "
+                           "(SELECT COUNT(*) FROM promos p WHERE p.pm_id < f.fl_row) = 0");
+  ASSERT_TRUE(count.ok()) << count.status().ToString();
+  EXPECT_EQ(*count, 7488);
+}
+
 TEST(Session, CountStarFromPaths) {
   auto session = NewSession();
   ASSERT_NE(session, nullptr);

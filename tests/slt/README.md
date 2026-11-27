@@ -261,12 +261,16 @@ feature.
 The refs carry the **correlated** subqueries too (ADR 0023's T3, feature `correlated_exists` or
 `correlated_aggregate`), from a seventh random stream and only where the uncorrelated conjunct did not fire,
 so a query holds at most one subquery and a seed that took an uncorrelated one is untouched. Both forms
-correlate through one equality between a column of a FROM binding and a column of the block's table:
+can correlate through one equality between a column of a FROM binding and a column of the block's table:
 
 ```sql
 [NOT] EXISTS (SELECT * FROM inner WHERE inner.k = outer.k [AND inner.k < outer.k])
 <literal> <op> (SELECT MIN(inner.c) FROM inner WHERE inner.k = outer.k)   -- or the mirror
 ```
+
+For a scalar aggregate the generator can draw an inequality instead. It caps the number of candidate pairs at
+10,000, using the outer key's distinct-value count, one extra binding for a possible NULL, and the inner row
+count. This budget applies only to differential tests.
 
 The candidate rules are stricter than the uncorrelated form's, each because a shape one condition outside
 what ADR 0023's U2 and U3 answer would exit 4 for good and so never be compared: both ends of the key have

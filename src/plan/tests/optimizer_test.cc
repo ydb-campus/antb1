@@ -2788,6 +2788,18 @@ TEST(OptimizerTest, ScalarDomainResolvesKeylessResidualAgainstBothInputs) {
   EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
 }
 
+TEST(OptimizerTest, KeylessScalarDomainBuildsAKnownEmptyInnerInput) {
+  for (const std::optional<int64_t> rows :
+       {std::optional<int64_t>{0}, std::optional<int64_t>{1}, std::optional<int64_t>{}}) {
+    const LogicalPlan plan =
+        Path2Plan({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kLt)}, 7'488, rows);
+    const auto* product = RestrictionUnder(plan);
+    ASSERT_NE(product, nullptr) << Explain(plan);
+    EXPECT_EQ(product->build, rows == 0 ? BuildSide::kLeft : BuildSide::kRight) << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  }
+}
+
 // A plan with no dependent join is unaffected: the pass is an identity and the other rules run.
 TEST(OptimizerTest, TheUnnestingPassLeavesAnOrdinaryPlanAlone) {
   const LogicalPlan plan = Optimized("SELECT COUNT(*) FROM t");
