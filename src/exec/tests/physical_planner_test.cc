@@ -1227,6 +1227,339 @@ TEST_F(PhysicalPlannerTest, FiltersCompletedProbeGroupsBeforeAnInnerJoin) {
   }
 }
 
+TEST_F(PhysicalPlannerTest, ComparesDecimalSumAndCountOnCompletedProbeGroups) {
+  const auto amount = LogicalType::Decimal(8, 2);
+  const auto total = LogicalType::Decimal(38, 2);
+  const auto schema = arrow::schema(
+      {arrow::field("x", arrow::int64()), arrow::field("amount", plan::ToArrow(amount))});
+  const auto batch = arrow::RecordBatch::Make(
+      schema, 7,
+      {Int64s({1, 1, 2, 2, 3, 4, 4}),
+       testing::Decimals(amount, {"50", "50", "50", "51", "101", std::nullopt, std::nullopt})});
+  const auto facts = Node(plan::ScanNode{
+      .table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}),
+      .fields = {0, 1},
+      .ids = {plan::ColumnId{1}, plan::ColumnId{2}}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto groups = Node(plan::GroupAggregateNode{
+      .input = facts,
+      .keys = {x},
+      .key_ids = {plan::ColumnId{3}},
+      .aggregates = {{.kind = plan::AggKind::kSum,
+                      .arg = Column(1, "amount", amount),
+                      .type = total,
+                      .id = plan::ColumnId{4}},
+                     {.kind = plan::AggKind::kCountStar, .id = plan::ColumnId{5}}}});
+  const auto label_schema = arrow::schema({arrow::field("x", arrow::int64())});
+  const auto label_rows = arrow::RecordBatch::Make(label_schema, 6, {Int64s({1, 2, 2, 2, 3, 4})});
+  const auto labels = Node(plan::ScanNode{
+      .table = std::make_shared<MemoryTable>(label_schema, arrow::RecordBatchVector{label_rows}),
+      .fields = {0},
+      .ids = {plan::ColumnId{6}}});
+  for (const bool build_left : {false, true}) {
+    SCOPED_TRACE(build_left);
+    const auto join = Node(
+        plan::JoinNode{.kind = plan::JoinKind::kInner,
+                       .left = build_left ? labels : groups,
+                       .right = build_left ? groups : labels,
+                       .keys = {{.left = x, .right = x}},
+                       .build = build_left ? plan::BuildSide::kLeft : plan::BuildSide::kRight});
+    const int offset = build_left ? 1 : 0;
+    auto sum = Column(offset + 1, "total", total);
+    sum.id = plan::ColumnId{4};
+    auto count = Column(offset + 2, "n", LogicalType::kBigInt);
+    count.id = plan::ColumnId{5};
+    const auto keep_sum = testing::Compare(sum, plan::CompareOp::kGt,
+                                           plan::Constant{.type = total, .value = Int128{100}});
+    const auto keep_count = testing::Compare(count, plan::CompareOp::kGe, BigInt(2));
+    const auto filtered =
+        Node(plan::FilterNode{.input = join, .predicates = {keep_sum, keep_count}});
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(PlanOf(filtered, 4), &profile);
+    ASSERT_TRUE(op.ok()) << op.status();
+    ASSERT_EQ(profile.name(), "HashJoin");
+    ASSERT_EQ(profile.children().size(), 2U);
+    const auto* probe = profile.children()[0];
+    ASSERT_EQ(probe->name(), "Filter");
+    ASSERT_EQ(probe->children().size(), 1U);
+    EXPECT_EQ(probe->children()[0]->name(), "PartGroupAggregate");
+    ExecContext ctx{.pool = arrow::default_memory_pool()};
+    const auto result = Drain(**op, ctx);
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(probe->rows(), 1);
+    EXPECT_EQ(Int64Column(**result, offset), (std::vector<std::optional<int64_t>>{2, 2, 2}));
+  }
+}
+
+TEST_F(PhysicalPlannerTest, GroupedProbeRequiresBoundTypesAndIdsForEveryConjunct) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto scan = Node(plan::ScanNode{.table = Table(), .fields = {0}});
+  const plan::ColumnId key_id{1};
+  const plan::ColumnId count_id{2};
+  const auto group = Node(plan::GroupAggregateNode{
+      .input = scan,
+      .keys = {x},
+      .key_ids = {key_id},
+      .aggregates = {{.kind = plan::AggKind::kCountStar, .id = count_id}}});
+  const auto join = Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                        .left = group,
+                                        .right = scan,
+                                        .keys = {{.left = x, .right = x}}});
+  const auto decimal = LogicalType::Decimal(8, 2);
+  const plan::Constant decimal_limit{.type = decimal, .value = Int128{100}};
+  const auto threshold = BigInt(1);
+  const plan::BoundColumn count{.index = 1, .id = count_id};
+  const auto positive = testing::Compare(count, plan::CompareOp::kGt, BigInt(0));
+  struct Case {
+    std::string_view name;
+    plan::BoundColumn column;
+    plan::CompareOp op;
+    plan::Constant constant;
+    bool moves;
+  };
+  using enum plan::CompareOp;
+  const std::vector<Case> cases{
+      {.name = "count range", .column = count, .op = kGt, .constant = threshold, .moves = true},
+      {.name = "key equality",
+       .column = {.index = 0, .id = key_id},
+       .op = kEq,
+       .constant = threshold,
+       .moves = true},
+      {.name = "count described as decimal",
+       .column = {.index = 1, .id = count_id, .type = decimal},
+       .op = kGt,
+       .constant = decimal_limit,
+       .moves = false},
+      {.name = "decimal literal on count",
+       .column = count,
+       .op = kGt,
+       .constant = decimal_limit,
+       .moves = false},
+      {.name = "count without id",
+       .column = {.index = 1},
+       .op = kGt,
+       .constant = threshold,
+       .moves = false},
+      {.name = "key range",
+       .column = {.index = 0, .id = key_id},
+       .op = kGt,
+       .constant = threshold,
+       .moves = false},
+      {.name = "key described as date",
+       .column = {.index = 0, .id = key_id, .type = LogicalType::kDate},
+       .op = kEq,
+       .constant = {.type = LogicalType::kDate, .value = Int128{1}},
+       .moves = false}};
+  for (const Case& test : cases) {
+    SCOPED_TRACE(test.name);
+    const auto second = testing::Compare(test.column, test.op, test.constant);
+    const auto query =
+        PlanOf(Node(plan::FilterNode{.input = join, .predicates = {positive, second}}), 3);
+    ProfileNode profile;
+    const auto op = BuildPhysicalPlan(query, &profile);
+    ASSERT_TRUE(op.ok()) << op.status();
+    EXPECT_EQ(profile.name(), test.moves ? "HashJoin" : "Filter");
+  }
+}
+
+TEST_F(PhysicalPlannerTest, AnEmptyBuildPreservesErrorsFromInvalidGroupedProbeConstants) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto scan = Node(plan::ScanNode{.table = Table(), .fields = {0}});
+  const auto groups = Node(plan::GroupAggregateNode{
+      .input = scan,
+      .keys = {x},
+      .key_ids = {plan::ColumnId{1}},
+      .aggregates = {{.kind = plan::AggKind::kCountStar, .id = plan::ColumnId{2}}}});
+  const auto empty = Node(plan::LimitNode{.input = scan, .limit = 0});
+  const auto join = Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                        .left = groups,
+                                        .right = empty,
+                                        .keys = {{.left = x, .right = x}}});
+  auto key = x;
+  key.id = plan::ColumnId{1};
+  auto count = Column(1, "n", LogicalType::kBigInt);
+  count.id = plan::ColumnId{2};
+  const auto positive = testing::Compare(count, plan::CompareOp::kGt, BigInt(0));
+  const plan::Constant too_big{.type = LogicalType::kBigInt, .value = Int128{kTwoTo62} * 2};
+  for (const auto& column : {key, count}) {
+    const auto invalid = testing::Compare(column, plan::CompareOp::kEq, too_big);
+    const auto query =
+        PlanOf(Node(plan::FilterNode{.input = join, .predicates = {positive, invalid}}), 3);
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(query, &profile);
+    ASSERT_TRUE(op.ok()) << op.status();
+    EXPECT_EQ(profile.name(), "Filter");
+    ExecContext ctx{.pool = arrow::default_memory_pool()};
+    const auto result = Drain(**op, ctx);
+    EXPECT_TRUE(result.status().IsInvalid()) << result.status();
+    EXPECT_TRUE(result.status().message().contains("outside the range of BIGINT"))
+        << result.status();
+  }
+}
+
+TEST_F(PhysicalPlannerTest, RebaseSkipsUnnamedColumnsOfTheJoinBuild) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto events = Node(plan::ScanNode{.table = Repeated(), .fields = {0}});
+  const auto groups = Node(plan::GroupAggregateNode{
+      .input = events,
+      .keys = {x},
+      .key_ids = {plan::ColumnId{1}},
+      .aggregates = {{.kind = plan::AggKind::kCountStar, .id = plan::ColumnId{2}}}});
+  const auto labels = Node(plan::ScanNode{.table = Table(), .fields = {0, 1}});
+  const auto join = Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                        .left = labels,
+                                        .right = groups,
+                                        .keys = {{.left = x, .right = x}},
+                                        .build = plan::BuildSide::kLeft});
+  for (const int slot : {1, 3}) {
+    // Slot 1 physically reads the build's y; slot 3 reads the count of the matching group.
+    auto count = Column(slot, "n", LogicalType::kBigInt);
+    count.id = plan::ColumnId{2};
+    const auto query =
+        PlanOf(Node(plan::FilterNode{
+                   .input = join,
+                   .predicates = {testing::Compare(count, plan::CompareOp::kGt, BigInt(2))}}),
+               4);
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(query, &profile);
+    ASSERT_TRUE(op.ok()) << op.status();
+    EXPECT_EQ(profile.name(), slot == 3 ? "HashJoin" : "Filter");
+    ExecContext ctx{.pool = arrow::default_memory_pool()};
+    const auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status();
+    EXPECT_EQ((*rows)->num_rows(), slot == 3 ? 1 : 3);
+  }
+}
+
+TEST_F(PhysicalPlannerTest, AnUpperFilterEvaluatesMaskedGroupsAcrossStreamingOperators) {
+  // The upper raw-plan comparison casts label to DOUBLE. One discarded group's label fails
+  // conversion whenever an intervening operator passes the lower filter's mask through.
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto events =
+      Node(plan::ScanNode{.table = Repeated(), .fields = {0}, .ids = {plan::ColumnId{1}}});
+  // Sort coalesces the three tiny parts so both matching groups arrive in the same batch.
+  const auto sorted = Node(plan::SortNode{.input = events, .keys = {{.column = x}}});
+  const auto groups = Node(plan::GroupAggregateNode{
+      .input = sorted,
+      .keys = {x},
+      .key_ids = {plan::ColumnId{2}},
+      .aggregates = {{.kind = plan::AggKind::kCountStar, .id = plan::ColumnId{3}}}});
+  const auto schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("label", arrow::binary()),
+                     arrow::field("limit", arrow::float64())});
+  const auto batch =
+      arrow::RecordBatch::Make(schema, 2,
+                               {Int64s({1, 2}), testing::Strings({"bad", "2"}),
+                                testing::ArrayOf<arrow::DoubleBuilder>(
+                                    arrow::float64(), std::vector<std::optional<double>>{1, 1})});
+  const auto labels = Node(plan::ScanNode{
+      .table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}),
+      .fields = {0, 1, 2},
+      .ids = {plan::ColumnId{4}, plan::ColumnId{5}, plan::ColumnId{6}}});
+  const auto join = Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                        .left = groups,
+                                        .right = labels,
+                                        .keys = {{.left = x, .right = x}}});
+  auto count = Column(1, "n", LogicalType::kBigInt);
+  count.id = plan::ColumnId{3};
+  const auto selected = Node(plan::FilterNode{
+      .input = join, .predicates = {testing::Compare(count, plan::CompareOp::kGt, BigInt(2))}});
+  const plan::Predicate compare{.kind = plan::Predicate::Kind::kCompareColumns,
+                                .column = Column(3, "label", LogicalType::kVarchar),
+                                .other = Column(4, "limit", LogicalType::kDouble),
+                                .op = plan::CompareOp::kGt};
+  const auto limited = Node(plan::LimitNode{.input = selected, .limit = 100});
+  const auto unioned =
+      Node(plan::UnionAllNode{.inputs = {selected},
+                              .columns = {{x, count, Column(2, "x", LogicalType::kBigInt),
+                                           *compare.column, *compare.other}}});
+  const auto semi = Node(plan::JoinNode{.kind = plan::JoinKind::kSemi,
+                                        .left = selected,
+                                        .right = labels,
+                                        .keys = {{.left = x, .right = x}}});
+  const auto padded = Node(plan::JoinNode{.kind = plan::JoinKind::kLeft,
+                                          .left = selected,
+                                          .right = labels,
+                                          .keys = {{.left = x, .right = x}}});
+  for (const auto& input : {selected, limited, unioned, semi, padded}) {
+    SCOPED_TRACE(plan::NodeName(*input));
+    const auto query = PlanOf(Node(plan::FilterNode{.input = input, .predicates = {compare}}),
+                              input == padded ? 8 : 5);
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(query, &profile);
+    ASSERT_TRUE(op.ok()) << op.status();
+    ASSERT_EQ(profile.name(), "Filter");
+    ExecContext ctx{.pool = arrow::default_memory_pool()};
+    const auto rows = Drain(**op, ctx);
+    EXPECT_FALSE(rows.ok());
+    EXPECT_TRUE(rows.status().message().contains("bad")) << rows.status();
+  }
+}
+
+TEST_F(PhysicalPlannerTest, ALimitKeepsTheFirstBatchSeenByACheckedCastAfterTheJoin) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto scan = [&](const std::vector<std::optional<int64_t>>& keys,
+                        const std::vector<std::optional<int64_t>>& values) {
+    const auto batch = arrow::RecordBatch::Make(schema, static_cast<int64_t>(keys.size()),
+                                                {Int64s(keys), Int64s(values)});
+    return Node(plan::ScanNode{
+        .table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}),
+        .fields = {0, 1}});
+  };
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const auto v = Column(1, "v", LogicalType::kBigInt);
+  // The ordinal sort makes one serial group table. The first input batch introduces keys
+  // 1, 2, 3 in order. Their counts are 2, 1, 2.
+  const auto ordered = Node(
+      plan::SortNode{.input = scan({1, 2, 3, 1, 3}, {1, 2, 3, 4, 5}), .keys = {{.column = v}}});
+  const auto group = Node(plan::GroupAggregateNode{
+      .input = ordered,
+      .keys = {k},
+      .key_ids = {plan::ColumnId{1}},
+      .aggregates = {{.kind = plan::AggKind::kCountStar, .id = plan::ColumnId{2}}}});
+  // The duplicate build key fills the three-row window with matches for 1, 2, 2.
+  // Removing group 2 before the join would let the invalid value for key 3 into that window.
+  const auto join = Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                        .left = group,
+                                        .right = scan({1, 2, 2, 3}, {7, 0, 0, 40'000}),
+                                        .keys = {{.left = k, .right = k}}});
+  auto count = Column(1, "n", LogicalType::kBigInt);
+  count.id = plan::ColumnId{2};
+  const auto chosen = Node(plan::FilterNode{
+      .input = join, .predicates = {testing::Compare(count, plan::CompareOp::kGt, BigInt(1))}});
+  const auto project = Node(plan::ProjectNode{.input = chosen,
+                                              .columns = {Column(3, "v", LogicalType::kBigInt)},
+                                              .ids = {plan::ColumnId{3}}});
+  const auto value = std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::ColumnExpr{.index = 0, .id = plan::ColumnId{3}}, .type = LogicalType::kBigInt});
+  const auto cast = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::CastExpr{.operand = value}, .type = LogicalType::kSmallInt});
+  const auto compute =
+      Node(plan::ComputeNode{.input = project, .exprs = {cast}, .ids = {plan::ColumnId{4}}});
+  const auto limited = Node(plan::LimitNode{.input = compute, .limit = 1});
+  // Check that this fixture distinguishes the two placements even under the same LIMIT.
+  const auto early = plan::FilterGroupedProbe(std::get<plan::FilterNode>(*chosen),
+                                              plan::GroupedProbeFilterMode::kPhysical);
+  ASSERT_NE(early, nullptr);
+  const auto early_project = plan::WithInputs(*project, {early});
+  const auto early_compute = plan::WithInputs(*compute, {early_project});
+  const auto early_limit = plan::WithInputs(*limited, {early_compute});
+  for (const auto& root : {limited, early_limit, compute}) {
+    auto op = BuildPhysicalPlan(PlanOf(root, 2));
+    ASSERT_TRUE(op.ok()) << op.status();
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+    const auto rows = Drain(**op, ctx);
+    if (root == limited) {
+      ASSERT_TRUE(rows.ok()) << rows.status();
+      EXPECT_EQ(Int64Column(**rows, 0), (std::vector<std::optional<int64_t>>{7}));
+    } else {
+      EXPECT_TRUE(rows.status().IsExecutionError()) << rows.status();
+      EXPECT_TRUE(rows.status().message().contains("40000")) << rows.status();
+    }
+  }
+}
+
 TEST_F(PhysicalPlannerTest, GroupedProbeFilterPreservesErrorsAndEmptyBuildShortCircuit) {
   const auto table = Table();
   const auto scan = Node(plan::ScanNode{.table = table, .fields = {0}, .ids = {plan::ColumnId{1}}});

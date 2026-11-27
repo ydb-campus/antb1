@@ -1531,6 +1531,12 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     one aggregate. Each reader filters the materialized groups for its own value. The guarded
     input reports `shared_rows` for a completed shared build. Its `shared_fallbacks` counter
     includes retries that keep the deferred lookup and run the per-value aggregates independently.
+  - `SharedGroupPartitions` shows two grouped DOUBLE sums sharing a fact scan and lookup join.
+    Each `source=shared-group-partition` reader receives the groups for its own lookup value.
+    `split_scan_parts` counts fact parts processed by the shared producers.
+    `split_rows_0` and `split_rows_1` count joined rows routed to the first and second aggregate
+    states in reader order. These counters are summed across producers. `shared_fallbacks` records
+    a retry with the independent aggregates.
   - on the query's root, `shared` is time spent preparing shared sub-plans and `shared_rows` is
     the number of rows retained when sharing succeeds. If a shared result exceeds the 256 MiB cap,
     the query budget refuses a reservation, or preparation fails, antb1 releases the shared results

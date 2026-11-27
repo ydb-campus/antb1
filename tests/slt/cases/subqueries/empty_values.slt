@@ -1569,3 +1569,39 @@ SMALLINT
 1
 2
 3
+
+# Among these trips, rider 1 has a single fare of 3.50, rider 106 has only a NULL fare,
+# and rider 2 has no trip. SUM must exclude both NULL results at either threshold.
+query I nosort
+SELECT r.rd_id FROM riders r WHERE r.rd_id IN (1, 2, 106)
+AND (SELECT SUM(t.tr_fare) FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_row IN (0, 15)) > 3.49
+ORDER BY r.rd_id
+----
+BIGINT
+1
+
+query I nosort
+SELECT r.rd_id FROM riders r WHERE r.rd_id IN (1, 2, 106)
+AND (SELECT SUM(t.tr_fare) FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_row IN (0, 15)) > 3.50
+ORDER BY r.rd_id
+----
+BIGINT
+
+query I nosort
+SELECT r.rd_id FROM riders r WHERE r.rd_id IN (1, 2, 106)
+AND (SELECT SUM(t.tr_fare) FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_row IN (0, 15)) IS NULL
+ORDER BY r.rd_id
+----
+BIGINT
+2
+106
+
+# The second trip for rider 1 raises COUNT(*) above one. The NULL fare still counts as one
+# trip for rider 106 and the missing group counts as zero for rider 2.
+query I nosort
+SELECT r.rd_id FROM riders r WHERE r.rd_id IN (1, 2, 106)
+AND (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_row IN (0, 15, 236)) > 1
+ORDER BY r.rd_id
+----
+BIGINT
+1

@@ -337,29 +337,12 @@ std::optional<Reduced> Rewrite::Tree(const LogicalNodePtr& node) {
 }
 
 std::optional<LogicalPlan> Rewrite::Run(const LogicalPlan& plan) {
+  const auto* sort = FullyOrderedJoin(plan);
+  if (sort == nullptr) {
+    return std::nullopt;
+  }
   const auto* output = std::get_if<ProjectNode>(plan.root.get());
-  if (output == nullptr ||
-      (!output->constants.empty() && output->constants.size() != output->columns.size())) {
-    return std::nullopt;
-  }
   const auto* limit = std::get_if<LimitNode>(output->input.get());
-  if (limit != nullptr && limit->limit == 0) {
-    return std::nullopt;
-  }
-  const auto* sort =
-      std::get_if<SortNode>(limit != nullptr ? limit->input.get() : output->input.get());
-  if (sort == nullptr || std::get_if<JoinNode>(sort->input.get()) == nullptr) {
-    return std::nullopt;
-  }
-  // Sort consumes the whole candidate before emitting anything. Cover all observable values
-  // as well: changing a hash join's keys can change the choice among otherwise tied rows.
-  for (const auto& column : output->columns) {
-    if (column.id != kNoColumnId && !std::ranges::any_of(sort->keys, [&](const SortKey& key) {
-          return key.column.id == column.id;
-        })) {
-      return std::nullopt;
-    }
-  }
   root_ = plan.root.get();
   auto fast = Tree(sort->input);
   if (!fast || business_field_ == -1 || !dimension_.table || PositionMismatch(plan)) {

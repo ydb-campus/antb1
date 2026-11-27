@@ -103,7 +103,7 @@ bool CanSkipPredicate(const Predicate& p) {
     return false;
   }
   if (p.kind == kCompare) {
-    return p.column->type == p.constant.type;
+    return p.column->type == p.constant.type || ComparesDecimalInDouble(*p.column, p.constant);
   }
   if (p.kind == kLike || p.kind == kNotLike) {
     return p.column->type == LogicalType::kVarchar && p.constant.type == LogicalType::kVarchar &&
@@ -363,7 +363,8 @@ struct PushdownState {
   bool keep_filtered_plan = false;
 };
 
-LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState& state);
+LogicalNodePtr PushGroupFilters(const LogicalNodePtr& node, PushdownState& state,
+                                GroupFilterContext context = {});
 
 struct GroupEqualities {
   std::vector<Predicate> values;
@@ -388,11 +389,12 @@ bool CanSkipCompute(const ComputeNode& compute, ComputeSafety* safety) {
 }
 
 LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predicate,
-                             PushdownState& state) {
+                             PushdownState& state, GroupFilterContext context = {}) {
   if (state.preserve.contains(node.get())) {
     return Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
   }
   ANTB1_CHECK(predicate.column.has_value());  // the equality or its remapped copy
+  const GroupFilterContext below_context = context.ForInput(*node);
   if (const auto* filter = std::get_if<FilterNode>(node.get())) {
     if (state.compute_safety.use == ComputeSafety::Use::kSharedProducer &&
         !std::ranges::all_of(filter->predicates, CanSkipPredicate)) {
@@ -402,7 +404,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
                             [&](const Predicate& p) { return SameEquality(p, predicate); })) {
       return node;
     }
-    LogicalNodePtr below = PushKeyFilter(filter->input, predicate, state);
+    LogicalNodePtr below = PushKeyFilter(filter->input, predicate, state, below_context);
     if (const auto* placed = std::get_if<FilterNode>(below.get());
         placed != nullptr && placed->input == filter->input) {
       FilterNode out = *filter;
@@ -414,7 +416,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
   if (const auto* project = std::get_if<ProjectNode>(node.get())) {
     if (const auto below = ThroughProject(
             *project, predicate, state.compute_safety.use == ComputeSafety::Use::kSharedProducer)) {
-      return WithInputs(*node, {PushKeyFilter(project->input, *below, state)});
+      return WithInputs(*node, {PushKeyFilter(project->input, *below, state, below_context)});
     }
   }
   if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
@@ -428,7 +430,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
       }
       Predicate below = predicate;
       below.column = group->keys[Narrow<std::size_t>(at - group->key_ids.begin())];
-      auto pushed = PushKeyFilter(group->input, below, state);
+      auto pushed = PushKeyFilter(group->input, below, state, below_context);
       if (pushed != group->input) {
         state.pushed_group_keys.insert(predicate.column->id);
       }
@@ -440,7 +442,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
       compute != nullptr &&
       std::ranges::find(compute->ids, predicate.column->id) == compute->ids.end() &&
       CanSkipCompute(*compute, &state.compute_safety)) {
-    return WithInputs(*node, {PushKeyFilter(compute->input, predicate, state)});
+    return WithInputs(*node, {PushKeyFilter(compute->input, predicate, state, below_context)});
   }
   if (const auto* join = std::get_if<JoinNode>(node.get());
       join != nullptr && join->residual.empty() &&
@@ -455,7 +457,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
         (right && join->kind == JoinKind::kInner)) {
       JoinNode out = *join;
       auto& input = left ? out.left : out.right;
-      input = PushKeyFilter(input, predicate, state);
+      input = PushKeyFilter(input, predicate, state, below_context);
       for (const JoinKey& key : join->keys) {
         const BoundColumn& source = left ? key.left : key.right;
         const BoundColumn& target = left ? key.right : key.left;
@@ -463,7 +465,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
           Predicate inferred = predicate;
           inferred.column = target;
           auto& other = left ? out.right : out.left;
-          other = PushKeyFilter(other, inferred, state);
+          other = PushKeyFilter(other, inferred, state, below_context);
         }
       }
       return Make(std::move(out));
@@ -481,7 +483,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
       for (std::size_t i = 0; i < set.inputs.size(); ++i) {
         Predicate branch = predicate;
         branch.column = set.columns[i][Narrow<std::size_t>(key - set.ids.begin())];
-        inputs.push_back(PushKeyFilter(set.inputs[i], branch, state));
+        inputs.push_back(PushKeyFilter(set.inputs[i], branch, state, below_context));
       }
       return WithInputs(*node, std::move(inputs));
     };
@@ -499,7 +501,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
     // A new condition above UNION ALL must reach its branches in this Optimize, too. Their
     // projections or aggregates may then admit it farther down. FALSE filters are left alone.
     LogicalNodePtr branches = FilterIntoUnionBranches(placed, &state.keep_filtered_plan);
-    return branches != placed ? PushGroupKeyEqualities(branches, state) : placed;
+    return branches != placed ? PushGroupFilters(branches, state, context) : placed;
   }
   // Windows, limits, global aggregates, grouping sets and distinct set operations are barriers.
   return placed;
@@ -602,38 +604,69 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node, ComputeSafety* 
   return {};
 }
 
-LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState& state) {
+LogicalNodePtr PlaceGroupFilter(const LogicalNodePtr& current, const FilterNode& filter,
+                                PushdownState& state, GroupFilterContext context) {
+  const auto* join = std::get_if<JoinNode>(filter.input.get());
+  const bool grouped_probe =
+      join != nullptr && join->kind == JoinKind::kInner && join->residual.empty() &&
+      std::get_if<GroupAggregateNode>(
+          (join->build == BuildSide::kLeft ? join->right : join->left).get()) != nullptr;
+  if (grouped_probe) {
+    if (!context.CanMove()) {
+      return current;
+    }
+    if (auto moved = FilterGroupedProbe(filter, GroupedProbeFilterMode::kLogical)) {
+      return moved;
+    }
+    // A mixed filter may still have an exact key equality eligible for the existing
+    // pushdown, provided every conjunct evaluated on the original matches is total.
+    if (!std::ranges::all_of(filter.predicates, CanSkipPredicate)) {
+      return current;
+    }
+  }
+  LogicalNodePtr below = filter.input;
+  std::vector<Predicate> kept;
+  for (const Predicate& predicate : filter.predicates) {
+    if (IsIntegerOrDateEquality(predicate)) {
+      LogicalNodePtr pushed = PushKeyFilter(below, predicate, state, context.ForInput(*current));
+      const auto* placed = std::get_if<FilterNode>(pushed.get());
+      // Keep the original predicate order and filter span when nothing moved. In particular,
+      // ordinary scan filters and repeated EXISTS checks need no rewrite here.
+      if (pushed != below && (placed == nullptr || placed->input != below)) {
+        below = std::move(pushed);
+        continue;
+      }
+    }
+    kept.push_back(predicate);
+  }
+  if (kept.size() == filter.predicates.size()) {
+    return current;
+  }
+  if (kept.empty()) {
+    return below;
+  }
+  FilterNode out = filter;
+  out.input = std::move(below);
+  out.predicates = std::move(kept);
+  // An equality moved below the group can leave only comparisons of completed aggregates.
+  if (grouped_probe) {
+    if (auto moved = FilterGroupedProbe(out, GroupedProbeFilterMode::kLogical)) {
+      return moved;
+    }
+  }
+  return Make(std::move(out));
+}
+
+LogicalNodePtr PushGroupFilters(const LogicalNodePtr& node, PushdownState& state,
+                                GroupFilterContext context) {
   if (state.preserve.contains(node.get())) {
     return node;
   }
-  LogicalNodePtr current = MapInputs(
-      node, [&](const LogicalNodePtr& input) { return PushGroupKeyEqualities(input, state); });
+  LogicalNodePtr current = MapInputs(node, [&](const LogicalNodePtr& input) {
+    return PushGroupFilters(input, state, context.ForInput(*node));
+  });
   if (const auto* filter = std::get_if<FilterNode>(current.get())) {
-    LogicalNodePtr below = filter->input;
-    std::vector<Predicate> kept;
-    for (const Predicate& predicate : filter->predicates) {
-      if (IsIntegerOrDateEquality(predicate)) {
-        LogicalNodePtr pushed = PushKeyFilter(below, predicate, state);
-        const auto* placed = std::get_if<FilterNode>(pushed.get());
-        // Keep the original predicate order and filter span when nothing moved. In particular,
-        // ordinary scan filters and repeated EXISTS checks need no rewrite here.
-        if (pushed != below && (placed == nullptr || placed->input != below)) {
-          below = std::move(pushed);
-          continue;
-        }
-      }
-      kept.push_back(predicate);
-    }
-    if (kept.size() == filter->predicates.size()) {
-      return current;
-    }
-    if (kept.empty()) {
-      return below;
-    }
-    FilterNode out = *filter;
-    out.input = std::move(below);
-    out.predicates = std::move(kept);
-    return Make(std::move(out));
+    current = PlaceGroupFilter(current, *filter, state, context);
   }
   if (const auto* join = std::get_if<JoinNode>(current.get());
       join != nullptr && (join->kind == JoinKind::kInner || join->kind == JoinKind::kLeft)) {
@@ -656,7 +689,7 @@ LogicalNodePtr PushGroupKeyEqualities(const LogicalNodePtr& node, PushdownState&
             Predicate inferred = predicate;
             inferred.column = target;
             auto& input = from_left ? out.right : out.left;
-            input = PushKeyFilter(input, inferred, state);
+            input = PushKeyFilter(input, inferred, state, context.ForInput(*current));
           }
         }
       }
@@ -1382,6 +1415,29 @@ bool CanEvaluateUnboundProjection(const Expr& expr, const LogicalNodePtr& input)
           (range->min && *range->min >= target.min && range->max && *range->max <= target.max));
 }
 
+GroupFilterContext GroupFilterContext::ForInput(const LogicalNode& parent) const {
+  // A sort emits fresh windows and a global aggregate emits a single row after consuming
+  // its input. In either case, operators above it cannot observe input batch boundaries.
+  if (std::holds_alternative<SortNode>(parent) || std::holds_alternative<AggregateNode>(parent)) {
+    return {};
+  }
+  GroupFilterContext next = *this;
+  if (const auto* limit = std::get_if<LimitNode>(&parent)) {
+    next.limited_ = limited_ || limit->limit.has_value();
+  } else if (const auto* filter = std::get_if<FilterNode>(&parent)) {
+    // A filter inspects the full batch, even with a selection mask. Comparing columns can
+    // require a value-dependent conversion; rebatching can expose previously rejected rows.
+    // Unary tests validate their literal and input type at Open and are total on every value.
+    next.preserve_batches_ |= std::ranges::any_of(
+        filter->predicates, [](const Predicate& p) { return p.other.has_value(); });
+  } else if (limited_ && !std::holds_alternative<ProjectNode>(parent)) {
+    // LIMIT may stop before a later qualifying row. An intervening operator could now
+    // evaluate that row in an earlier batch and fail; a projection only selects columns.
+    next.preserve_batches_ = true;
+  }
+  return next;
+}
+
 std::vector<Predicate> SharedConsumerFilters::ReaderPredicates(const LogicalNode* member) const {
   std::vector<Predicate> result;
   std::size_t materialized = 0;
@@ -1475,7 +1531,7 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   PushdownState filters;
   const auto pushed = PreserveSharedAggregates(root, estimates, filters, [&](PushdownState& state) {
     state.pushed_group_keys.clear();  // each sharing trial starts from the original tree
-    return PushGroupKeyEqualities(root, state);
+    return PushGroupFilters(root, state);
   });
   const bool reconsider_groups = pushed != root && !filters.pushed_group_keys.empty();
   root = Prune(pushed, Needed(output.begin(), output.end()));

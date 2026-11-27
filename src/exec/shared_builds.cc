@@ -44,7 +44,7 @@ arrow::Result<bool> Prepare(SharedBuild& build, ExecContext& ctx) {
   try {
     if (producer == nullptr) {
       auto rebuilt = build.make_producer();
-      if (!rebuilt.ok()) {
+      if (!rebuilt.ok() || !*rebuilt) {
         return false;
       }
       producer = std::move(*rebuilt);
@@ -85,6 +85,11 @@ arrow::Status SharedBuildsOperator::Open(ExecContext& ctx) {
     }
     if (!*kept) {
       ReleaseBuilds();
+      if (!fallback_) {
+        // The guarded split plan must release its buffered result and run the independent root
+        // under the caller's ordinary limits. It owns the retry, including scan validation.
+        return arrow::Status::Invalid("cannot retain a guarded shared producer");
+      }
       ARROW_RETURN_NOT_OK(PrepareFallback(ctx));
       break;
     }
