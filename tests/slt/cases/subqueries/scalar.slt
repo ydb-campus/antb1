@@ -611,6 +611,32 @@ FROM edge o WHERE o.id = 2
 INTEGER	SMALLINT
 2	0
 
+# D39: DuckDB may evaluate the cast for unprobed keys, including when no outer row survives.
+onlyif antb1
+query I nosort
+SELECT (SELECT MAX(i.bad) FROM (SELECT id, CAST(i64 AS SMALLINT) AS bad FROM edge) i
+        WHERE i.id IS NOT DISTINCT FROM o.id % 13) FROM edge o WHERE o.id = 2
+----
+SMALLINT
+0
+
+onlyif duckdb
+statement error out of range
+SELECT (SELECT MAX(i.bad) FROM (SELECT id, CAST(i64 AS SMALLINT) AS bad FROM edge) i
+        WHERE i.id IS NOT DISTINCT FROM o.id % 13) FROM edge o WHERE o.id = 2
+
+onlyif antb1
+query I nosort
+SELECT (SELECT MAX(i.bad) FROM (SELECT id, CAST(i64 AS SMALLINT) AS bad FROM edge) i
+        WHERE i.id = o.id % 13) FROM edge o WHERE o.id < 0
+----
+SMALLINT
+
+onlyif duckdb
+statement error out of range
+SELECT (SELECT MAX(i.bad) FROM (SELECT id, CAST(i64 AS SMALLINT) AS bad FROM edge) i
+        WHERE i.id = o.id % 13) FROM edge o WHERE o.id < 0
+
 # A matching row must still report the checked cast error.
 statement error out of range
 SELECT (SELECT MAX(i.bad) FROM (SELECT id, CAST(i64 AS SMALLINT) AS bad FROM edge) i
