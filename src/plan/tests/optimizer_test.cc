@@ -2343,25 +2343,31 @@ TEST(OptimizerTest, ComputedScalarKeysRequireSafeSideLocalOperands) {
     bool accepted;
   };
   for (const auto& [key, accepted] : {
-           Example{"lower(u.s) = upper(t.s)", true},
-           Example{"strlen(upper(u.s)) = t.i64", true},
-           Example{"strlen(substring(u.s, 1, 2)) = t.i64", false},
-           Example{"u.i32 // 3 = t.i32", true},
-           Example{"u.i32 % u.i16 = t.i32", false},
-           Example{"(u.i32 + 1) % 3 = t.i32", false},
-           Example{"COALESCE(u.i32, 0) = t.i32", true},
-           Example{"COALESCE(u.i32, CAST(u.i64 AS INTEGER)) = t.i32", false},
-           Example{"CASE WHEN u.i32 > 0 AND u.i16 < 3 THEN u.i32 END = t.i32", true},
-           Example{"CASE WHEN CAST(u.i64 AS SMALLINT) > u.i16 OR u.i16 < 3 THEN u.i32 END = t.i32",
-                   false},
-           Example{"CASE WHEN u.i32 > 0 THEN u.i32 ELSE u.i32 + 1 END = t.i32", false},
-           Example{"CASE WHEN u.i32 > 0 THEN CAST(u.i64 AS INTEGER) ELSE u.i32 END = t.i32", false},
-           Example{"CASE WHEN u.i32 > 0 THEN u.i16 ELSE u.i64 END = t.i64", true},
-           Example{"u.i32 % 7 = t.d", false},
-           Example{"u.i32 % 7 = t.i16 + u.i16", false},
-           Example{"u.i32 = 3 AND u.i32 % 7 = t.i32", true},
-           Example{"u.i32 % 7 = u.i16 AND u.i32 % 3 = t.i32", true},
-           Example{"CAST(u.i16 AS BIGINT) + t.i16 = t.i32 % 7", false},
+           Example{.key = "lower(u.s) = upper(t.s)", .accepted = true},
+           Example{.key = "strlen(upper(u.s)) = t.i64", .accepted = true},
+           Example{.key = "strlen(substring(u.s, 1, 2)) = t.i64", .accepted = false},
+           Example{.key = "u.i32 // 3 = t.i32", .accepted = true},
+           Example{.key = "u.i32 % u.i16 = t.i32", .accepted = false},
+           Example{.key = "(u.i32 + 1) % 3 = t.i32", .accepted = false},
+           Example{.key = "COALESCE(u.i32, 0) = t.i32", .accepted = true},
+           Example{.key = "COALESCE(u.i32, CAST(u.i64 AS INTEGER)) = t.i32", .accepted = false},
+           Example{.key = "CASE WHEN u.i32 > 0 AND u.i16 < 3 THEN u.i32 END = t.i32",
+                   .accepted = true},
+           Example{
+               .key =
+                   "CASE WHEN CAST(u.i64 AS SMALLINT) > u.i16 OR u.i16 < 3 THEN u.i32 END = t.i32",
+               .accepted = false},
+           Example{.key = "CASE WHEN u.i32 > 0 THEN u.i32 ELSE u.i32 + 1 END = t.i32",
+                   .accepted = false},
+           Example{.key = "CASE WHEN u.i32 > 0 THEN CAST(u.i64 AS INTEGER) ELSE u.i32 END = t.i32",
+                   .accepted = false},
+           Example{.key = "CASE WHEN u.i32 > 0 THEN u.i16 ELSE u.i64 END = t.i64",
+                   .accepted = true},
+           Example{.key = "u.i32 % 7 = t.d", .accepted = false},
+           Example{.key = "u.i32 % 7 = t.i16 + u.i16", .accepted = false},
+           Example{.key = "u.i32 = 3 AND u.i32 % 7 = t.i32", .accepted = true},
+           Example{.key = "u.i32 % 7 = u.i16 AND u.i32 % 3 = t.i32", .accepted = true},
+           Example{.key = "CAST(u.i16 AS BIGINT) + t.i16 = t.i32 % 7", .accepted = false},
        }) {
     CheckScalarRewrite(catalog, std::format("SELECT (SELECT COUNT(*) FROM u WHERE {}) FROM t", key),
                        accepted);
@@ -2375,11 +2381,12 @@ TEST(OptimizerTest, ComputedScalarProductsCheckBothExtremesOfTheInputRange) {
   };
   // Both signs matter: a negative factor makes the minimum determine the upper bound.
   for (const auto& [stats, accepted] : {
-           Example{{.min = -1'073'741'823, .max = 1'073'741'824, .rows = 2}, true},
-           Example{{.min = -1'073'741'824, .max = 0, .rows = 2}, false},
-           Example{{.min = 0, .max = 1'073'741'825, .rows = 2}, false},
-           Example{{.null_count = 2, .rows = 2}, true},
-           Example{{.rows = 2}, false},
+           Example{.stats = {.min = -1'073'741'823, .max = 1'073'741'824, .rows = 2},
+                   .accepted = true},
+           Example{.stats = {.min = -1'073'741'824, .max = 0, .rows = 2}, .accepted = false},
+           Example{.stats = {.min = 0, .max = 1'073'741'825, .rows = 2}, .accepted = false},
+           Example{.stats = {.null_count = 2, .rows = 2}, .accepted = true},
+           Example{.stats = {.rows = 2}, .accepted = false},
        }) {
     auto catalog = MakeCatalog();
     auto bounds = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 2);
@@ -2399,11 +2406,11 @@ TEST(OptimizerTest, ComputedScalarProjectionUsesExactNarrowingBounds) {
   // LIMIT leaves some bindings unread. A cast below the inner projection may run on all
   // rows only when every part fits, including the exact SMALLINT boundaries.
   for (const auto& [stats, fits] : {
-           Example{{.min = -32768, .max = 32767, .rows = 2}, true},
-           Example{{.min = -32769, .max = 0, .rows = 2}, false},
-           Example{{.min = 0, .max = 32768, .rows = 2}, false},
-           Example{{.null_count = 2, .rows = 2}, true},
-           Example{{.rows = 2}, false},
+           Example{.stats = {.min = -32768, .max = 32767, .rows = 2}, .fits = true},
+           Example{.stats = {.min = -32769, .max = 0, .rows = 2}, .fits = false},
+           Example{.stats = {.min = 0, .max = 32768, .rows = 2}, .fits = false},
+           Example{.stats = {.null_count = 2, .rows = 2}, .fits = true},
+           Example{.stats = {.rows = 2}, .fits = false},
        }) {
     auto catalog = MakeCatalog();
     auto bounds = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 4);
@@ -2430,13 +2437,23 @@ TEST(OptimizerTest, CheckedScalarProjectionsRequireAllMatchingBindings) {
   // A restriction can pass through aliases but cannot move below an inner LIMIT or GROUP BY,
   // nor use a key that the checked projection itself must first compute.
   for (const auto& [inner, outer, accepted] : {
-           Example{kChecked, "t", true},
-           Example{kChecked, "(SELECT i32 FROM t LIMIT 5) t", false},
-           Example{"SELECT i32 AS k, CAST(i64 AS SMALLINT) AS v FROM u LIMIT 5", "t", false},
-           Example{"SELECT i32 % 7 AS k, CAST(i64 AS SMALLINT) AS v FROM u", "t", false},
-           Example{"SELECT i32 AS k, MAX(i64) AS v FROM u GROUP BY i32", "t", true},
-           Example{"SELECT i32 AS k, AVG(dt) AS v FROM u GROUP BY i32", "t", false},
-           Example{"SELECT i32 AS k, SUM(h) AS v FROM u GROUP BY i32", "t", false},
+           Example{.inner = kChecked, .outer = "t", .accepted = true},
+           Example{.inner = kChecked, .outer = "(SELECT i32 FROM t LIMIT 5) t", .accepted = false},
+           Example{.inner = "SELECT i32 AS k, CAST(i64 AS SMALLINT) AS v FROM u LIMIT 5",
+                   .outer = "t",
+                   .accepted = false},
+           Example{.inner = "SELECT i32 % 7 AS k, CAST(i64 AS SMALLINT) AS v FROM u",
+                   .outer = "t",
+                   .accepted = false},
+           Example{.inner = "SELECT i32 AS k, MAX(i64) AS v FROM u GROUP BY i32",
+                   .outer = "t",
+                   .accepted = true},
+           Example{.inner = "SELECT i32 AS k, AVG(dt) AS v FROM u GROUP BY i32",
+                   .outer = "t",
+                   .accepted = false},
+           Example{.inner = "SELECT i32 AS k, SUM(h) AS v FROM u GROUP BY i32",
+                   .outer = "t",
+                   .accepted = false},
        }) {
     CheckScalarRewrite(catalog,
                        std::format("SELECT (SELECT MAX(i.v) FROM ({}) i WHERE i.k = t.i32 % 7) "
