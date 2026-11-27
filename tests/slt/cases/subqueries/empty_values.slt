@@ -1529,8 +1529,7 @@ SMALLINT
 5
 6
 
-# Computed equality operands and outer-only conditions are later SQ10 rules.
-onlyif duckdb
+# SQ10: an outer expression supplies the key, including for a missing group.
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id + 0) = 0 ORDER BY 1
 ----
@@ -1539,6 +1538,7 @@ SMALLINT
 5
 6
 
+# An outer-only conjunct in the aggregate is a later SQ10 rule.
 onlyif duckdb
 query I nosort
 SELECT c.ct_id FROM cities c

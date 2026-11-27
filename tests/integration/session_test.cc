@@ -87,6 +87,20 @@ TEST(Session, KeylessCountOverEmptyTableFitsTheMemoryBudget) {
   EXPECT_EQ(*count, 7488);
 }
 
+TEST(Session, ComputedScalarKeyOverAnEmptyOuterTableFitsTheMemoryBudget) {
+  auto session =
+      engine::Session::Make({.threads = 1, .memory_limit = 2 * 1024 * 1024}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("fleet", {Fixture("star/fleet.parquet")}).ok());
+  ASSERT_TRUE(session->RegisterParquet("promos", {Fixture("star/promos.parquet")}).ok());
+  for (const std::string_view condition :
+       {"f.fl_row + 1 = p.pm_id", "f.fl_row IS NOT DISTINCT FROM p.pm_id % 7"}) {
+    const auto result = session->Execute("SELECT p.pm_id, (SELECT COUNT(*) FROM fleet f WHERE " +
+                                         std::string(condition) + ") FROM promos p");
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(result->table->num_rows(), 0);
+  }
+}
+
 TEST(Session, CountStarFromPaths) {
   auto session = NewSession();
   ASSERT_NE(session, nullptr);

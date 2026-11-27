@@ -2712,6 +2712,8 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   int avg = 0;
   int avg_integer = 0;
   int avg_decimal = 0;
+  int computed_keys = 0;
+  int grouped_integer_min_max = 0;
   int widened_keys = 0;
   int keyed_domains = 0;
   int keyless_domains = 0;
@@ -2720,6 +2722,11 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedAggregate)) {
       continue;
+    }
+    if (q.features.Has(Feature::kComputedScalarKey)) {
+      ++computed_keys;
+      EXPECT_TRUE(q.sql.contains('%')) << q.sql;
+      EXPECT_FALSE(q.features.Has(Feature::kCorrelatedSingle)) << q.sql;
     }
     const auto ordinary = without_widening.Generate(i);
     if (q.features.Has(Feature::kWidenedScalarKey)) {
@@ -2742,6 +2749,16 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     const std::string block = q.sql.substr(at, q.sql.find(')', q.sql.find(" WHERE ", at)) - at);
     EXPECT_EQ(block.contains("GROUP BY"), q.features.Has(Feature::kCorrelatedSingle)) << q.sql;
     grouped_scalars += q.features.Has(Feature::kCorrelatedSingle) ? 1 : 0;
+    constexpr std::string_view kGroupBy = " GROUP BY ";
+    if (const auto group = block.find(kGroupBy);
+        group != std::string::npos &&
+        (block.starts_with("(SELECT MIN(") || block.starts_with("(SELECT MAX("))) {
+      const auto start = group + kGroupBy.size();
+      const auto key = block.substr(start, block.find(',', start) - start);
+      if (kind_of(key) == ValueKind::kInteger) {
+        ++grouped_integer_min_max;
+      }
+    }
     EXPECT_NE(block.find(" WHERE "), std::string::npos) << q.sql;
     if (q.features.Has(Feature::kKeyedDomainAggregate)) {
       ++keyed_domains;
@@ -2773,6 +2790,8 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     EXPECT_FALSE(q.features.Has(Feature::kInSubquery)) << q.sql;
     EXPECT_FALSE(q.features.Has(Feature::kScalarSubquery)) << q.sql;
   }
+  EXPECT_GT(computed_keys, 0);
+  EXPECT_GT(grouped_integer_min_max, 0);
   EXPECT_GT(widened_keys, 0);
   EXPECT_GT(grouped_scalars, 0);
   EXPECT_GT(calls, 150) << "calls: " << calls;

@@ -2412,8 +2412,7 @@ SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE 
 SMALLINT
 1
 
-# A computed equality operand is a separate SQ10 rule.
-onlyif duckdb
+# SQ10 also handles arithmetic over a locally available scalar value.
 query I nosort
 SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) + 0 = c.ct_id) ORDER BY ct_id
 ----
