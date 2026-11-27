@@ -23,6 +23,7 @@ struct SharedBuild {
   std::shared_ptr<MaterializedTable> table;
   std::unique_ptr<Operator> first_producer;
   std::function<arrow::Result<std::unique_ptr<Operator>>()> make_producer;
+  bool combined_domains = false;
 };
 
 // Runs every shared sub-plan to completion before it opens `input`, and owns the results.
@@ -66,6 +67,7 @@ class SharedBuildsOperator final : public Operator {
   Fallback fallback_;
   std::unique_ptr<Operator> unshared_;
   bool use_fallback_ = false;
+  bool retry_if_empty_ = false;
 };
 
 }  // namespace antb1::exec

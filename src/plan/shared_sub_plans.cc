@@ -20,6 +20,7 @@
 
 #include <arrow/type.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
@@ -70,15 +71,20 @@ class Origins {
 
   // A column reference that `at` reads, as a key: its ordinal and its path, or its position when it
   // has no id (the executor's positional plans, which never reach here from the binder).
-  [[nodiscard]] std::string Key(const BoundColumn& column, const LogicalNode& at) const {
+  [[nodiscard]] std::string Key(const BoundColumn& column, const LogicalNode& at,
+                                bool include_layout = false) const {
     if (column.id == kNoColumnId) {
       return std::format("@{}", column.index);
     }
-    return std::format("c{}{}", Of(column.id), PathOf(column.id, at));
+    const auto path = PathOf(column.id, at);
+    if (include_layout) {
+      return std::format("c{}{}@{}:{}", Of(column.id), path, column.index, ToString(column.type));
+    }
+    return std::format("c{}{}", Of(column.id), path);
   }
-  [[nodiscard]] std::string Key(const std::optional<BoundColumn>& column,
-                                const LogicalNode& at) const {
-    return column.has_value() ? Key(*column, at) : "-";
+  [[nodiscard]] std::string Key(const std::optional<BoundColumn>& column, const LogicalNode& at,
+                                bool include_layout = false) const {
+    return column.has_value() ? Key(*column, at, include_layout) : "-";
   }
 
   // The path from `at` to the node that defines `id`, which `at` reads from one of its inputs: that
@@ -267,12 +273,16 @@ std::string ConstantKey(const Constant& constant) {
 // PredicateExpr (index 0 and 1 into the operands) rather than columns of a node's input, so they
 // are keyed by position.
 std::string PredicateKey(const Predicate& p, const Origins& origins, bool local,
-                         const LogicalNode& at) {
+                         const LogicalNode& at, bool include_layout = false) {
   const auto column = [&](const std::optional<BoundColumn>& c) {
     if (!c.has_value()) {
       return std::string("-");
     }
-    return local ? std::format("@{}", c->index) : origins.Key(*c, at);
+    if (local) {
+      return include_layout ? std::format("@{}:{}", c->index, ToString(c->type))
+                            : std::format("@{}", c->index);
+    }
+    return origins.Key(*c, at, include_layout);
   };
   std::string key = std::format("P{},{},{},{},{}", static_cast<int>(p.kind), column(p.column),
                                 column(p.other), static_cast<int>(p.op), ConstantKey(p.constant));
@@ -285,14 +295,18 @@ std::string PredicateKey(const Predicate& p, const Origins& origins, bool local,
 
 // An expression that `at` computes, as a key: its structure and type with every column reference by
 // origin and path, and without its display name (which SameExpr ignores too, for the same reason).
-std::string ExprKey(const ExprPtr& expr, const Origins& origins, const LogicalNode& at) {
+std::string ExprKey(const ExprPtr& expr, const Origins& origins, const LogicalNode& at,
+                    bool include_layout = false) {
   if (expr == nullptr) {
     return "_";
   }
-  const auto args = [&origins, &at](const std::vector<ExprPtr>& list) {
+  const auto child = [&](const ExprPtr& input) {
+    return ExprKey(input, origins, at, include_layout);
+  };
+  const auto args = [&child](const std::vector<ExprPtr>& list) {
     std::string out;
     for (const ExprPtr& arg : list) {
-      out += ExprKey(arg, origins, at);
+      out += child(arg);
       out += ',';
     }
     return out;
@@ -301,28 +315,30 @@ std::string ExprKey(const ExprPtr& expr, const Origins& origins, const LogicalNo
       [&](const auto& e) -> std::string {
         using T = std::decay_t<decltype(e)>;
         if constexpr (std::is_same_v<T, ColumnExpr>) {
-          return e.id == kNoColumnId
-                     ? std::format("@{}", e.index)
-                     : std::format("c{}{}", origins.Of(e.id), origins.PathOf(e.id, at));
+          if (e.id == kNoColumnId) {
+            return std::format("@{}", e.index);
+          }
+          const auto path = origins.PathOf(e.id, at);
+          return include_layout ? std::format("c{}{}@{}", origins.Of(e.id), path, e.index)
+                                : std::format("c{}{}", origins.Of(e.id), path);
         } else if constexpr (std::is_same_v<T, ConstantExpr>) {
           return std::format("k{}", ConstantKey(e.value));
         } else if constexpr (std::is_same_v<T, ArithExpr>) {
-          return std::format("A{}({},{})", static_cast<int>(e.op), ExprKey(e.left, origins, at),
-                             ExprKey(e.right, origins, at));
+          return std::format("A{}({},{})", static_cast<int>(e.op), child(e.left), child(e.right));
         } else if constexpr (std::is_same_v<T, NegateExpr>) {
-          return std::format("N({})", ExprKey(e.operand, origins, at));
+          return std::format("N({})", child(e.operand));
         } else if constexpr (std::is_same_v<T, FunctionExpr>) {
           return std::format("F{}({})", static_cast<int>(e.function), args(e.args));
         } else if constexpr (std::is_same_v<T, PredicateExpr>) {
-          return std::format("E{}({})", PredicateKey(e.predicate, origins, /*local=*/true, at),
+          return std::format("E{}({})",
+                             PredicateKey(e.predicate, origins, /*local=*/true, at, include_layout),
                              args(e.operands));
         } else if constexpr (std::is_same_v<T, BoolExpr>) {
           return std::format("B{}({})", static_cast<int>(e.op), args(e.args));
         } else if constexpr (std::is_same_v<T, CaseExpr>) {
-          return std::format("W({}|{}|{})", args(e.whens), args(e.thens),
-                             ExprKey(e.otherwise, origins, at));
+          return std::format("W({}|{}|{})", args(e.whens), args(e.thens), child(e.otherwise));
         } else if constexpr (std::is_same_v<T, CastExpr>) {
-          return std::format("X({})", ExprKey(e.operand, origins, at));
+          return std::format("X({})", child(e.operand));
         } else {
           static_assert(false, "an expression type without a key");
         }
@@ -361,26 +377,38 @@ void Origins::Define(const JoinNode& node, const LogicalNode& at) {
 // returns, so two scans of one table differing only there compute the same rows and the shared
 // sub-plan reads the union. A Join's build side and estimate are absent too -- both are choices
 // about *how* to run it, and neither changes the rows or their order.
-std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origins) {
+std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origins,
+                                   const Predicate* partition) {
   return std::visit(
-      [&origins, &node](const auto& n) -> std::optional<std::string> {
+      [&](const auto& n) -> std::optional<std::string> {
         using T = std::decay_t<decltype(n)>;
         if constexpr (std::is_same_v<T, ScanNode>) {
           if (n.table == nullptr) {
             return std::nullopt;  // sharing a valid member must not mask a malformed scan
           }
-          return std::format("scan({})", n.table_name);
+          if (partition == nullptr) {
+            return std::format("scan({})", n.table_name);
+          }
+          // The combined producer must decode every field an individual reader would visit.
+          std::string key =
+              std::format("scan({},{},", n.table_name, static_cast<const void*>(n.table.get()));
+          for (const int field : n.fields) {
+            key += std::format("{},", field);
+          }
+          return key + ')';
         } else if constexpr (std::is_same_v<T, FilterNode>) {
           std::string key = "filter(";
           for (const Predicate& p : n.predicates) {
-            key += PredicateKey(p, origins, /*local=*/false, node);
+            key += &p == partition
+                       ? std::format("partition({})", origins.Key(p.column, node, true))
+                       : PredicateKey(p, origins, /*local=*/false, node, partition != nullptr);
             key += ';';
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, ComputeNode>) {
           std::string key = "compute(";
           for (const ExprPtr& expr : n.exprs) {
-            key += ExprKey(expr, origins, node);
+            key += ExprKey(expr, origins, node, partition != nullptr);
             key += ';';
           }
           return key + ')';
@@ -397,31 +425,37 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
         } else if constexpr (std::is_same_v<T, AggregateNode>) {
           std::string key = "aggregate(";
           for (const AggregateCall& call : n.aggregates) {
-            key += std::format("{},{},{};", static_cast<int>(call.kind),
-                               origins.Key(call.arg, node), ToString(call.type));
+            key +=
+                std::format("{},{},{};", static_cast<int>(call.kind),
+                            origins.Key(call.arg, node, partition != nullptr), ToString(call.type));
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, GroupAggregateNode>) {
           std::string key = "group(";
           for (const BoundColumn& k : n.keys) {
-            key += origins.Key(k, node);
+            key += origins.Key(k, node, partition != nullptr);
             key += ',';
           }
           key += ';';
           for (const AggregateCall& call : n.aggregates) {
-            key += std::format("{},{},{};", static_cast<int>(call.kind),
-                               origins.Key(call.arg, node), ToString(call.type));
+            key +=
+                std::format("{},{},{};", static_cast<int>(call.kind),
+                            origins.Key(call.arg, node, partition != nullptr), ToString(call.type));
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, JoinNode>) {
           std::string key = std::format("join({},", static_cast<int>(n.kind));
+          if (partition != nullptr) {
+            key += std::format("build{},", static_cast<int>(n.build));
+          }
           for (const JoinKey& k : n.keys) {
-            key += std::format("{}{}{},", origins.Key(k.left, node), k.null_equal ? "<=>" : "=",
-                               origins.Key(k.right, node));
+            key += std::format("{}{}{},", origins.Key(k.left, node, partition != nullptr),
+                               k.null_equal ? "<=>" : "=",
+                               origins.Key(k.right, node, partition != nullptr));
           }
           key += ';';
           for (const ExprPtr& expr : n.residual) {
-            key += ExprKey(expr, origins, node);
+            key += ExprKey(expr, origins, node, partition != nullptr);
             key += ';';
           }
           return key + ')';
@@ -473,7 +507,7 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
 using KeyMemo = std::unordered_map<const LogicalNode*, std::optional<std::string>>;
 
 const std::optional<std::string>& SubtreeKey(const LogicalNodePtr& node, const Origins& origins,
-                                             KeyMemo& memo) {
+                                             KeyMemo& memo, const Predicate* partition = nullptr) {
   if (node == nullptr) {
     // Keyed by nullptr rather than returning a reference to a static: a missing input is not
     // shareable, which is what an empty key says.
@@ -483,10 +517,10 @@ const std::optional<std::string>& SubtreeKey(const LogicalNodePtr& node, const O
   if (found != memo.end()) {
     return found->second;
   }
-  std::optional<std::string> key = NodeKey(*node, origins);
+  std::optional<std::string> key = NodeKey(*node, origins, partition);
   if (key.has_value()) {
     for (const LogicalNodePtr& input : InputsOf(*node)) {
-      const std::optional<std::string>& child = SubtreeKey(input, origins, memo);
+      const std::optional<std::string>& child = SubtreeKey(input, origins, memo, partition);
       if (!child.has_value()) {
         key.reset();
         break;
@@ -534,6 +568,9 @@ int64_t FieldUnion(const std::vector<LogicalNodePtr>& members) {
 // it twice. Unknown input row counts decline sharing. Keep the total to compare it with the
 // output of a compound candidate, saturating only when it exceeds the representable row count.
 constexpr int64_t kMinSharedRows = 10'000'000;
+// Fixed-width IN evaluates one comparison per value. The scan selectivity heuristic expects
+// ten equality values to cover the domain; avoid adding that work below a group.
+constexpr std::size_t kMaxSharedFilterValues = 9;
 
 std::optional<int64_t> InputRows(const LogicalNode& node) {
   if (const auto* scan = std::get_if<ScanNode>(&node)) {
@@ -607,6 +644,25 @@ std::optional<AggregateSize> SharedAggregateSize(const LogicalNodePtr& node) {
   return size;
 }
 
+// Every tuple from this scan belongs to a row in one part. Bound it by the table rows,
+// the product of the table-wide domains, or the per-part product times the number of
+// parts. The latter counts the parts once even when several keys come from the same scan.
+int64_t AfterScan(const ScanNode& scan, std::span<const ScanKeyDomain> sources, int64_t limit) {
+  const auto divide = [](int64_t value, std::optional<int64_t> bound) -> int64_t {
+    return bound.has_value() ? value / std::max<int64_t>(*bound, 1) : 0;
+  };
+  int64_t by_table = limit;
+  int64_t by_part = divide(limit, scan.table->num_parts());
+  for (const auto& source : sources) {
+    if (source.scan == &scan) {
+      by_table = divide(by_table, source.max_values);
+      by_part = divide(
+          by_part, source.max_part_values.has_value() ? source.max_part_values : source.max_values);
+    }
+  }
+  return std::max({by_table, by_part, divide(limit, scan.table->exact_row_count())});
+}
+
 // A filter on one scan can bound several of that scan's grouping keys together. Keys from
 // other scans need a table-wide bound. Compare by division so a product cannot overflow.
 struct GroupSizeLimit {
@@ -614,25 +670,6 @@ struct GroupSizeLimit {
   std::span<const ScanKeyDomain> sources;
   int64_t max_groups;
   int& remaining;
-
-  // Every tuple from this scan belongs to a row in one part. Bound it by the table rows,
-  // the product of the table-wide domains, or the per-part product times the number of
-  // parts. The latter counts the parts once even when several keys come from the same scan.
-  int64_t AfterScan(const ScanNode& scan, int64_t limit) const {
-    const auto divide = [](int64_t value, std::optional<int64_t> bound) -> int64_t {
-      return bound.has_value() ? value / std::max<int64_t>(*bound, 1) : 0;
-    };
-    int64_t by_table = limit;
-    int64_t by_part = divide(limit, scan.table->num_parts());
-    for (const auto& source : sources) {
-      if (source.scan == &scan) {
-        by_table = divide(by_table, source.max_values);
-        by_part = divide(by_part, source.max_part_values.has_value() ? source.max_part_values
-                                                                     : source.max_values);
-      }
-    }
-    return std::max({by_table, by_part, divide(limit, scan.table->exact_row_count())});
-  }
 
   bool Fits(const FilterNode& filter, const ScanNode* scan) const {
     std::array<PredicateDomainKey, kMaxPredicateDomainKeys> local;
@@ -644,7 +681,7 @@ struct GroupSizeLimit {
       } else if (sources[i].scan == nullptr) {
         return false;
       } else if (!std::ranges::contains(sources.first(i), sources[i].scan, &ScanKeyDomain::scan)) {
-        limit = AfterScan(*sources[i].scan, limit);
+        limit = AfterScan(*sources[i].scan, sources, limit);
       }
     }
     const auto bound = PredicateTupleBound(filter, std::span(local).first(count), remaining);
@@ -801,12 +838,12 @@ SharedConsumerFilters::SharedConsumerFilters(const LogicalPlan& plan) {
 }
 
 LogicalNodePtr SharedConsumerFilters::Producer(const SharedSubPlan& group) const {
+  if (group.combined_producer) {
+    return group.combined_producer;
+  }
   const auto& widest = group.members[group.widest];
   // Intersect the constrained output positions across readers, unioning their allowed values.
   // Map by origin-derived producer position: every reference has its own ids and projection.
-  // Fixed-width IN evaluates one comparison per value. The scan selectivity heuristic
-  // expects ten equality values to cover the domain; avoid adding that work below a group.
-  constexpr std::size_t kMaxSharedFilterValues = 9;
   using Domains = std::map<int, std::set<Int128>>;
   Domains common;
   std::map<int, BoundColumn> producer_columns;
@@ -987,19 +1024,241 @@ bool Overlaps(const LogicalNodePtr& node, const std::unordered_set<const Logical
                              }));
 }
 
-std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool executable) {
+struct GroupPartition {
+  LogicalNodePtr member;
+  const Predicate* equality;
+  std::size_t key;
+};
+
+bool ReadsSlot(const BoundColumn& column, std::span<const ColumnId> ids) {
+  const auto slot = TryNarrow<std::size_t>(column.index);
+  return slot && *slot < ids.size() && column.id != kNoColumnId && ids[*slot] == column.id;
+}
+
+// A retained input key preserves its equality through row-wise nodes and inner joins. An
+// aggregate, a compound input, or a null-extending join would need a different proof.
+std::vector<GroupPartition> PartitionsOf(const LogicalNodePtr& member,
+                                         const GroupAggregateNode& group) {
+  std::vector<GroupPartition> partitions;
+  bool joined = false;
+  const auto visit = [&](const auto& self, const LogicalNodePtr& node) -> bool {
+    if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+      const auto ids = OutputIds(*filter->input);
+      for (const auto& p : filter->predicates) {
+        if (!IsIntegerOrDateEquality(p) || !ReadsSlot(*p.column, ids)) {
+          continue;
+        }
+        const auto key = std::ranges::find(group.keys, p.column->id, &BoundColumn::id);
+        if (key != group.keys.end() && key->type == p.column->type) {
+          // Bound alternative fingerprints per group. One filter reached twice is two
+          // occurrences in the fingerprint, so changing just one would not reproduce it.
+          if (partitions.size() == kMaxPredicateDomainKeys ||
+              std::ranges::contains(partitions, &p, &GroupPartition::equality)) {
+            return false;
+          }
+          partitions.push_back({.member = member,
+                                .equality = &p,
+                                .key = Narrow<std::size_t>(key - group.keys.begin())});
+        }
+      }
+    } else if (const auto* join = std::get_if<JoinNode>(node.get())) {
+      // Several joins can offer different dynamic filters on the same scan after widening.
+      if (joined || join->kind != JoinKind::kInner || join->verify_dimension_business_field) {
+        return false;
+      }
+      joined = true;
+    } else if (std::get_if<ComputeNode>(node.get()) == nullptr &&
+               std::get_if<ScanNode>(node.get()) == nullptr) {
+      return false;
+    }
+    return std::ranges::all_of(InputsOf(*node),
+                               [&](const auto& input) { return self(self, input); });
+  };
+  const auto input_ids = OutputIds(*group.input);
+  if (!std::ranges::all_of(group.keys,
+                           [&](const auto& key) { return ReadsSlot(key, input_ids); }) ||
+      !visit(visit, group.input)) {
+    return {};
+  }
+  return partitions;
+}
+
+// Unlike the cost estimate for an exact match, widening an input needs a bound for the whole
+// producer. Retained tuples belong to one row of each source scan. Cap the filtered key by the
+// actual IN list (which excludes NULL); all other bounds include NULL and cover disjoint parts.
+bool FitsPartitions(const GroupAggregateNode& group, std::size_t key, int64_t values) {
+  std::vector<ColumnId> keys;
+  int64_t width = 0;
+  for (const auto& column : group.keys) {
+    width += FixedBytes(column.type) + 1;
+    keys.push_back(column.id);
+  }
+  for (const auto& call : group.aggregates) {
+    width += FixedBytes(call.type) + 1;
+  }
+  std::vector<ScanKeyDomain> sources(keys.size());
+  EachDistinctValues(*group.input, keys, sources);
+  auto& restricted = sources[key];
+  restricted.max_values = std::min(restricted.max_values.value_or(values), values);
+  if (restricted.max_part_values) {
+    restricted.max_part_values = std::min(*restricted.max_part_values, values);
+  }
+  int64_t limit = kMaxSharedResultBytes / width;
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    const auto* scan = sources[i].scan;
+    if (scan == nullptr || scan->ids.size() != scan->fields.size() || !scan->table->schema()) {
+      return false;  // including a computed key: its domain isn't the raw scan's
+    }
+    const auto pos =
+        std::ranges::find(scan->ids, keys[i]);  // EachDistinctValues found this id here
+    const int field = scan->fields[Narrow<std::size_t>(pos - scan->ids.begin())];
+    if (field < 0 || field >= scan->table->schema()->num_fields()) {
+      return false;
+    }
+    const auto type = FromArrow(*scan->table->schema()->field(field)->type());
+    if (!type.ok() || *type != group.keys[i].type) {
+      return false;
+    }
+    if (!std::ranges::contains(std::span(sources).first(i), scan, &ScanKeyDomain::scan)) {
+      limit = AfterScan(*scan, sources, limit);
+    }
+  }
+  return limit > 0;
+}
+
+LogicalNodePtr WithPartitions(const LogicalNodePtr& node, const Predicate* equality,
+                              const std::set<Int128>& values) {
+  if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+    for (std::size_t i = 0; i < filter->predicates.size(); ++i) {
+      if (&filter->predicates[i] == equality) {
+        FilterNode copy = *filter;
+        Predicate combined{
+            .kind = Predicate::Kind::kIn, .column = equality->column, .span = equality->span};
+        for (const Int128 value : values) {
+          combined.values.push_back({.type = equality->constant.type, .value = value});
+        }
+        copy.predicates[i] = std::move(combined);
+        return std::make_shared<LogicalNode>(std::move(copy));
+      }
+    }
+  }
+  auto inputs = InputsOf(*node);
+  for (auto& input : inputs) {
+    auto next = WithPartitions(input, equality, values);
+    if (next != input) {
+      input = std::move(next);
+      return WithInputs(*node, std::move(inputs));
+    }
+  }
+  return node;
+}
+
+class FilteredGroups {
+ public:
+  void Collect(const LogicalNodePtr& node, const Origins& origins) {
+    const auto* group = std::get_if<GroupAggregateNode>(node.get());
+    if (group == nullptr || group->keys.empty() || group->keys.size() > kMaxPredicateDomainKeys ||
+        group->key_ids.size() != group->keys.size() || candidates_.contains(node.get()) ||
+        !std::ranges::all_of(group->keys,
+                             [](const auto& key) {
+                               return key.id != kNoColumnId && FixedBytes(key.type) > 0 &&
+                                      key.type != LogicalType::kDouble;
+                             }) ||
+        !std::ranges::all_of(group->aggregates, [](const auto& call) {
+          return FixedBytes(call.type) > 0 && call.type != LogicalType::kDouble &&
+                 (call.kind == AggKind::kCountStar || call.kind == AggKind::kCount ||
+                  call.kind == AggKind::kSum || call.kind == AggKind::kMin ||
+                  call.kind == AggKind::kMax);
+        })) {
+      return;
+    }
+    for (const auto& partition : PartitionsOf(node, *group)) {
+      // Elide exactly one literal, preserving its type, column origin and path, predicate order,
+      // every other filter, and every expression in the input and aggregate.
+      KeyMemo memo;
+      const auto& key = SubtreeKey(node, origins, memo, partition.equality);
+      if (key.has_value()) {
+        auto& bucket = by_key_[*key];
+        bucket.push_back(partition);
+        candidates_[node.get()].push_back(&bucket);
+      }
+    }
+  }
+
+  std::optional<SharedSubPlan> Select(const LogicalNodePtr& node, const Origins& origins,
+                                      const std::unordered_set<const LogicalNode*>& covered) {
+    const auto found = candidates_.find(node.get());
+    if (found == candidates_.end()) {
+      return std::nullopt;
+    }
+    for (auto* bucket : found->second) {
+      auto partitions = std::exchange(*bucket, {});  // try each candidate only once
+      if (!covered.empty()) {
+        std::erase_if(partitions, [&](const auto& part) { return Overlaps(part.member, covered); });
+      }
+      if (partitions.size() < 2) {
+        continue;
+      }
+      std::set<Int128> values;
+      std::vector<LogicalNodePtr> members;
+      for (const auto& part : partitions) {
+        values.insert(std::get<Int128>(part.equality->constant.value));
+        if (values.size() > kMaxSharedFilterValues) {
+          break;
+        }
+        members.push_back(part.member);
+      }
+      if (values.size() < 2 || values.size() > kMaxSharedFilterValues ||
+          InputRows(*members.front()).value_or(0) < kMinSharedRows) {
+        continue;
+      }
+      auto group = GroupOf(std::move(members), origins);
+      if (!group) {
+        continue;
+      }
+      const auto& widest = partitions[group->widest];
+      if (!FitsPartitions(std::get<GroupAggregateNode>(*widest.member), widest.key,
+                          std::ssize(values))) {
+        continue;
+      }
+      group->combined_producer = WithPartitions(widest.member, widest.equality, values);
+      for (const auto& part : partitions) {
+        const auto& aggregate = std::get<GroupAggregateNode>(*part.member);
+        Predicate reader = *part.equality;
+        reader.column = aggregate.keys[part.key];
+        reader.column->id = aggregate.key_ids[part.key];
+        reader.column->index = Narrow<int>(part.key);
+        group->reader_predicates.push_back(std::move(reader));
+      }
+      return group;
+    }
+    return std::nullopt;
+  }
+
+ private:
+  using Bucket = std::vector<GroupPartition>;
+  // Bucket addresses survive rehashing, and a member need not store another copy of the
+  // whole subtree fingerprint for each possible partition.
+  std::unordered_map<std::string, Bucket> by_key_;
+  std::unordered_map<const LogicalNode*, std::vector<Bucket*>> candidates_;
+};
+
+std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool executable,
+                                              bool share_filtered_groups = false) {
   if (plan.root == nullptr) {
     return {};
   }
   Origins origins;
   origins.Walk(plan.root);
   KeyMemo memo;
+  FilteredGroups filtered;
   std::unordered_set<const LogicalNode*> covered;
 
   // Every candidate sub-tree by key, in the order a walk from the root meets it. A node that
   // appears twice as the same pointer is already shared and is counted once.
   std::unordered_map<std::string, std::vector<LogicalNodePtr>> by_key;
-  const std::function<void(const LogicalNodePtr&)> collect = [&](const LogicalNodePtr& node) {
+  const auto collect = [&](const auto& self, const LogicalNodePtr& node,
+                           bool discover_partitions) -> void {
     if (node == nullptr) {
       return;
     }
@@ -1014,6 +1273,9 @@ std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool exec
       return;
     }
     if (const std::optional<std::string>& key = SubtreeKey(node, origins, memo); key.has_value()) {
+      if (discover_partitions) {
+        filtered.Collect(node, origins);
+      }
       std::vector<LogicalNodePtr>& members = by_key[*key];
       if (std::ranges::none_of(
               members, [&node](const LogicalNodePtr& m) { return m.get() == node.get(); })) {
@@ -1026,11 +1288,14 @@ std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool exec
                         std::holds_alternative<SetOperationNode>(*node))) {
       return;
     }
+    // The first grouped node in each deferred dimension branch is its verified fact partial.
+    // Deeper groups can feed an order-sensitive computation even when the final sort is complete.
+    const bool descend = discover_partitions && !std::holds_alternative<GroupAggregateNode>(*node);
     for (const LogicalNodePtr& input : InputsOf(*node)) {
-      collect(input);
+      self(self, input, descend);
     }
   };
-  collect(plan.root);
+  collect(collect, plan.root, share_filtered_groups);
 
   // Maximal groups only: where a sub-tree repeats so does everything inside it, and the outermost
   // is the one a later item would materialise. A pre-order walk that stops descending at a member
@@ -1041,6 +1306,15 @@ std::vector<SharedSubPlan> FindSharedSubPlans(const LogicalPlan& plan, bool exec
   const std::function<void(const LogicalNodePtr&)> emit = [&](const LogicalNodePtr& node) {
     if (node == nullptr || covered.contains(node.get())) {
       return;
+    }
+    if (share_filtered_groups) {
+      if (auto group = filtered.Select(node, origins, covered)) {
+        for (const auto& member : group->members) {
+          Cover(member, covered);
+        }
+        out.push_back(std::move(*group));
+        return;
+      }
     }
     const std::optional<std::string>& key = SubtreeKey(node, origins, memo);
     if (key.has_value() && by_key[*key].size() > 1) {
@@ -1085,8 +1359,9 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
   return FindSharedSubPlans(plan, /*executable=*/false);
 }
 
-std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan) {
-  return FindSharedSubPlans(plan, /*executable=*/true);
+std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan,
+                                                  bool share_filtered_groups) {
+  return FindSharedSubPlans(plan, /*executable=*/true, share_filtered_groups);
 }
 
 }  // namespace antb1::plan

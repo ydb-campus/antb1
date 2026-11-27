@@ -26,6 +26,15 @@ using testing::Int64s;
 using testing::MemoryTable;
 using testing::Strings;
 
+std::optional<int64_t> MetricOf(const ProfileNode& node, std::string_view name) {
+  for (const auto& metric : node.metrics()) {
+    if (metric.name == name) {
+      return metric.value;
+    }
+  }
+  return std::nullopt;
+}
+
 // A separate read of just the keys can observe different values from the group payload. A
 // missing payload table models a decode failure confined to that column's data pages.
 class SensorPayloadTable final : public plan::Table {
@@ -197,14 +206,7 @@ class DeferredDimensionJoinTest : public testing::ExecTest {
     ASSERT_TRUE(actual.ok()) << actual.status();
     EXPECT_EQ(candidate.name(), "DeferredDimensionJoin");
     const std::string_view counter = verified ? "dimension_verified" : "dimension_fallbacks";
-    bool counted = false;
-    for (const auto& metric : candidate.metrics()) {
-      if (metric.name == counter) {
-        EXPECT_EQ(metric.value, 1);
-        counted = true;
-      }
-    }
-    EXPECT_TRUE(counted) << counter;
+    EXPECT_EQ(MetricOf(candidate, counter), 1) << counter;
     EXPECT_TRUE((*actual)->Equals(**expected));
   }
 
@@ -237,6 +239,74 @@ TEST_F(DeferredDimensionJoinTest, PhaseRestrictionsPreserveLookupColumnsAcrossUn
 TEST_F(DeferredDimensionJoinTest, FixedGroupingKeyKeepsTheDeferredLookupAndStreamLiterals) {
   ASSERT_NO_FATAL_FAILURE(RegisterSensors(2, "a", "yard"));
   CheckQueries(BandQuery("sensors"), BandQuery("sensor_copy"), true, 3);
+}
+
+TEST_F(DeferredDimensionJoinTest, SharesFixedBandsAndRetriesTheirIndependentAggregates) {
+  for (const char* name : {"sensors", "sensor_copy"}) {
+    const auto sensors = Sensors(2, "a", "yard");
+    // Keep partial aggregation below the lookup worthwhile after each band restriction.
+    sensors->set_claimed_rows(32);
+    ASSERT_TRUE(catalog_.Register(name, sensors).ok());
+  }
+  const auto schema =
+      arrow::schema({arrow::field("slot", arrow::int64()), arrow::field("reading", arrow::int64()),
+                     arrow::field("band", arrow::int64())});
+  // Slot 1 has repeated readings in one band, slot 2 lacks the second band, slot 3 is
+  // absent from the dimension, and slot 4 has an all-NULL sum in both bands.
+  const auto batch =
+      arrow::RecordBatch::Make(schema, 10,
+                               {Int64s({1, 1, 1, 1, 2, 2, 3, 3, 4, 4}),
+                                Int64s({5, 7, 29, 1000, 6, 71, 8, 9, std::nullopt, std::nullopt}),
+                                Int64s({0, 0, 1, std::nullopt, 0, 2, 0, 1, 0, 1})});
+  const auto packets =
+      std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch, batch}, true);
+  packets->set_claimed_rows(20'000'000);  // enough input to make a shared producer worthwhile
+  ASSERT_TRUE(catalog_.Register("packets", packets).ok());
+  const auto query = [](std::string_view second_dimension) {
+    const auto stream = [](std::string_view dimension, int band) {
+      return std::format(
+          "SELECT d.code,d.site,d.slot,f.band,SUM(f.reading) AS total "
+          "FROM packets f JOIN {} d ON f.slot=d.slot WHERE f.band={} "
+          "GROUP BY d.code,d.site,d.slot,f.band",
+          dimension, band);
+    };
+    constexpr std::string_view kOutputs = "a.code,a.band,b.band,a.total,b.total";
+    return std::format(
+        "WITH a AS ({}), b AS ({}) SELECT {} FROM a JOIN b ON a.code=b.code "
+        "ORDER BY {} LIMIT 50",
+        stream("sensors", 0), stream(second_dimension, 1), kOutputs, kOutputs);
+  };
+
+  ProfileNode control;
+  const auto reference = Execute(query("sensor_copy"), control);
+  ASSERT_TRUE(reference.ok()) << reference.status();
+  ASSERT_NE(control.name(), "DeferredDimensionJoin");
+  ASSERT_EQ((*reference)->num_rows(), 2);
+  EXPECT_EQ(packets->scanned_parts().size(), 4U);
+  EXPECT_EQ((*reference)->column(3)->null_count(), 1);
+  EXPECT_EQ((*reference)->column(4)->null_count(), 1);
+  for (const bool fail : {false, true}) {
+    SCOPED_TRACE(fail);
+    const auto scans_before = packets->scanned_parts().size();
+    if (fail) {
+      packets->FailNextPart();
+    }
+    ProfileNode candidate;
+    const auto result = Execute(query("sensors"), candidate);
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_TRUE((*result)->Equals(**reference));
+    ASSERT_EQ(MetricOf(candidate, "dimension_verified"), 1) << candidate.name();
+    ASSERT_FALSE(candidate.children().empty());
+    const auto& fast = *candidate.children().front();
+    if (fail) {
+      EXPECT_EQ(MetricOf(fast, "shared_fallbacks"), 1);
+      // One failed producer read followed by a full scan of both parts for each band.
+      EXPECT_EQ(packets->scanned_parts().size() - scans_before, 5U);
+    } else {
+      EXPECT_EQ(MetricOf(fast, "shared_rows"), 7);
+      EXPECT_EQ(packets->scanned_parts().size() - scans_before, 2U);
+    }
+  }
 }
 
 TEST_F(DeferredDimensionJoinTest, DropsOrphanBandsBeforePairingGroupedBranches) {

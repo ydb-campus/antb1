@@ -14,9 +14,8 @@ using DimensionPlanBuilder = arrow::Result<std::unique_ptr<Operator>> (*)(const 
 
 // The candidate reads the dimension keys of this execution before it can commit to the late join.
 // The original plan supplies the output schema and runs if the proof or candidate fails.
-arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(plan::LogicalPlan fast,
-                                                                   plan::LogicalPlan original,
-                                                                   ProfileNode* profile,
-                                                                   DimensionPlanBuilder build);
+arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(
+    plan::LogicalPlan fast, plan::LogicalPlan original, ProfileNode* profile,
+    DimensionPlanBuilder build, DimensionPlanBuilder build_fast = nullptr);
 
 }  // namespace antb1::exec

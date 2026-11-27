@@ -40,11 +40,13 @@ bool SameTypes(const arrow::Schema& first, const arrow::Schema& second) {
 class DeferredDimensionJoinOperator final : public Operator {
  public:
   DeferredDimensionJoinOperator(plan::LogicalPlan fast, plan::LogicalPlan original,
-                                DimensionPlanBuilder build, std::shared_ptr<arrow::Schema> schema,
+                                DimensionPlanBuilder build, DimensionPlanBuilder build_fast,
+                                std::shared_ptr<arrow::Schema> schema,
                                 std::unique_ptr<Operator> first)
       : fast_(std::move(fast)),
         original_(std::move(original)),
         build_(build),
+        build_fast_(build_fast),
         schema_(std::move(schema)),
         first_(std::move(first)) {}
 
@@ -171,7 +173,7 @@ class DeferredDimensionJoinOperator final : public Operator {
     run.scans = std::make_shared<plan::ScanContext>();
     auto fast = std::move(first_);
     if (fast == nullptr) {
-      ARROW_ASSIGN_OR_RAISE(fast, build_(fast_, Child(0)));
+      ARROW_ASSIGN_OR_RAISE(fast, build_fast_(fast_, Child(0)));
     }
     const auto kept = KeyTableNoBadAlloc([&] { return Collect(*fast, run); });
     const auto closed = fast->Close();
@@ -188,6 +190,7 @@ class DeferredDimensionJoinOperator final : public Operator {
   plan::LogicalPlan fast_;
   plan::LogicalPlan original_;
   DimensionPlanBuilder build_;
+  DimensionPlanBuilder build_fast_;
   std::shared_ptr<arrow::Schema> schema_;
   std::unique_ptr<Operator> first_;
   std::unique_ptr<Operator> original_op_;
@@ -201,10 +204,9 @@ class DeferredDimensionJoinOperator final : public Operator {
 
 }  // namespace
 
-arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(plan::LogicalPlan fast,
-                                                                   plan::LogicalPlan original,
-                                                                   ProfileNode* profile,
-                                                                   DimensionPlanBuilder build) {
+arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(
+    plan::LogicalPlan fast, plan::LogicalPlan original, ProfileNode* profile,
+    DimensionPlanBuilder build, DimensionPlanBuilder build_fast) {
   ARROW_ASSIGN_OR_RAISE(auto ordinary, build(original, nullptr));
   auto schema = ordinary->output_schema();
   ordinary.reset();
@@ -213,7 +215,10 @@ arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(plan::Logical
     profile->set_detail("verify unique, non-NULL surrogate and business keys");
   }
   ProfileNode* child = profile == nullptr ? nullptr : profile->Child(0);
-  auto first = KeyTableNoBadAlloc([&] { return build(fast, child); });
+  if (build_fast == nullptr) {
+    build_fast = build;
+  }
+  auto first = KeyTableNoBadAlloc([&] { return build_fast(fast, child); });
   if (!first.ok() || !SameTypes(*schema, *(*first)->output_schema())) {
     // An optional physical shape may cost more to construct than the ordinary tree.
     if (profile == nullptr) {
@@ -224,7 +229,8 @@ arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(plan::Logical
     return std::make_unique<ProfiledOperator>(std::move(fallback), profile);
   }
   auto guarded = std::make_unique<DeferredDimensionJoinOperator>(
-      std::move(fast), std::move(original), build, std::move(schema), *std::move(first));
+      std::move(fast), std::move(original), build, build_fast, std::move(schema),
+      *std::move(first));
   if (profile == nullptr) {
     return guarded;
   }

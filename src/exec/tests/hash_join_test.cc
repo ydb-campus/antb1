@@ -36,6 +36,7 @@
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/join_table.h"
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
@@ -4976,6 +4977,35 @@ TEST_F(HashJoinPlanTest, ADirectBuildTakesNoRowFilterAndStillPrunesParts) {
     EXPECT_EQ(RowsOf(**got), RowsOf(**control));
     EXPECT_FALSE(RowsOf(**got).empty());
   }
+}
+
+TEST_F(HashJoinPlanTest, CombinedDomainsRequireExactPartPruningBeforeTheProbeOpens) {
+  // The two domains match a row in the first and last probe parts. Each has an exact key
+  // filter by itself, but their union exceeds the limit and its min/max spans the middle part.
+  constexpr int64_t kRows = (KeyFilter::kMaxPublishedKeys / 2) + 1;
+  constexpr int64_t kGap = 100'000;
+  const auto keys = [](int64_t i) { return i < kRows ? i : (2 * kGap) + i - kRows; };
+  const auto run = [&](int64_t first, int64_t rows, bool combined,
+                       const std::vector<int64_t>& expected_parts) {
+    const auto probe = MixedTable("p", 3, 1, [](int64_t i) { return i * kGap; });
+    const auto build = MixedTable("b", 1, rows, [&](int64_t i) { return keys(first + i); });
+    const auto plan = PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(probe, "p"), ScanOf(build, "b"),
+                                    {MixedColumn("p", 0)}, {MixedColumn("b", 0)}),
+                             6);
+    const auto result = RunPlan(plan, {.require_exact_join_filter = combined});
+    if (rows > KeyFilter::kMaxPublishedKeys) {
+      EXPECT_TRUE(result.status().IsInvalid()) << result.status();
+      EXPECT_TRUE(result.status().message().contains("preserve part pruning")) << result.status();
+    } else {
+      ASSERT_TRUE(result.ok()) << result.status();
+      EXPECT_EQ((*result)->num_rows(), 1);
+    }
+    EXPECT_EQ(probe->scanned_parts(), expected_parts);
+  };
+  run(0, 2 * kRows, true, {});
+  run(0, kRows, false, {0});
+  run(kRows, kRows, false, {2});
+  run(kRows - 1, 2, true, {2});  // a small combined build keeps its exact keys and skips the gap
 }
 
 // ADR 0029's D2: a part of the probe's scan whose key column spans no key the build published is

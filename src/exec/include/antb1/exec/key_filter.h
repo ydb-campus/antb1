@@ -143,6 +143,7 @@ class KeyFilter {
 
   // Whether any part can be ruled out at all: whether PublishKeys was called with anything.
   [[nodiscard]] bool prunes_parts() const { return key_range_.has_value(); }
+  [[nodiscard]] bool has_exact_keys() const { return !key_values_.empty(); }
 
   // The keys it was sized for, and its bytes.
   [[nodiscard]] int64_t keys() const { return keys_; }

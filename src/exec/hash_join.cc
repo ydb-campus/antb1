@@ -28,6 +28,7 @@
 #include "antb1/common/narrow.h"
 #include "antb1/exec/compute.h"
 #include "antb1/exec/join_table.h"
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/profile.h"
@@ -436,6 +437,12 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     // Before Finish: it frees the parts the per-row hashes live in (ADR 0029's D1).
     ARROW_ASSIGN_OR_RAISE(key_filter_, builder->MakeKeyFilter());
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
+    // A min/max interval for several domains can span files that each independent join skips.
+    // Abandon the speculative producer before opening its probe if the exact key set didn't fit.
+    if (ctx.require_exact_join_filter && CanPublishKeyFilter(spec_) && !table_->empty() &&
+        (key_filter_ == nullptr || !key_filter_->has_exact_keys())) {
+      return arrow::Status::Invalid("cannot preserve part pruning for a combined join build");
+    }
     if (verify_dimension_business_field_) {
       const ProfileTimer check(profile_, "dimension_check");
       ARROW_ASSIGN_OR_RAISE(const bool verified,

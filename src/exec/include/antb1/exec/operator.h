@@ -45,6 +45,8 @@ struct ExecContext {
   MemoryBudget* budget = nullptr;
   // Shared by every scan of one run; Drain supplies a fresh context for each execution.
   std::shared_ptr<plan::ScanContext> scans = nullptr;
+  // A combined equality-domain producer may only scan the union of its members' parts.
+  bool require_exact_join_filter = false;
 };
 
 // Rows flowing from one operator to the next: the columns and, optionally, a selection. A selection

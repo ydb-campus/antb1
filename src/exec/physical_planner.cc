@@ -1854,7 +1854,8 @@ plan::LogicalNodePtr Substituted(
   return changed ? plan::WithInputs(*root, std::move(inputs)) : root;
 }
 
-OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode* profile) {
+OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode* profile,
+                                      bool share_filtered_groups = false) {
   if (!plan.root || plan.output.empty()) {
     return arrow::Status::Invalid("empty logical plan");
   }
@@ -1865,7 +1866,8 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
   std::vector<SharedBuild> shared;
   std::unordered_map<const plan::LogicalNode*, plan::LogicalNodePtr> replacements;
   std::optional<plan::SharedConsumerFilters> consumer_filters;
-  for (const plan::SharedSubPlan& group : plan::MaterializableSubPlans(plan)) {
+  for (const plan::SharedSubPlan& group :
+       plan::MaterializableSubPlans(plan, share_filtered_groups)) {
     if (!consumer_filters.has_value()) {
       consumer_filters.emplace(plan);
     }
@@ -1880,16 +1882,22 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
       if (ids.size() != group.columns[i].size()) {
         return arrow::Status::Invalid("a shared sub-plan's columns do not match its output");
       }
-      replacements.emplace(member.get(), std::make_shared<const plan::LogicalNode>(plan::ScanNode{
-                                             .table = table,
-                                             .table_name = "shared",
-                                             .fields = group.columns[i],
-                                             .ids = std::move(ids),
-                                         }));
+      plan::LogicalNodePtr reader =
+          std::make_shared<const plan::LogicalNode>(plan::ScanNode{.table = table,
+                                                                   .table_name = "shared",
+                                                                   .fields = group.columns[i],
+                                                                   .ids = std::move(ids)});
+      if (!group.reader_predicates.empty()) {
+        const plan::Predicate& equality = group.reader_predicates[i];
+        reader = std::make_shared<const plan::LogicalNode>(plan::FilterNode{
+            .input = std::move(reader), .predicates = {equality}, .span = equality.span});
+      }
+      replacements.emplace(member.get(), std::move(reader));
     }
     shared.push_back(SharedBuild{.table = std::move(table),
                                  .first_producer = std::move(op),
-                                 .make_producer = std::move(make_producer)});
+                                 .make_producer = std::move(make_producer),
+                                 .combined_domains = !group.reader_predicates.empty()});
   }
 
   const plan::LogicalNodePtr root_node =
@@ -1920,7 +1928,15 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
 arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPlan& plan,
                                                            ProfileNode* profile) {
   if (auto candidate = plan::FindDeferredDimensionJoin(plan)) {
-    return MakeDeferredDimensionJoin(std::move(*candidate), plan, profile, BuildUnconditionalPlan);
+    // Sharing differently filtered aggregates may change group emission order. Only the
+    // dimension candidate has proved that its fully ordered output can be buffered and retried.
+    const auto ordinary = [](const plan::LogicalPlan& p, ProfileNode* slot) {
+      return BuildUnconditionalPlan(p, slot);
+    };
+    const auto guarded = [](const plan::LogicalPlan& p, ProfileNode* slot) {
+      return BuildUnconditionalPlan(p, slot, /*share_filtered_groups=*/true);
+    };
+    return MakeDeferredDimensionJoin(std::move(*candidate), plan, profile, ordinary, guarded);
   }
   return BuildUnconditionalPlan(plan, profile);
 }

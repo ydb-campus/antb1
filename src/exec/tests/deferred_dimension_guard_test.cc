@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -175,6 +176,7 @@ class GuardScanState final : public plan::TableScanState {
   }
   arrow::Status status;
   int checks = 0;
+  int reads = 0;
 };
 
 class GuardScanTable final : public plan::Table {
@@ -190,6 +192,7 @@ class GuardScanTable final : public plan::Table {
       const std::vector<int>& /*fields*/, int64_t /*size*/, arrow::MemoryPool* /*pool*/,
       const std::shared_ptr<plan::ScanContext>& context) const override {
     ARROW_RETURN_NOT_OK(context->Get(*this).status());
+    ++state->reads;
     auto row = arrow::RecordBatch::Make(schema_, 1, {testing::Int64s({42})});
     return std::make_unique<testing::VectorReader>(schema_, arrow::RecordBatchVector{row});
   }
@@ -197,6 +200,56 @@ class GuardScanTable final : public plan::Table {
  private:
   const std::shared_ptr<arrow::Schema> schema_ = arrow::schema({arrow::field("n", arrow::int64())});
 };
+
+TEST_F(DeferredDimensionGuardTest, EmptyJoinedResultDiscardsUnusedProducerScans) {
+  const auto probe = std::make_shared<GuardScanTable>();
+  const auto empty = std::make_shared<testing::MemoryTable>(
+      probe->schema(), arrow::RecordBatchVector{}, /*split=*/true);
+  const auto scan = [](std::shared_ptr<plan::Table> table, plan::ColumnId id) {
+    return std::make_shared<plan::LogicalNode>(
+        plan::ScanNode{.table = std::move(table), .fields = {0}, .ids = {id}});
+  };
+  const plan::ColumnId left{1};
+  const plan::ColumnId right{2};
+  const plan::JoinNode join{.kind = plan::JoinKind::kInner,
+                            .left = scan(probe, left),
+                            .right = scan(empty, right),
+                            .keys = {{.left = {.id = left}, .right = {.id = right}}}};
+  const plan::LogicalPlan joined{
+      .root = std::make_shared<plan::LogicalNode>(join),
+      .output = {{.name = "left", .id = left}, {.name = "right", .id = right}}};
+  const auto candidate = [](const plan::LogicalPlan& plan,
+                            ProfileNode* profile) -> arrow::Result<std::unique_ptr<Operator>> {
+    ARROW_ASSIGN_OR_RAISE(auto inner, BuildPhysicalPlan(plan, profile));
+    const auto& input = std::get<plan::JoinNode>(*plan.root).left;
+    const auto table = std::get<plan::ScanNode>(*input).table;
+    std::vector<SharedBuild> producers;
+    producers.push_back({.table = std::make_shared<MaterializedTable>(table->schema()),
+                         .make_producer = [table] -> arrow::Result<std::unique_ptr<Operator>> {
+                           return std::make_unique<TableScanOperator>(table, std::vector<int>{0});
+                         },
+                         .combined_domains = true});
+    return std::make_unique<SharedBuildsOperator>(
+        std::move(inner), std::move(producers),
+        [plan](ProfileNode* fallback) { return BuildPhysicalPlan(plan, fallback); });
+  };
+  ProfileNode profile;
+  const auto op = MakeDeferredDimensionJoin(joined, joined, &profile, BuildPhysicalPlan, candidate);
+  ASSERT_TRUE(op.ok()) << op.status();
+  ExecContext ctx{.scans = std::make_shared<plan::ScanContext>()};
+  ASSERT_TRUE((*op)->Open(ctx).ok());
+  const auto end = (*op)->Next();
+  ASSERT_TRUE(end.ok()) << end.status();
+  EXPECT_TRUE(end->end());
+  ASSERT_TRUE((*op)->Close().ok());
+  EXPECT_EQ(probe->state->reads, 1);  // the eager producer only: both joins skip the probe
+  probe->state->status = arrow::Status::IOError("probe file removed after the join");
+  EXPECT_TRUE(ctx.scans->Finish(ctx.pool).ok());
+  EXPECT_EQ(probe->state->checks, 0);
+  EXPECT_TRUE(std::ranges::any_of(profile.metrics(), [](const ProfileMetric& metric) {
+    return metric.name == "dimension_fallbacks" && metric.value == 1;
+  }));
+}
 
 TEST_F(DeferredDimensionGuardTest, CallerFinishesOnlyTheChosenScansAfterReceivingTheirRows) {
   const auto plan_for = [](const std::shared_ptr<GuardScanTable>& table, const char* name) {

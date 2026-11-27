@@ -44,12 +44,10 @@
 namespace antb1::exec {
 
 ExecContext PartContext(const ExecContext& ctx) {
-  return ExecContext{.pool = ctx.pool,
-                     .batch_size = ctx.batch_size,
-                     .executor = nullptr,
-                     .threads = 1,
-                     .budget = ctx.budget,
-                     .scans = ctx.scans};
+  ExecContext part = ctx;
+  part.executor = nullptr;
+  part.threads = 1;
+  return part;
 }
 
 int64_t PartWindow(const ExecContext& ctx) {
