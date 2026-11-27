@@ -78,6 +78,28 @@ bool HasType(const arrow::Schema& schema, int field, LogicalType type) {
   return logical.ok() && *logical == type;
 }
 
+// A filter fixing this key still fixes it after a compute or an inner join. Stop at
+// null-extending joins: they can introduce a second value even on a filtered input.
+bool FixedByEquality(const LogicalNodePtr& node, const BoundColumn& key) {
+  if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+    return std::ranges::any_of(filter->predicates,
+                               [&](const Predicate& predicate) {
+                                 return predicate.column && predicate.column->id == key.id &&
+                                        predicate.column->type == key.type &&
+                                        IsIntegerOrDateEquality(predicate);
+                               }) ||
+           FixedByEquality(filter->input, key);
+  }
+  if (const auto* compute = std::get_if<ComputeNode>(node.get())) {
+    return FixedByEquality(compute->input, key);
+  }
+  if (const auto* join = std::get_if<JoinNode>(node.get());
+      join != nullptr && join->kind == JoinKind::kInner) {
+    return FixedByEquality(join->left, key) || FixedByEquality(join->right, key);
+  }
+  return false;
+}
+
 // A final over one partial must preserve both its value and its type. SUM of a NULL partial
 // stays NULL. SUM_COUNTS returns zero for NULL, so it may pass through only a non-NULL count.
 bool KeepsPartial(const AggregateCall& call, const AggregateCall& state) {
@@ -158,10 +180,13 @@ std::optional<Reduced> Rewrite::Group(const GroupAggregateNode& group, const Sca
       (dimension_.table && (dimension.table != dimension_.table || pk_field != surrogate_field_))) {
     return std::nullopt;
   }
-  // Keep exactly the groups the partial made. Its integer key is recoverable from the
-  // business key after verification, and every remaining partial key must still be grouped.
-  for (const auto id : partial->key_ids) {
-    if (id != fact_key.id && !std::ranges::contains(group.keys, id, &BoundColumn::id)) {
+  // A unique dimension gives no guarantee that a fact key has a matching dimension row.
+  // Require at most one group per surrogate in each branch: otherwise an orphan can make
+  // a Cartesian product of fact groups before the final lookup discards them.
+  for (std::size_t i = 0; i < partial->key_ids.size(); ++i) {
+    const auto id = partial->key_ids[i];
+    if (id != fact_key.id && (!std::ranges::contains(group.keys, id, &BoundColumn::id) ||
+                              !FixedByEquality(partial->input, partial->keys[i]))) {
       return std::nullopt;
     }
   }

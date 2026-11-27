@@ -38,6 +38,7 @@ class DeferredDimensionJoinPlanTest : public ::testing::Test {
     sensors->WithDistinctCount(0, 2, 10);
     archived->WithDistinctCount(0, 0, 10);
     readings->WithDistinctCount(0, 0, 10);
+    readings->WithDistinctCount(0, 1, 2);
     ASSERT_TRUE(catalog_.Register("sensors", sensors).ok());
     ASSERT_TRUE(catalog_.Register("archived", archived).ok());
     ASSERT_TRUE(catalog_.Register("readings", readings).ok());
@@ -212,6 +213,46 @@ TEST_F(DeferredDimensionJoinPlanTest, NeedsEveryPartialKeyThatTheDimensionDoesNo
     return true;
   });
   EXPECT_FALSE(FindDeferredDimensionJoin(plan_));
+}
+
+TEST_F(DeferredDimensionJoinPlanTest, OnlyAnInnerJoinPropagatesTheFixedKeyFromItsRight) {
+  const auto bound = testing::BindSql(
+      "WITH counts AS (SELECT d.code,f.sample,COUNT(f.sample) AS n FROM readings f JOIN sensors d "
+      "ON f.slot=d.slot GROUP BY d.code,f.sample HAVING f.sample=7) "
+      "SELECT a.code,a.n,b.n FROM counts a JOIN counts b ON a.code=b.code ORDER BY a.code,a.n,b.n",
+      catalog_);
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto original = Optimized(*bound);
+  ASSERT_TRUE(FindDeferredDimensionJoin(original));
+  const auto next = std::to_underlying(MaxColumnId(*original.root)) + 1;
+  for (const auto kind : {JoinKind::kInner, JoinKind::kLeft}) {
+    plan_ = original;
+    ChangeOneGroup([&](GroupAggregateNode& group) {
+      if (group.aggregates.front().kind != AggKind::kCount) {
+        return false;
+      }
+      const auto slot = std::ranges::find(group.keys, "slot", &BoundColumn::name);
+      if (slot == group.keys.end()) {
+        return false;
+      }
+      // The new fact side groups by its own slot and looks up the sample through its
+      // reading. A left join can produce both a match and NULL for the same grouped slot.
+      auto left = std::make_shared<const LogicalNode>(
+          ScanNode{.table = catalog_.Find("readings"),
+                   .fields = {0, 1},
+                   .ids = {ColumnId{next}, ColumnId{next + 1}}});
+      auto reading = *slot;
+      reading.id = ColumnId{next + 1};
+      group.input = std::make_shared<const LogicalNode>(
+          JoinNode{.kind = kind,
+                   .left = std::move(left),
+                   .right = group.input,
+                   .keys = {{.left = reading, .right = *slot}}});
+      slot->id = ColumnId{next};
+      return true;
+    });
+    EXPECT_EQ(FindDeferredDimensionJoin(plan_).has_value(), kind == JoinKind::kInner);
+  }
 }
 
 TEST_F(DeferredDimensionJoinPlanTest, VerifiesTheBusinessKeyOnTheFinalDimensionBuild) {

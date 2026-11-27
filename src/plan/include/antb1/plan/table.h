@@ -296,11 +296,29 @@ class ScanContext {
     }
   }
 
+  // The chosen execution of a guarded operator has a private context. Retain it alongside
+  // this context's own scans: even two scans of the same table may have used different files.
+  // The caller supplies a fresh child whose readers may continue to open until Finish.
+  arrow::Status KeepForFinish(std::shared_ptr<ScanContext> child) {
+    if (child == nullptr || child.get() == this) {
+      return arrow::Status::Invalid("final validation requires a separate child scan context");
+    }
+    try {
+      const std::scoped_lock lock(mutex_);
+      children_.push_back(std::move(child));
+      return arrow::Status::OK();
+    } catch (const std::bad_alloc&) {
+      return arrow::Status::OutOfMemory("out of memory retaining completed query scans");
+    }
+  }
+
   arrow::Status Finish(arrow::MemoryPool* pool, const FinishRunner& runner = {}) {
     try {
       std::vector<std::shared_ptr<TableScanState>> states;
+      std::vector<std::shared_ptr<ScanContext>> children;
       {
         const std::scoped_lock lock(mutex_);
+        children = children_;
         states.reserve(states_.size());
         for (const auto& [table, state] : states_) {
           static_cast<void>(table);
@@ -312,6 +330,9 @@ class ScanContext {
       for (const auto& state : states) {
         ARROW_RETURN_NOT_OK(runner ? runner(*state, pool) : state->Finish(pool));
       }
+      for (const auto& child : children) {
+        ARROW_RETURN_NOT_OK(child->Finish(pool, runner));
+      }
       return arrow::Status::OK();
     } catch (const std::bad_alloc&) {
       return arrow::Status::OutOfMemory("out of memory validating completed table scans");
@@ -321,6 +342,7 @@ class ScanContext {
  private:
   std::mutex mutex_;
   std::unordered_map<const Table*, std::shared_ptr<TableScanState>> states_;
+  std::vector<std::shared_ptr<ScanContext>> children_;
 };
 
 }  // namespace antb1::plan

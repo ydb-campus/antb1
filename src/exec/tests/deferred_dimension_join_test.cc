@@ -161,12 +161,13 @@ class DeferredDimensionJoinTest : public testing::ExecTest {
 
   // Retain a fact-side grouping key independent of the sensor, plus a literal identifying
   // the reading stream. Joining only on code matches every pair of bands for that sensor.
-  static std::string BandQuery(std::string_view second_table, std::string_view condition = "") {
-    const auto stream = [](std::string_view facts, std::string_view sensors) {
+  static std::string BandQuery(std::string_view second_table, std::string_view condition = "",
+                               std::string_view band_filter = "HAVING f.band=0") {
+    const auto stream = [band_filter](std::string_view facts, std::string_view sensors) {
       return std::format(
           "SELECT d.code,d.site,d.slot AS pos,f.band,SUM(f.reading) AS total,'{}' AS origin "
-          "FROM {} f JOIN {} d ON f.slot=d.slot GROUP BY d.code,d.site,d.slot,f.band",
-          facts, facts, sensors);
+          "FROM {} f JOIN {} d ON f.slot=d.slot GROUP BY d.code,d.site,d.slot,f.band {}",
+          facts, facts, sensors, band_filter);
     };
     constexpr std::string_view kOutputs = "a.code,a.band,b.band,a.total,b.total,a.origin,b.origin";
     return std::format(
@@ -207,6 +208,19 @@ class DeferredDimensionJoinTest : public testing::ExecTest {
     EXPECT_TRUE((*actual)->Equals(**expected));
   }
 
+  void CheckOrdinaryBands(std::string_view condition, std::string_view band_filter,
+                          int64_t expected_rows) {
+    ProfileNode control;
+    const auto expected = Execute(BandQuery("sensor_copy", condition, band_filter), control);
+    ASSERT_TRUE(expected.ok()) << expected.status();
+    ASSERT_EQ((*expected)->num_rows(), expected_rows);
+    ProfileNode candidate;
+    const auto actual = Execute(BandQuery("sensors", condition, band_filter), candidate);
+    ASSERT_TRUE(actual.ok()) << actual.status();
+    EXPECT_NE(candidate.name(), "DeferredDimensionJoin");
+    EXPECT_TRUE((*actual)->Equals(**expected));
+  }
+
   plan::Catalog catalog_;
 };
 
@@ -220,26 +234,27 @@ TEST_F(DeferredDimensionJoinTest, PhaseRestrictionsPreserveLookupColumnsAcrossUn
   Check(true, 3, /*tagged=*/true);
 }
 
-TEST_F(DeferredDimensionJoinTest, MatchingGroupsKeepEveryPairOfBandsAndEachStreamsLiteral) {
+TEST_F(DeferredDimensionJoinTest, FixedGroupingKeyKeepsTheDeferredLookupAndStreamLiterals) {
   ASSERT_NO_FATAL_FAILURE(RegisterSensors(2, "a", "yard"));
-  CheckQueries(BandQuery("sensors"), BandQuery("sensor_copy"), true, 12);
+  CheckQueries(BandQuery("sensors"), BandQuery("sensor_copy"), true, 3);
+}
+
+TEST_F(DeferredDimensionJoinTest, DropsOrphanBandsBeforePairingGroupedBranches) {
+  ASSERT_NO_FATAL_FAILURE(RegisterSensors(2, "a", "yard"));
+  // Slot 3 has multiple bands in each fact stream but no dimension row. Pairing its
+  // groups before the lookup would do quadratic work and then discard every pair.
+  CheckOrdinaryBands("", "", 12);
+  CheckOrdinaryBands("", "HAVING f.band>=0", 12);
+  CheckOrdinaryBands("", "HAVING d.slot=1", 4);
 }
 
 TEST_F(DeferredDimensionJoinTest, PayloadPredicatesStayAtTheirOriginalGroupedInputsOrJoin) {
   ASSERT_NO_FATAL_FAILURE(RegisterSensors(2, "a", "yard"));
   for (const auto& [condition, rows] :
-       {std::pair{"WHERE a.site='lab'", 4}, std::pair{"WHERE a.total > a.pos", 8},
-        std::pair{"AND a.site <> b.code", 8}}) {
+       {std::pair{"WHERE a.site='lab'", 1}, std::pair{"WHERE a.total > a.pos", 2},
+        std::pair{"AND a.site <> b.code", 2}}) {
     SCOPED_TRACE(condition);
-    ProfileNode control;
-    const auto expected = Execute(BandQuery("sensor_copy", condition), control);
-    ASSERT_TRUE(expected.ok()) << expected.status();
-    ASSERT_EQ((*expected)->num_rows(), rows);
-    ProfileNode candidate;
-    const auto actual = Execute(BandQuery("sensors", condition), candidate);
-    ASSERT_TRUE(actual.ok()) << actual.status();
-    EXPECT_NE(candidate.name(), "DeferredDimensionJoin");
-    EXPECT_TRUE((*actual)->Equals(**expected));
+    CheckOrdinaryBands(condition, "HAVING f.band=0", rows);
   }
 }
 

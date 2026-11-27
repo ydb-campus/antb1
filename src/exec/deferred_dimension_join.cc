@@ -10,10 +10,10 @@
 
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
+#include <arrow/stl_allocator.h>
 #include <arrow/type.h>
 #include <arrow/util/byte_size.h>
 
-#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/profile.h"
 #include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/table.h"
@@ -53,6 +53,7 @@ class DeferredDimensionJoinOperator final : public Operator {
   arrow::Status Open(ExecContext& ctx) override {
     ARROW_RETURN_NOT_OK(Close());
     ctx_ = ctx;
+    finish_fallback_ = ctx.scans == nullptr;
     started_ = false;
     return arrow::Status::OK();
   }
@@ -71,14 +72,16 @@ class DeferredDimensionJoinOperator final : public Operator {
       if (batch.end()) {
         auto original = std::move(original_op_);
         ARROW_RETURN_NOT_OK(original->Close());
-        ARROW_RETURN_NOT_OK(FinishScans(ctx));
+        if (finish_fallback_) {
+          ARROW_RETURN_NOT_OK(FinishScans(ctx));
+        }
       }
       return batch;
     }
-    if (next_ == output_.size()) {
+    if (!output_ || next_ == output_->size()) {
       return Batch{};
     }
-    return Batch{.data = std::move(output_[next_++]), .selection = nullptr};
+    return Batch{.data = std::move((*output_)[next_++]), .selection = nullptr};
   }
 
   arrow::Status Close() override {
@@ -107,9 +110,13 @@ class DeferredDimensionJoinOperator final : public Operator {
       if (profile() != nullptr) {
         profile()->AddNoThrow("dimension_fallbacks", MetricUnit::kCount, 1);
       }
-      ctx.scans = std::make_shared<plan::ScanContext>();
+      const auto caller_scans = std::exchange(ctx.scans, std::make_shared<plan::ScanContext>());
       ARROW_ASSIGN_OR_RAISE(original_op_, build_(original_, Child(1)));
-      const auto opened = original_op_->Open(ctx);
+      auto opened = original_op_->Open(ctx);
+      if (opened.ok() && caller_scans != nullptr) {
+        // Opening a shared build may itself retry with a new context.
+        opened = caller_scans->KeepForFinish(ctx.scans);
+      }
       if (!opened.ok()) {
         static_cast<void>(Close());
       }
@@ -125,8 +132,7 @@ class DeferredDimensionJoinOperator final : public Operator {
   }
 
   void DiscardOutput() {
-    arrow::RecordBatchVector{}.swap(output_);
-    retained_.Release();
+    output_.reset();
     next_ = 0;
   }
 
@@ -134,7 +140,8 @@ class DeferredDimensionJoinOperator final : public Operator {
   // has succeeded: a failure even in a later projected batch can then retry without mixing rows.
   arrow::Result<bool> Collect(Operator& fast, ExecContext& run) {
     ARROW_RETURN_NOT_OK(fast.Open(run));
-    retained_.Reset(run.budget);
+    auto& output = output_.emplace(OutputAllocator(run.pool));
+    int64_t retained_bytes = 0;
     while (true) {
       ARROW_ASSIGN_OR_RAISE(auto batch, fast.Next());
       if (batch.end()) {
@@ -149,11 +156,13 @@ class DeferredDimensionJoinOperator final : public Operator {
       rows = arrow::RecordBatch::Make(schema_, rows->num_rows(), rows->columns());
       const int64_t bytes = arrow::util::TotalBufferSize(*rows);
       constexpr int64_t kEntryBytes = sizeof(std::shared_ptr<arrow::RecordBatch>);
-      if (bytes > plan::kMaxSharedResultBytes - retained_.bytes() - kEntryBytes) {
+      if (bytes > plan::kMaxSharedResultBytes - retained_bytes - kEntryBytes) {
         return false;
       }
-      ARROW_RETURN_NOT_OK(retained_.Resize(retained_.bytes() + bytes + kEntryBytes));
-      output_.push_back(std::move(rows));
+      // The sort already allocated its result buffers from the query pool. Count their sizes
+      // toward the result cap; only the vector's storage needs a new allocation from the pool.
+      retained_bytes += bytes + kEntryBytes;
+      output.push_back(std::move(rows));
     }
   }
 
@@ -170,6 +179,9 @@ class DeferredDimensionJoinOperator final : public Operator {
       return false;
     }
     ARROW_RETURN_NOT_OK(FinishScans(run));
+    if (ctx.scans != nullptr) {
+      ARROW_RETURN_NOT_OK(ctx.scans->KeepForFinish(std::move(run.scans)));
+    }
     return true;
   }
 
@@ -180,9 +192,10 @@ class DeferredDimensionJoinOperator final : public Operator {
   std::unique_ptr<Operator> first_;
   std::unique_ptr<Operator> original_op_;
   std::optional<ExecContext> ctx_;
+  bool finish_fallback_ = false;
   bool started_ = false;
-  arrow::RecordBatchVector output_;
-  MemoryReservation retained_;
+  using OutputAllocator = arrow::stl::allocator<std::shared_ptr<arrow::RecordBatch>>;
+  std::optional<std::vector<std::shared_ptr<arrow::RecordBatch>, OutputAllocator>> output_;
   std::size_t next_ = 0;
 };
 
