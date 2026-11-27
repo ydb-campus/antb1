@@ -972,6 +972,8 @@ void CheckDistinctUnion(arrow::internal::Executor* executor) {
 // define a duplicate: the filter column differs on otherwise identical selected rows.
 void PartOperatorsTest::CheckPartIntersections(arrow::internal::Executor* executor) {
   using Kind = plan::SetTermKind;
+  constexpr int64_t kPatternCopies = 2048;
+  constexpr int64_t kSelectedPerPart = 7 * kPatternCopies;
   const auto schema =
       arrow::schema({arrow::field("payload", arrow::int64()), arrow::field("k", arrow::int64()),
                      arrow::field("v", arrow::float64())});
@@ -979,12 +981,15 @@ void PartOperatorsTest::CheckPartIntersections(arrow::internal::Executor* execut
     arrow::RecordBatchVector batches;
     for (int part = 0; part < 2; ++part) {
       const double first = starter && part == 0 ? -0.0 : 0.0;
-      batches.push_back(arrow::RecordBatch::Make(
+      const auto pattern = arrow::RecordBatch::Make(
           schema, 8,
           {Int64s({0, 1, 2, 3, 4, 5, 6, 7}),
            Int64s({std::nullopt, std::nullopt, std::nullopt, 7, 7, std::nullopt, 7, 7}),
            testing::ArrayOf<arrow::DoubleBuilder, double>(
-               arrow::float64(), {0.0, first, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0})}));
+               arrow::float64(), {0.0, first, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0})});
+      batches.push_back(
+          arrow::ConcatenateRecordBatches(arrow::RecordBatchVector(kPatternCopies, pattern))
+              .ValueOrDie());
     }
     std::vector<std::optional<int64_t>> unique;
     unique.reserve(16);
@@ -1033,15 +1038,17 @@ void PartOperatorsTest::CheckPartIntersections(arrow::internal::Executor* execut
     auto op = BuildPhysicalPlan(plan, &profile);
     ASSERT_TRUE(op.ok()) << op.status();
     ExecContext ctx{.pool = &memory,
-                    .batch_size = 4,
+                    .batch_size = 4096,
                     .executor = executor,
                     .threads = executor == nullptr ? 1 : kThreads,
                     .budget = &memory};
     auto result = Drain(**op, ctx);
     ASSERT_TRUE(result.ok()) << result.status();
     if (kind != Kind::kIntersect) {
-      EXPECT_EQ((*result)->num_rows(), kind == Kind::kIntersectAll ? 28 : 13);
-      EXPECT_EQ(MetricValue(profile, "starter_rows"), 30);
+      constexpr int64_t kInputRows = (2 * kSelectedPerPart) + 16;
+      EXPECT_EQ((*result)->num_rows(),
+                kind == Kind::kIntersectAll ? kInputRows - 2 : kInputRows - 17);
+      EXPECT_EQ(MetricValue(profile, "starter_rows"), kInputRows);
       continue;
     }
     std::vector<std::optional<int64_t>> expected{std::nullopt, 7, 7};
@@ -1063,7 +1070,7 @@ void PartOperatorsTest::CheckPartIntersections(arrow::internal::Executor* execut
     const auto children = profile.children();
     ASSERT_EQ(children.size(), 2U);
     for (const ProfileNode* child : children) {
-      EXPECT_EQ(MetricValue(*child, "local_distinct_rows_removed"), 8);
+      EXPECT_EQ(MetricValue(*child, "local_distinct_rows_removed"), 2 * (kSelectedPerPart - 3));
       EXPECT_EQ(MetricValue(*child, "local_distinct_parts_bypassed"), 1);
     }
   }
@@ -1071,8 +1078,12 @@ void PartOperatorsTest::CheckPartIntersections(arrow::internal::Executor* execut
 
 TEST_F(PartOperatorsTest, IntersectDedupReturnsSelectionsWhenItsBudgetRunsOut) {
   const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
-  const auto batch = arrow::RecordBatch::Make(schema, 4, {Int64s({0, 1, 1, 1})});
-  const Batch selected{.data = batch, .selection = testing::Bools({false, true, true, true})};
+  constexpr int64_t kBatchRows = 8192;
+  const auto batch = arrow::RecordBatch::Make(
+      schema, kBatchRows, {Int64s(std::vector<std::optional<int64_t>>(kBatchRows, 1))});
+  std::vector<std::optional<bool>> keep(kBatchRows, true);
+  keep.front() = false;
+  const Batch selected{.data = batch, .selection = testing::Bools(keep)};
   const PartPipeline pipeline = [=](int64_t /*part*/) -> arrow::Result<std::unique_ptr<Operator>> {
     return std::make_unique<testing::ScriptedSource>(schema, std::vector{selected, selected});
   };
@@ -1116,24 +1127,41 @@ TEST_F(PartOperatorsTest, IntersectDedupBypassesTheRestOfAPartAfterAUniqueSample
   const auto unique = arrow::RecordBatch::Make(schema, kSampleRows, {Int64s(keys)});
   std::ranges::fill(keys, 0);
   const auto repeated = arrow::RecordBatch::Make(schema, kSampleRows, {Int64s(keys)});
-  const PartPipeline pipeline = [=](int64_t /*part*/) -> arrow::Result<std::unique_ptr<Operator>> {
-    return std::make_unique<testing::ScriptedSource>(
-        schema, std::vector<Batch>{{.data = unique}, {.data = repeated}});
+  const PartPipeline pipeline = [=](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    std::vector<Batch> batches{{.data = unique}};
+    if (part == 1) {
+      batches.push_back({.data = repeated});
+    }
+    return std::make_unique<testing::ScriptedSource>(schema, std::move(batches));
   };
   ProfileNode profile;
-  PartUnionOperator op(pipeline, 1, schema, std::nullopt, {0});
+  PartUnionOperator op(pipeline, 2, schema, std::nullopt, {0});
   op.set_profile(&profile);
-  ExecContext ctx{.pool = arrow::default_memory_pool()};
-  const auto rows = Drain(op, ctx);
-  ASSERT_TRUE(rows.ok()) << rows.status();
-  EXPECT_EQ((*rows)->num_rows(), 2 * kSampleRows);
-  EXPECT_EQ(MetricValue(profile, "local_distinct_parts_bypassed"), 1);
+  MemoryBudget memory(std::nullopt);
+  ExecContext ctx{.pool = &memory, .budget = &memory};
+  ASSERT_TRUE(op.Open(ctx).ok());
+  const auto small_part = op.Next();
+  ASSERT_TRUE(small_part.ok()) << small_part.status();
+  EXPECT_EQ(small_part->data, unique);
+  EXPECT_EQ(memory.max_memory(), 0)
+      << "a small unique part should pass through without an allocation";
+  for (const auto& expected : {unique, repeated}) {
+    const auto batch = op.Next();
+    ASSERT_TRUE(batch.ok()) << batch.status();
+    EXPECT_EQ(batch->data, expected);
+    EXPECT_EQ(batch->selection, nullptr);
+  }
+  const auto end = op.Next();
+  ASSERT_TRUE(end.ok()) << end.status();
+  EXPECT_TRUE(end->end());
+  EXPECT_TRUE(op.Close().ok());
+  EXPECT_EQ(MetricValue(profile, "local_distinct_parts_bypassed"), 2);
   EXPECT_EQ(MetricValue(profile, "local_distinct_rows_removed"), 0);
 }
 
 TEST_F(PartOperatorsTest, IntersectDedupRestoresTheCompactedPrefixOnLateBypass) {
   const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
-  constexpr int64_t kPrefix = 8193;
+  constexpr int64_t kPrefix = 8194;
   const auto repeated = arrow::RecordBatch::Make(
       schema, kPrefix, {Int64s(std::vector<std::optional<int64_t>>(kPrefix, 7))});
   std::vector<std::optional<bool>> keep(kPrefix, true);
@@ -1186,11 +1214,94 @@ TEST_F(PartOperatorsTest, IntersectDedupRestoresTheCompactedPrefixOnLateBypass) 
   EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
+TEST_F(PartOperatorsTest, IntersectDedupKeepsOneBatchAcrossSamplingBoundaries) {
+  constexpr int64_t kRun = 8192;
+  constexpr int64_t kSize = 4 * kRun;
+  std::vector<std::optional<int64_t>> values;
+  values.reserve(kSize);
+  for (int64_t i = 0; i < kSize; ++i) {
+    values.emplace_back(i / kRun);
+  }
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto input = arrow::RecordBatch::Make(
+      schema, kSize, {Int64s(values), Int64s(std::vector<std::optional<int64_t>>(kSize, 9))});
+  const PartPipeline pipeline = [=](int64_t /*part*/) -> arrow::Result<std::unique_ptr<Operator>> {
+    return std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = input}});
+  };
+  PartUnionOperator op(pipeline, 1, schema, std::nullopt, {1, 0});
+  ExecContext ctx{.pool = arrow::default_memory_pool()};
+  ASSERT_TRUE(op.Open(ctx).ok());
+  const auto batch = op.Next();
+  ASSERT_TRUE(batch.ok()) << batch.status();
+  ASSERT_EQ(batch->selected_rows(), 4);
+  EXPECT_EQ(batch->selection, nullptr);
+  ASSERT_EQ(batch->data->num_rows(), 4);
+  EXPECT_TRUE(Int64s({0, 1, 2, 3})->Equals(batch->data->column(0)));
+  EXPECT_TRUE(Int64s({9, 9, 9, 9})->Equals(batch->data->column(1)));
+  const auto end = op.Next();
+  ASSERT_TRUE(end.ok()) << end.status();
+  EXPECT_TRUE(end->end());
+  EXPECT_TRUE(op.Close().ok());
+}
+
+TEST_F(PartOperatorsTest, IntersectDedupAcceptsLookupKeysAndPayloadWithNoValuesBuffer) {
+  constexpr int64_t kBatchRows = 16384;
+  const auto bitmap = arrow::AllocateEmptyBitmap(kBatchRows).ValueOrDie();
+  const auto absent = arrow::MakeArray(
+      arrow::ArrayData::Make(arrow::int64(), kBatchRows, {bitmap, nullptr}, kBatchRows));
+  ASSERT_EQ(absent->data()->buffers[1], nullptr);
+  const auto schema =
+      arrow::schema({arrow::field("n", arrow::int64()), arrow::field("k", arrow::int64())});
+  const auto starter =
+      arrow::RecordBatch::Make(schema, 2, {Int64s({std::nullopt, 7}), Int64s({0, 0})});
+  const auto lookup = arrow::RecordBatch::Make(
+      schema, kBatchRows, {absent, Int64s(std::vector<std::optional<int64_t>>(kBatchRows, 7))});
+  const PartPipeline pipeline = [=](int64_t /*part*/) -> arrow::Result<std::unique_ptr<Operator>> {
+    return std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = lookup}});
+  };
+  {
+    // Repeating the key gives as many key slots as fields but still leaves the payload unread.
+    PartUnionOperator parts(pipeline, 1, schema, std::nullopt, {1, 1});
+    ExecContext ctx{.pool = arrow::default_memory_pool()};
+    ASSERT_TRUE(parts.Open(ctx).ok());
+    const auto out = parts.Next();
+    ASSERT_TRUE(out.ok()) << out.status();
+    EXPECT_EQ(out->data, lookup);
+    ASSERT_NE(out->selection, nullptr);
+    EXPECT_TRUE(out->selection->Value(0));
+    EXPECT_EQ(out->selected_rows(), 1);
+    ASSERT_TRUE(parts.Close().ok());
+  }
+  for (const int key : {0, 1}) {
+    SCOPED_TRACE(key);
+    std::vector<std::unique_ptr<Operator>> inputs;
+    inputs.push_back(
+        std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = starter}}));
+    inputs.push_back(std::make_unique<PartUnionOperator>(pipeline, 1, schema, std::nullopt,
+                                                         std::vector<int>{key}));
+    using Kind = plan::SetTermKind;
+    auto op = SetOperationOperator::Make(std::move(inputs), {{0}, {key}}, {LogicalType::kBigInt},
+                                         {{.kind = Kind::kInput, .input = 0},
+                                          {.kind = Kind::kInput, .input = 1},
+                                          {.kind = Kind::kIntersect, .operands = 2}});
+    ASSERT_TRUE(op.ok()) << op.status();
+    const auto result = Drain(**op, {.pool = arrow::default_memory_pool()});
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(
+        Int64Column(**result, 0),
+        (std::vector<std::optional<int64_t>>{key == 0 ? std::nullopt : std::optional<int64_t>{7}}));
+  }
+}
+
+void CheckDedupProfileAfterRetry(arrow::internal::Executor* pool);
+
 // A union runs its inputs one after another, each over its own parts (ADR 0036): every row of input
 // 0 in part order, then input 1's, on any number of threads. A LIMIT met in input 0 never scans a
 // part of input 1, and the first failing input decides the error.
 TEST_F(PartOperatorsTest, UnionsKeepInputThenPartOrder) {
   const auto pool = Pool();
+  CheckDedupProfileAfterRetry(pool.get());
   const auto x = Column(0, "x", LogicalType::kBigInt);
   const auto branch = [&x](const std::shared_ptr<MemoryTable>& table) {
     return Node(
@@ -1620,6 +1731,41 @@ class CompleteFirstWindow final : public arrow::internal::Executor {
   int64_t parts_;
   std::atomic<int64_t> spawns_ = 0;
 };
+
+// After part 0 fails, the scheduler discards both a bypass and a successful reduction.
+// Each later part contributes to the profile only once, when its replay is accepted.
+void CheckDedupProfileAfterRetry(arrow::internal::Executor* pool) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto unique = arrow::RecordBatch::Make(schema, 2, {Int64s({1, 2})});
+  constexpr int64_t kRepeated = 16384;
+  const auto repeated = arrow::RecordBatch::Make(
+      schema, kRepeated, {Int64s(std::vector<std::optional<int64_t>>(kRepeated, 3))});
+  std::array<std::atomic<int>, 3> attempts{};
+  const PartPipeline pipeline = [&](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    const auto attempt = ++attempts.at(Narrow<std::size_t>(part));
+    if (part == 0 && attempt == 1) {
+      return arrow::Status::OutOfMemory("retry with a narrower window");
+    }
+    std::vector<Batch> batches;
+    if (part != 0) {
+      batches.push_back({.data = part == 1 ? unique : repeated});
+    }
+    return std::make_unique<testing::ScriptedSource>(schema, std::move(batches));
+  };
+  CompleteFirstWindow executor(pool, 3);
+  ProfileNode profile;
+  PartUnionOperator op(pipeline, 3, schema, std::nullopt, {0});
+  op.set_profile(&profile);
+  const auto result =
+      Drain(op, {.pool = arrow::default_memory_pool(), .executor = &executor, .threads = kThreads});
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(Int64Column(**result, 0), (std::vector<std::optional<int64_t>>{1, 2, 3}));
+  for (const auto& count : attempts) {
+    EXPECT_EQ(count.load(), 2);
+  }
+  EXPECT_EQ(MetricValue(profile, "local_distinct_parts_bypassed"), 1);
+  EXPECT_EQ(MetricValue(profile, "local_distinct_rows_removed"), kRepeated - 1);
+}
 
 // A low-cardinality part and the prefix of a promoted part share keys. Both handoffs must
 // reach the same destination partitions and retain the ordinary part order.

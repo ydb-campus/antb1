@@ -30,6 +30,7 @@
 #include "packed_order.h"
 #include "partition_lanes.h"
 #include "pool_vector.h"
+#include "slice.h"
 #include "window_prefix.h"
 
 namespace antb1::exec {
@@ -78,35 +79,6 @@ bool SameSpecification(const plan::WindowCall& a, const plan::WindowCall& b) {
            return x.column.index == y.column.index && x.column.type == y.column.type &&
                   x.descending == y.descending && x.nulls_first == y.nulls_first;
          });
-}
-
-// Arrow 26's ArrayData copy constructor is noexcept although it copies vectors. Array::Slice
-// and RecordBatch::Slice use that constructor, terminating on a heap failure. Copy the buffer
-// pointers as arguments to Make instead, where a failure can reach Next's error boundary.
-arrow::Result<std::shared_ptr<arrow::Array>> SliceColumn(const arrow::Array& array, int64_t offset,
-                                                         int64_t length) {
-  const auto& data = *array.data();
-  if (offset > std::numeric_limits<int64_t>::max() - data.offset) {
-    return arrow::Status::CapacityError("window array offset overflow");
-  }
-  return arrow::MakeArray(arrow::ArrayData::Make(
-      data.type, length, data.buffers, data.child_data, data.dictionary,
-      array.null_count() == 0 ? 0 : arrow::kUnknownNullCount, data.offset + offset));
-}
-
-arrow::Result<std::shared_ptr<arrow::RecordBatch>> SliceBatch(
-    const std::shared_ptr<arrow::RecordBatch>& batch, int64_t start, int64_t length) {
-  length = std::min(length, batch->num_rows() - start);
-  if (start == 0 && length == batch->num_rows()) {
-    return batch;
-  }
-  arrow::ArrayVector columns;
-  columns.reserve(static_cast<std::size_t>(batch->num_columns()));
-  for (const auto& column : batch->columns()) {
-    ARROW_ASSIGN_OR_RAISE(auto slice, SliceColumn(*column, start, length));
-    columns.push_back(std::move(slice));
-  }
-  return arrow::RecordBatch::Make(batch->schema(), length, std::move(columns));
 }
 
 struct Results {

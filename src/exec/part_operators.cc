@@ -20,7 +20,6 @@
 #include <arrow/array/concatenate.h>
 #include <arrow/compute/api_vector.h>
 #include <arrow/stl_allocator.h>
-#include <arrow/util/byte_size.h>
 #include <arrow/util/thread_pool.h>
 
 #include "antb1/common/check.h"
@@ -38,6 +37,7 @@
 #include "part_pruning.h"
 #include "part_scheduler.h"
 #include "partition_lanes.h"
+#include "slice.h"
 #include "union_distinct.h"
 #include "variance.h"
 
@@ -99,6 +99,7 @@ namespace {
 
 // Sample selected rows across input batches. Bound speculative key state even if a part starts
 // with many repeats and its remaining rows are unique.
+constexpr int64_t kDistinctProbeRows = 256;
 constexpr int64_t kDistinctSampleRows = 8192;
 constexpr int64_t kMaxPartDistinctBytes = int64_t{8} * 1024 * 1024;
 
@@ -120,14 +121,76 @@ int64_t DistinctChunkSize(const Batch& batch, int64_t start, int64_t remaining_s
   return count;
 }
 
-// Keep the original batches until the optional reduction commits. In particular, a refused hash
-// table or output allocation can be retried by forwarding the input directly to the set operation.
+// Mark first occurrences back in the original batch. Positions are in selected-row order,
+// so an existing selection must map them back to physical rows.
+void MarkDistinctRows(uint8_t* mask, int64_t start, const arrow::BooleanArray* selection,
+                      const arrow::UInt32Array& positions) {
+  if (selection == nullptr) {
+    for (int64_t i = 0; i < positions.length(); ++i) {
+      arrow::bit_util::SetBit(mask, start + positions.Value(i));
+    }
+    return;
+  }
+  int64_t next = 0;
+  uint32_t selected = 0;
+  for (int64_t i = 0; next < positions.length(); ++i) {
+    if (selection->IsValid(i) && selection->Value(i)) {
+      if (selected == positions.Value(next)) {
+        arrow::bit_util::SetBit(mask, start + i);
+        ++next;
+      }
+      ++selected;
+    }
+  }
+}
+
+// A positive width bounds the output of filtering the full physical batch. Only copy it when
+// every column is a checked set key; the original batch may carry unread payload columns.
+int64_t DistinctRowWidth(const arrow::Schema& schema, const std::vector<int>& columns) {
+  if (columns.size() != Narrow<std::size_t>(schema.num_fields())) {
+    return 0;
+  }
+  int64_t width = 0;
+  for (int i = 0; i < schema.num_fields(); ++i) {
+    const auto& type = *schema.field(i)->type();
+    if ((type.id() != arrow::Type::BOOL && type.byte_width() <= 0) ||
+        (columns[Narrow<std::size_t>(i)] != i && !std::ranges::contains(columns, i))) {
+      return 0;
+    }
+    width += int64_t{1} + std::max(1, type.byte_width());  // validity plus value
+  }
+  return width;
+}
+
+// Release the raw buffers before the global set operation, when the worker can bound the
+// output and the filter's temporary indices. The selection already represents the same rows.
+int64_t CompactDistinctBatch(Batch& batch, int64_t kept, int64_t width, int64_t mask_bytes,
+                             int64_t available, arrow::MemoryPool* pool) {
+  const int64_t padding = ((int64_t{2} * batch.data->num_columns()) + 2) * 64;
+  const int64_t free = available - mask_bytes - padding;
+  if (width == 0 || free <= 0 || batch.data->num_rows() > free / 8) {
+    return mask_bytes;
+  }
+  if (kept > (free - (8 * batch.data->num_rows())) / width) {
+    return mask_bytes;
+  }
+  auto compact = KeyTableNoBadAlloc([&] { return Materialize(batch, pool); });
+  if (!compact.ok()) {
+    return mask_bytes;
+  }
+  batch = {.data = *std::move(compact), .selection = {}};
+  return (kept * width) + padding;
+}
+
+// Keep each original batch until the whole part qualifies. Return at most one result per
+// original batch, preserving its first surviving rows in input order.
 arrow::Result<int64_t> DeduplicatePart(std::vector<Batch>& batches, int64_t rows,
                                        const std::vector<int>& columns, const arrow::Schema& schema,
                                        const ExecContext& ctx, int64_t window,
                                        const std::atomic<bool>& stop) {
-  // Leave room for the other workers and the consumer. Scratch and candidate output each take
-  // at most one eighth of a worker's share of headroom, including variable-width keys.
+  if (rows <= kDistinctSampleRows) {
+    return 0;
+  }
   auto allowance = kMaxPartDistinctBytes;
   const auto limit = ctx.budget == nullptr ? std::nullopt : ctx.budget->limit();
   if (limit.has_value()) {
@@ -135,66 +198,86 @@ arrow::Result<int64_t> DeduplicatePart(std::vector<Batch>& batches, int64_t rows
     allowance = std::min(allowance, std::max<int64_t>(0, headroom) / window / 8);
   }
   MemoryBudget scratch(allowance, ctx.pool);
-  auto local = ctx;
-  local.pool = &scratch;
-  UnionDistinct distinct(local);
-  // Materialized input and output rows may outlive scratch, including any Arrow buffers shared
-  // by a Take kernel. Normalized keys, hash state and the seen-group bitmap use the scratch pool.
-  arrow::compute::ExecContext output(ctx.pool);
+  arrow::compute::ExecContext kernels(&scratch);
+  std::unique_ptr<KeyTable> table;
   std::vector<Batch> reduced;
-  int64_t output_bytes = 0;
-  const int64_t sample = std::min(rows, kDistinctSampleRows);
+  const auto row_width = DistinctRowWidth(schema, columns);
+  int64_t retained_bytes = 0;
   int64_t consumed = 0;
   for (const auto& batch : batches) {
     for (const int column : columns) {
       if (column < 0 || column >= batch.data->num_columns() || column >= schema.num_fields() ||
-          !batch.data->column(column)->type()->Equals(*schema.field(column)->type())) {
-        return 0;  // the set operation validates every original key column
+          !batch.data->column(column)->type()->Equals(*schema.field(column)->type()) ||
+          LacksValues(*batch.data->column_data(column))) {
+        return 0;  // Let the regular set operation handle the original columns.
       }
     }
-    for (int64_t start = 0; start < batch.data->num_rows();) {
+    ARROW_ASSIGN_OR_RAISE(const auto keys, batch.data->SelectColumns(columns));
+    std::shared_ptr<arrow::Buffer> mask;
+    int64_t kept = 0;
+    for (int64_t start = 0; start < keys->num_rows();) {
       if (stop.load() || (ctx.budget != nullptr && ctx.budget->under_pressure())) {
         return 0;
       }
-      const auto count = DistinctChunkSize(batch, start, sample - consumed);
-      Batch chunk{.data = batch.data->Slice(start, count), .selection = {}};
-      if (batch.selection != nullptr) {
-        chunk.selection =
-            std::static_pointer_cast<arrow::BooleanArray>(batch.selection->Slice(start, count));
+      const auto target = consumed < kDistinctProbeRows ? kDistinctProbeRows : kDistinctSampleRows;
+      const auto count = DistinctChunkSize(batch, start, target - consumed);
+      ARROW_ASSIGN_OR_RAISE(auto chunk, SliceBatch(keys, start, count));
+      auto selection = batch.selection;
+      if (selection != nullptr && count != keys->num_rows()) {
+        ARROW_ASSIGN_OR_RAISE(const auto slice, SliceColumn(*selection, start, count));
+        selection = std::static_pointer_cast<arrow::BooleanArray>(slice);
       }
+      ARROW_ASSIGN_OR_RAISE(
+          const auto selected,
+          Materialize({.data = std::move(chunk), .selection = selection}, &scratch));
+      const auto offset = start;
       start += count;
-      // The unfiltered slice bounds both optional materialization and the rows Take could copy.
-      ARROW_ASSIGN_OR_RAISE(const auto bytes, arrow::util::ReferencedBufferSize(*chunk.data));
-      if (bytes > allowance - output_bytes) {
-        return 0;
-      }
-      ARROW_ASSIGN_OR_RAISE(const auto selected, Materialize(chunk, ctx.pool));
       if (selected->num_rows() == 0) {
         continue;
       }
-      ARROW_ASSIGN_OR_RAISE(const auto keys, selected->SelectColumns(columns));
-      ARROW_RETURN_NOT_OK(distinct.AppendSerial(selected, *keys, output));
+      ARROW_ASSIGN_OR_RAISE(const auto ids,
+                            ConsumeDistinctKeys(*selected, table, kernels, ctx.budget));
       consumed += selected->num_rows();
-      const auto removed = consumed - distinct.num_groups();
-      // Continue only while at least one eighth of the selected rows are duplicates.
-      if (consumed >= sample && removed <= (consumed - 1) / 8) {
+      const auto removed = consumed - ids.after;
+      // Stop on a completely unique short probe. A longer sample needs at least one eighth
+      // duplicates to pay for the full pass.
+      if ((consumed == kDistinctProbeRows && removed == 0) ||
+          (consumed >= kDistinctSampleRows && removed <= (consumed - 1) / 8)) {
         return 0;
       }
-      if (auto kept = distinct.Next(); !kept.end()) {
-        const auto held = arrow::util::TotalBufferSize(*kept.data) + Narrow<int64_t>(sizeof(Batch));
-        if (held > allowance - output_bytes) {
+      if (ids.before == ids.after) {
+        continue;
+      }
+      if (mask == nullptr) {
+        const auto bytes = arrow::bit_util::BytesForBits(keys->num_rows());
+        if (bytes > allowance - retained_bytes) {
           return 0;
         }
-        output_bytes += held;
-        reduced.push_back(std::move(kept));
+        ARROW_ASSIGN_OR_RAISE(mask, arrow::AllocateEmptyBitmap(keys->num_rows(), ctx.pool));
+        if (mask->capacity() > allowance - retained_bytes) {
+          return 0;
+        }
       }
+      ARROW_ASSIGN_OR_RAISE(const auto positions, FirstDistinctRows(ids, &scratch));
+      MarkDistinctRows(mask->mutable_data(), offset, selection.get(), *positions);
+      kept += positions->length();
+    }
+    if (kept == batch.selected_rows()) {
+      reduced.push_back(batch);
+    } else if (kept != 0) {
+      Batch candidate{.data = batch.data,
+                      .selection = std::make_shared<arrow::BooleanArray>(keys->num_rows(), mask)};
+      const auto width = batch.data->num_columns() == schema.num_fields() ? row_width : 0;
+      retained_bytes += CompactDistinctBatch(candidate, kept, width, mask->capacity(),
+                                             allowance - retained_bytes, ctx.pool);
+      reduced.push_back(std::move(candidate));
     }
   }
   if (ctx.budget != nullptr && ctx.budget->under_pressure()) {
     return 0;
   }
   batches.swap(reduced);
-  return consumed - distinct.num_groups();
+  return consumed - table->num_groups();
 }
 
 }  // namespace
@@ -218,28 +301,24 @@ arrow::Status PartUnionOperator::Open(ExecContext& ctx) {
                profile = profile()](int64_t part,
                                     const std::atomic<bool>& stop) -> arrow::Result<PartBatches> {
     const ProfileTimer part_time(profile, "part_time");
-    auto batches = std::make_shared<std::vector<Batch>>();
+    PartBatches result;
     int64_t rows = 0;
     if (cap.has_value() && *cap <= 0) {
-      return batches;
+      return result;
     }
     ARROW_RETURN_NOT_OK(
         RunPart(*pipeline, part, part_ctx, stop, [&](Batch batch) -> arrow::Result<bool> {
           rows += batch.selected_rows();
-          batches->push_back(std::move(batch));
+          result.batches.push_back(std::move(batch));
           return !cap.has_value() || rows < *cap;
         }));
     if (!columns.empty() && !cap.has_value() && rows > 0) {
       const auto removed = KeyTableNoBadAlloc([&] {
-        return DeduplicatePart(*batches, rows, columns, *schema, part_ctx, window, stop);
+        return DeduplicatePart(result.batches, rows, columns, *schema, part_ctx, window, stop);
       });
-      if (profile != nullptr) {
-        const auto saved = removed.ValueOr(0);
-        profile->Add("local_distinct_rows_removed", MetricUnit::kCount, saved);
-        profile->Add("local_distinct_parts_bypassed", MetricUnit::kCount, saved == 0 ? 1 : 0);
-      }
+      result.distinct_rows_removed = removed.ValueOr(0);
     }
-    return batches;
+    return result;
   };
   scheduler_ = std::make_unique<PartScheduler<PartBatches>>(
       num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
@@ -251,8 +330,8 @@ arrow::Result<Batch> PartUnionOperator::Next() {
     return arrow::Status::Invalid("part union: Next() before Open()");
   }
   while (true) {
-    if (current_ != nullptr && next_ < current_->size()) {
-      return std::move((*current_)[next_++]);  // released as it is handed on
+    if (current_.has_value() && next_ < current_->batches.size()) {
+      return std::move(current_->batches[next_++]);  // released as it is handed on
     }
     current_.reset();
     next_ = 0;
@@ -272,6 +351,12 @@ arrow::Result<Batch> PartUnionOperator::Next() {
       return part.status();
     }
     current_ = *std::move(part);
+    // A memory retry can discard completed lookahead parts. Count each accepted part once.
+    if (auto* node = profile(); node != nullptr && current_->distinct_rows_removed.has_value()) {
+      const auto saved = *current_->distinct_rows_removed;
+      node->Add("local_distinct_rows_removed", MetricUnit::kCount, saved);
+      node->Add("local_distinct_parts_bypassed", MetricUnit::kCount, saved == 0 ? 1 : 0);
+    }
   }
 }
 

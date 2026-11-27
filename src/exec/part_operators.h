@@ -106,14 +106,17 @@ class PartUnionOperator final : public PartSink {
   arrow::Status Close() override;
 
  private:
-  using PartBatches = std::shared_ptr<std::vector<Batch>>;
+  struct PartBatches {
+    std::vector<Batch> batches;
+    std::optional<int64_t> distinct_rows_removed;
+  };
 
   std::shared_ptr<const PartPipeline> pipeline_;
   int64_t num_parts_;
   std::shared_ptr<arrow::Schema> schema_;
   std::optional<int64_t> row_cap_;
   std::vector<int> distinct_columns_;
-  PartBatches current_;
+  std::optional<PartBatches> current_;
   std::size_t next_ = 0;  // the next batch of current_
   bool ended_ = false;    // every part's batches were handed on
   std::unique_ptr<PartScheduler<PartBatches>> scheduler_;

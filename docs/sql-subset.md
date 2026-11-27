@@ -1486,7 +1486,7 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     rows hardly reduced);
   - On a part pipeline feeding a pure `INTERSECT DISTINCT`, `local_distinct_rows_removed` counts duplicates
     removed by the part workers. `local_distinct_parts_bypassed` counts nonempty parts forwarded without
-    deduplication.
+    deduplication. Both counters cover parts accepted by the consumer, counting each part once across retries.
   - `narrow_scan_parts` and `wide_scan_parts` count accepted parts in parallel grouped aggregation when it
     adjusts scan lookahead. The narrow target requests one outstanding part per worker and the wide target
     requests four. Memory pressure may reduce the actual number of outstanding parts.
@@ -1781,7 +1781,8 @@ are not prerequisites for using the 2.0 oracle. Intentional differences are regi
   Both read every operand in full, in written order, even after one turns out empty (D31). The membership table
   holds distinct rows from the left operand. Later operands only look them up. For a pure `INTERSECT DISTINCT`,
   a part worker can remove duplicates from any operand using the complete set key. It keeps each key's first
-  original row and forwards parts whose sampled rows show little repetition.
+  original row. Small parts pass through directly. Larger parts pass through if the sampled keys show little
+  repetition or the worker runs short of memory.
 - EXCEPT: each distinct row of its left operand that no other operand holds; EXCEPT ALL: max(m - n - ..., 0) copies of
   a row its operands hold m, n, ... times, each copy with its normalized value. Both read every operand in full, in
   written order, the left one first even when it is empty (D30); only the left operand's distinct rows are held.
