@@ -2712,6 +2712,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   int avg_decimal = 0;
   int keyed_domains = 0;
   int keyless_domains = 0;
+  int grouped_scalars = 0;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedAggregate)) {
@@ -2725,9 +2726,10 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     ++calls;
     const std::size_t at = q.sql.find("(SELECT ");
     ASSERT_NE(at, std::string::npos) << q.sql;
-    // Ungrouped: the block holds one aggregate, one FROM and the key, and no GROUP BY.
+    // Only the SQ4b draw groups this scalar block.
     const std::string block = q.sql.substr(at, q.sql.find(')', q.sql.find(" WHERE ", at)) - at);
-    EXPECT_EQ(block.find("GROUP BY"), std::string::npos) << q.sql;
+    EXPECT_EQ(block.contains("GROUP BY"), q.features.Has(Feature::kCorrelatedSingle)) << q.sql;
+    grouped_scalars += q.features.Has(Feature::kCorrelatedSingle) ? 1 : 0;
     EXPECT_NE(block.find(" WHERE "), std::string::npos) << q.sql;
     if (q.features.Has(Feature::kKeyedDomainAggregate)) {
       ++keyed_domains;
@@ -2759,6 +2761,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     EXPECT_FALSE(q.features.Has(Feature::kInSubquery)) << q.sql;
     EXPECT_FALSE(q.features.Has(Feature::kScalarSubquery)) << q.sql;
   }
+  EXPECT_GT(grouped_scalars, 0);
   EXPECT_GT(calls, 150) << "calls: " << calls;
   EXPECT_GT(literal_first, 20) << "literal_first: " << literal_first;
   EXPECT_LT(literal_first, calls) << "both orders";

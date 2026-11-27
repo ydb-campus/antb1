@@ -1100,20 +1100,13 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT SUM((SELECT COUNT(*) FROM u)) FROM t", kUnsupported,
                   "(SELECT COUNT(*) FROM u)",
                   "an aggregate of subquery values alone is not supported"},
-        // An uncorrelated scalar subquery of any shape is its single value (ADR 0041's SQ4a). A
-        // correlated one is ADR 0023's Path 2 only over an aggregate over every row; any other
-        // shape needs the single join (SQ4b).
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16 FROM u WHERE u.i64 = t.i64)",
-                  kUnsupported, "(", "other than an aggregate over every row"},
+        // A per-binding LIMIT or OFFSET needs SQ14.
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
                   "LIMIT 1)",
-                  kUnsupported, "(", "other than an aggregate over every row"},
+                  kUnsupported, "(", "with LIMIT or OFFSET"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
                   "OFFSET 1)",
-                  kUnsupported, "(", "other than an aggregate over every row"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
-                  "GROUP BY i16)",
-                  kUnsupported, "(", "other than an aggregate over every row"},
+                  kUnsupported, "(", "with LIMIT or OFFSET"},
         // A HAVING is answered, as a CASE over the block's value (ADR 0041's SQ6). An IN or NOT IN
         // conjunct of it binds in full, so its bind errors come first, as in DuckDB; the unnesting
         // refuses it afterwards (unnesting_test).
@@ -1483,8 +1476,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT nope FROM u) FROM u)", kBind,
                   "nope", "column 'nope' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT ok.i16 FROM ok WHERE ok.i16 = "
-                  "u.i32) FROM u)",
-                  kUnsupported, "(", "other than an aggregate over every row"},
+                  "u.i32 LIMIT 1) FROM u)",
+                  kUnsupported, "(", "with LIMIT or OFFSET"},
         // A correlated EXISTS's mark stands in a select item as a correlated value does (ADR
         // 0041's SQ8a, SQ5b), but not over the block's aggregates (SQ13), nor alone in an
         // aggregate's argument (as `SUM((q))`).
@@ -3070,7 +3063,7 @@ TEST(BinderTest, GroupingCallsAreColumnsOfTheNode) {
 TEST(BinderTest, GroupingSetsMakeAGroupedBlock) {
   const Catalog catalog = MakeCatalog();
   // SQ8b answers plain grouping; a ROLLUP's empty set remains SQ16. Scalar grouped
-  // subqueries still require SQ4b.
+  // subqueries check cardinality after grouping.
   const auto grouped_exists =
       BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 GROUP BY u.i32)",
               catalog);
@@ -3088,8 +3081,15 @@ TEST(BinderTest, GroupingSetsMakeAGroupedBlock) {
                                             "WHERE u.i16 = t.i16 GROUP BY {})",
                                             keys),
                                 catalog);
-    ASSERT_FALSE(scalar.ok());
-    EXPECT_EQ(GetSqlError(scalar.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+    ASSERT_TRUE(scalar.ok()) << scalar.status();
+    const auto optimized = Optimize(*scalar);
+    if (std::string_view(keys) == "u.i32") {
+      ASSERT_TRUE(optimized.ok()) << optimized.status();
+      EXPECT_NE(Explain(*optimized).find("Join SINGLE"), std::string::npos);
+    } else {
+      ASSERT_FALSE(optimized.ok());
+      EXPECT_EQ(GetSqlError(optimized.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+    }
   }
   // Correlated through the grouping keys alone, every spelling of them is correlated alike: the
   // gate reads a grouping set's keys as it reads a GROUP BY list's.

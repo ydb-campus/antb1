@@ -1299,6 +1299,7 @@ struct Binding {
 struct CorrelatedCandidate {
   const Binding* outer = nullptr;        // the FROM item the subquery reads out to
   const GenColumn* outer_key = nullptr;  // of `outer`
+  bool inner_unique = false;             // including the NULL key, for NULL-equal correlations
   int64_t binding_bound = 0;             // distinct outer key values, including a possible NULL
   const GenTable* inner = nullptr;       // the block's only table, always named, never by path
   const GenColumn* inner_key = nullptr;  // of `inner`, of the same type as `outer_key`
@@ -3308,6 +3309,22 @@ class Builder {
         InnerColumn(c, *inner);
         Symbol("<");
         OuterValue(c, *outer);
+      }
+    }
+    // Group by the correlation key to produce zero or one group per binding. A second
+    // grouping key exercises SINGLE when the measured inner key is already unique.
+    // Copy the stream so that enabling this draw never changes an unrelated clause.
+    Rng group_rng = corr_rng_;
+    if (!keyless && !used_.Has(Feature::kKeyedDomainAggregate) && allowed_.Has(Feature::kGroupBy) &&
+        allowed_.Has(Feature::kCorrelatedSingle) && group_rng.Percent(25)) {
+      used_.Add(Feature::kCorrelatedSingle);
+      used_.Add(Feature::kGroupBy);
+      Keyword("GROUP");
+      Keyword("BY");
+      InnerColumn(c, *c.inner_key);
+      if (c.inner_unique && c.inner_key != arg) {
+        Symbol(",");
+        InnerColumn(c, *arg);
       }
     }
     Symbol(")");
@@ -7292,9 +7309,12 @@ class Builder {
           const GenKeyStats& stats = as_child ? edge.child_stats : edge.parent_stats;
           // A join can pad this binding even when its base column has no NULL.
           const bool may_have_null = stats.non_null < own.rows || from_->bindings.size() > 1;
+          const GenKeyStats& inner_stats = as_child ? edge.parent_stats : edge.child_stats;
           out.push_back(CorrelatedCandidate{
               .outer = &b,
               .outer_key = &outer_key,
+              .inner_unique =
+                  inner_stats.max_multiplicity <= 1 && other.rows - inner_stats.non_null <= 1,
               .binding_bound = SaturatingSum(stats.distinct, may_have_null ? 1 : 0),
               .inner = &other,
               .inner_key = &inner_key});

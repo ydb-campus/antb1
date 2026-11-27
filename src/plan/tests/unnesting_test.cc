@@ -143,10 +143,10 @@ std::string RefusalOf(std::string_view sql,
 // join takes its correlated conjuncts (lift mode), a one-row join appends a static aggregate's row
 // (value mode), and every other kind -- one whose join takes no residual, or that the binder never
 // makes dependent -- keeps the one refusal it has always had.
-TEST(UnnestingTest, EveryKindButSemiAntiMarkAndOneRowIsRefused) {
+TEST(UnnestingTest, OnlySupportedDependentKindsAreUnnested) {
   for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
                               JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kFull,
-                              JoinKind::kNullAwareMark, JoinKind::kMark}) {
+                              JoinKind::kNullAwareMark, JoinKind::kMark, JoinKind::kSingle}) {
     SCOPED_TRACE(ToString(kind));
     const std::string refusal = RefusalOf(
         kind == JoinKind::kOneRow ? kScalar : kExists, [kind](const LogicalNodePtr& root) {
@@ -156,6 +156,7 @@ TEST(UnnestingTest, EveryKindButSemiAntiMarkAndOneRowIsRefused) {
       case JoinKind::kSemi:
       case JoinKind::kAnti:
       case JoinKind::kOneRow:
+      case JoinKind::kSingle:
       case JoinKind::kMark:
         EXPECT_EQ(refusal, "");
         break;

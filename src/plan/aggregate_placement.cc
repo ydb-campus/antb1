@@ -188,7 +188,7 @@ bool Exchangeable(const JoinNode& join) {
   // has no keys to group by, and a join that pads its left input is refused until a kind that does
   // exists and is measured (ADR 0037's OJ2).
   const JoinKindTraits traits = Traits(join.kind);
-  return traits.outputs_right && !traits.one_row && !traits.pads_left;
+  return traits.outputs_right && !traits.one_row && !traits.pads_left && !traits.single_match;
 }
 
 // The per-row cost of grouping by one column, coarsely: what a hash table hashes, compares and

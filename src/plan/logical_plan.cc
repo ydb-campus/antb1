@@ -460,6 +460,8 @@ std::string_view ToString(JoinKind kind) {
       return "ANTI";
     case JoinKind::kNullAwareAnti:
       return "NULL-AWARE ANTI";
+    case JoinKind::kSingle:
+      return "SINGLE";
     case JoinKind::kOneRow:
       return "ONE-ROW";
     case JoinKind::kFull:
@@ -1332,7 +1334,7 @@ class Resolver {
       Fail(std::format("Join: {} join with a residual", ToString(join.kind)));
     }
     if (join.build == BuildSide::kLeft &&
-        (traits.one_row || traits.pads_left || traits.appends_mark)) {
+        (traits.one_row || traits.pads_left || traits.appends_mark || traits.single_match)) {
       // Every other kind may build on either input in a plan since ADR 0026's C2b (the executor
       // runs those whose traits say `may_build_left`); a one-row join may not, because its right
       // input is the single-row side by definition, and nor may one that pads its left input's
@@ -1390,6 +1392,7 @@ class Resolver {
     switch (join.kind) {
       case JoinKind::kSemi:
       case JoinKind::kAnti:
+      case JoinKind::kSingle:
       case JoinKind::kOneRow:
       case JoinKind::kMark:
         break;

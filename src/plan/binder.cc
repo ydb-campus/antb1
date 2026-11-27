@@ -4011,6 +4011,7 @@ class Binder {
   struct SubqueryBlock {
     LogicalNodePtr right;
     BindingColumn column;
+    JoinKind scalar_kind = JoinKind::kOneRow;
     LogicalType type;  // the column's, which a BindingColumn holds as an optional
     bool correlated = false;
     // The ids its plan reads from the blocks enclosing it (FreeVariables): empty exactly when it is
@@ -6835,13 +6836,11 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   if (auto r = correlated_compound()) {
     return Reject(*r);
   }
-  if (correlated && form.scalar() && !AggregateOverEveryRow(query)) {
-    // The unnesting's value mode takes an aggregate over every row; any other correlated scalar
-    // needs the single join (ADR 0041's SQ4b) or per-binding limits (SQ14).
-    return Reject(Rejection{.span = form.subquery->op_span,
-                            .message = "a scalar subquery other than an aggregate over every row "
-                                       "is not supported (no GROUP BY, LIMIT or OFFSET, which "
-                                       "could leave no row or several)"});
+  if (correlated && form.scalar() && (query.limit.has_value() || query.offset.has_value())) {
+    // A per-binding limit or offset needs SQ14.
+    return Reject(
+        Rejection{.span = form.subquery->op_span,
+                  .message = "a correlated scalar subquery with LIMIT or OFFSET is not supported"});
   }
   if (correlated && having) {
     // ADR 0023: a correlated subquery in HAVING exits 4, since its outer references would read the
@@ -6876,6 +6875,9 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   }
   return SubqueryBlock{.right = std::move(right),
                        .column = std::move(column),
+                       .scalar_kind = correlated && form.scalar() && !AggregateOverEveryRow(query)
+                                          ? JoinKind::kSingle
+                                          : JoinKind::kOneRow,
                        .type = type,
                        .correlated = correlated,
                        .free = std::move(free)};
@@ -6935,7 +6937,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
     return arrow::Status::OK();
   }
   const BindingColumn& column = block.column;
-  SubqueryJoin join{.kind = JoinKind::kOneRow,
+  SubqueryJoin join{.kind = block.scalar_kind,
                     .dependent = block.correlated,
                     .right = std::move(block.right),
                     .left_key = {},
@@ -7371,7 +7373,7 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
                                   block.column.stored_as_float);
   const bool deferred = dependent && deferring_;
   const LogicalNode* const right = block.right.get();  // before it moves into the join
-  SubqueryJoin join{.kind = mark ? JoinKind::kMark : JoinKind::kOneRow,
+  SubqueryJoin join{.kind = mark ? JoinKind::kMark : block.scalar_kind,
                     .dependent = dependent,
                     .right = std::move(block.right),
                     .left_key = {},
