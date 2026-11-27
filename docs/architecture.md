@@ -241,7 +241,13 @@ steps (only step 7 uses more than one thread):
    requires an equality or a finite list on the same integer or date grouping key, the producer can restrict
    that key to the union of their values. The planner considers reader lists of up to nine values and
    applies the combined list only when it also fits that limit. This bounds the comparisons per input row
-   before aggregation. Each reader still applies its own filter. The restriction can pass
+   before aggregation. Each reader still applies its own filter. The planner can trace a reader's
+   grouping key through a projection, a filter or a computation when skipping excluded groups
+   preserves expression evaluation errors. A projected alias must read the input slot identified by
+   its column ID. Once a projection or computation materializes a selection, later predicates see
+   only the surviving rows, so the planner can retain the earlier key restriction. Readers selecting
+   different periods can share one aggregate over those periods even when they also filter on a computed measure.
+   A reader that needs the full range prevents a shared restriction on that key. The restriction can pass
    through a distinct union into each input, and through safe computations to a scan. A checked aggregate
    retains its input. For narrow exact addition or subtraction, bounds from every scan part can prove that
    both operands, including a nullable join input with a `COALESCE` fallback, fit throughout evaluation.

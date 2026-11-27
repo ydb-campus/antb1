@@ -1177,6 +1177,64 @@ TEST(OptimizerTest, SharedKeyReachesEachUnionScanOnlyPastSafeArithmetic) {
   }
 }
 
+TEST(OptimizerTest, KeepsSharedDomainsAboveUncheckedProducerFiltersAndTheirJoins) {
+  auto catalog = MakeCatalog();
+  ASSERT_TRUE(catalog
+                  .Register("facts", std::make_shared<testing::FakeTable>(testing::AllTypesSchema(),
+                                                                          20'000'000))
+                  .ok());
+  for (const bool joined : {false, true}) {
+    const std::string source = joined ? "facts f JOIN t other ON f.i64=other.i64" : "facts f";
+    // With a lookup, the predicate is on the opposite side of the key being pushed.
+    // An empty restricted build could skip evaluation of that input altogether.
+    const std::string side = joined ? "other." : "f.";
+    for (const bool checked : {false, true}) {
+      const auto condition = checked ? side + "i32 > 0" : std::format("{0}i64 > {0}d", side);
+      SCOPED_TRACE(std::format("{} WHERE {}", source, condition));
+      const auto bound =
+          BindSql(std::format("WITH g AS (SELECT f.i64 AS k, MAX(f.i32) AS v FROM {} WHERE {} "
+                              "GROUP BY f.i64) SELECT a.k,b.k FROM g a JOIN g b ON a.v=b.v "
+                              "WHERE a.k IN (1,2) AND b.k IN (2,3)",
+                              source, condition),
+                  catalog);
+      ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+      const auto plan = Optimized(*bound);
+      const auto groups = MaterializableSubPlans(plan);
+      ASSERT_EQ(groups.size(), 1U);
+      const auto producer = SharedConsumerFilters(plan).Producer(groups.front());
+      const auto* group = Find<GroupAggregateNode>(producer);
+      ASSERT_NE(group, nullptr);
+      const auto* placed = std::get_if<FilterNode>(group->input.get());
+      if (!checked) {
+        ASSERT_NE(placed, nullptr);
+        ASSERT_EQ(placed->predicates.size(), 1U);
+        EXPECT_EQ(placed->predicates.front().kind, Predicate::Kind::kIn);
+        EXPECT_EQ(std::holds_alternative<JoinNode>(*placed->input), joined);
+        const auto* original = Find<FilterNode>(placed->input);
+        ASSERT_NE(original, nullptr);
+        ASSERT_EQ(original->predicates.size(), 1U);
+        EXPECT_EQ(original->predicates.front().kind, Predicate::Kind::kCompareColumns);
+      } else if (joined) {
+        const auto* join = std::get_if<JoinNode>(group->input.get());
+        ASSERT_NE(join, nullptr);
+        for (const auto& input : {join->left, join->right}) {
+          const auto* filter = Find<FilterNode>(input);
+          ASSERT_NE(filter, nullptr);
+          EXPECT_TRUE(std::holds_alternative<ScanNode>(*filter->input));
+          EXPECT_TRUE(
+              std::ranges::contains(filter->predicates, Predicate::Kind::kIn, &Predicate::kind));
+        }
+      } else {
+        ASSERT_NE(placed, nullptr);
+        EXPECT_TRUE(std::holds_alternative<ScanNode>(*placed->input));
+        EXPECT_EQ(placed->predicates.size(), 2U);
+        EXPECT_TRUE(
+            std::ranges::contains(placed->predicates, Predicate::Kind::kIn, &Predicate::kind));
+      }
+    }
+  }
+}
+
 TEST(OptimizerTest, ReconsidersFilteredGroupsForAParallelJoinProbe) {
   constexpr int64_t kLabels = 4096;
   constexpr int64_t kPart = kLabels / 2;

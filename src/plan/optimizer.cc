@@ -31,6 +31,7 @@
 #include "arithmetic_rewrite.h"
 #include "compute_safety.h"
 #include "join_order.h"
+#include "predicate_domain.h"
 #include "union_aggregate.h"
 #include "union_branches.h"
 #include "unnesting.h"
@@ -71,20 +72,49 @@ bool SameEquality(const Predicate& a, const Predicate& b) {
          a.constant.type == b.constant.type && a.constant.value == b.constant.value;
 }
 
-std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predicate& predicate) {
+std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predicate& predicate,
+                                        bool check_input_slot = false) {
   ANTB1_CHECK(predicate.column.has_value());  // the equality reads a column
   const auto at = std::ranges::find(project.ids, predicate.column->id);
   if (at == project.ids.end()) {
     return std::nullopt;
   }
   const auto index = Narrow<std::size_t>(at - project.ids.begin());
-  if ((!project.constants.empty() && project.constants[index].has_value()) ||
-      project.columns[index].type != predicate.column->type) {
+  if (index >= project.columns.size() ||
+      (!project.constants.empty() &&
+       (index >= project.constants.size() || project.constants[index].has_value())) ||
+      project.columns[index].type != predicate.column->type ||
+      (check_input_slot && (project.input == nullptr ||
+                            !ReadsSlot(project.columns[index], OutputIds(*project.input))))) {
     return std::nullopt;
   }
   Predicate below = predicate;
   below.column = project.columns[index];
   return below;
+}
+
+// These tests read already computed columns and can evaluate every value of their bound types.
+bool CanSkipPredicate(const Predicate& p) {
+  using enum Predicate::Kind;
+  if (p.kind == kFalse || p.kind == kIsNull || p.kind == kIsNotNull || p.kind == kIsTrue) {
+    return true;
+  }
+  if (!p.column) {
+    return false;
+  }
+  if (p.kind == kCompare) {
+    return p.column->type == p.constant.type;
+  }
+  if (p.kind == kLike || p.kind == kNotLike) {
+    return p.column->type == LogicalType::kVarchar && p.constant.type == LogicalType::kVarchar &&
+           std::holds_alternative<std::string>(p.constant.value);
+  }
+  if (p.kind == kIn || p.kind == kNotIn) {
+    return std::ranges::all_of(p.values,
+                               [&](const Constant& v) { return v.type == p.column->type; });
+  }
+  return (p.kind == kCompareColumns || p.kind == kIsDistinct || p.kind == kIsNotDistinct) &&
+         p.other && p.column->type == p.other->type;
 }
 
 // A filter can discard rows before a Compute only if every expression it skips is total.
@@ -93,6 +123,44 @@ class ComputeSafety {
  public:
   enum class Use : std::uint8_t { kFilter, kSharedProducer, kScalarKey };
   Use use = Use::kFilter;
+
+  bool Total(const Expr& expr, const LogicalNodePtr& input) {
+    if (std::holds_alternative<ColumnExpr>(expr.node) ||
+        std::holds_alternative<ConstantExpr>(expr.node) || Arithmetic(expr, input)) {
+      return true;
+    }
+    if (use != Use::kSharedProducer) {
+      return false;
+    }
+    if (const auto* test = std::get_if<PredicateExpr>(&expr.node)) {
+      return CanSkipPredicate(test->predicate) &&
+             std::ranges::all_of(test->operands,
+                                 [&](const ExprPtr& arg) { return arg && Total(*arg, input); });
+    }
+    const auto* arms = std::get_if<CaseExpr>(&expr.node);
+    if (arms == nullptr || arms->whens.size() != arms->thens.size()) {
+      return false;
+    }
+    // CASE evaluates and implicitly casts only the selected arm. Every possible arm and
+    // conversion must be total before we can omit the expression for a discarded group.
+    const auto value = [&](const ExprPtr& arm) {
+      return arm == nullptr || ((arm->type == expr.type ||
+                                 (IsInteger(arm->type) && IsInteger(expr.type) &&
+                                  IsExactWidening(arm->type, expr.type)) ||
+                                 (expr.type == LogicalType::kDouble &&
+                                  (IsNumeric(arm->type) || arm->type == LogicalType::kDecimal))) &&
+                                Total(*arm, input));
+    };
+    for (std::size_t i = 0; i < arms->whens.size(); ++i) {
+      const auto& when = arms->whens[i];
+      if ((when == nullptr && arms->thens[i] == nullptr) ||
+          (when && (when->type != LogicalType::kBoolean || !Total(*when, input))) ||
+          !value(arms->thens[i])) {
+        return false;
+      }
+    }
+    return value(arms->otherwise);
+  }
 
   bool Arithmetic(const Expr& expr, const LogicalNodePtr& input) {
     const auto* op = std::get_if<ArithExpr>(&expr.node);
@@ -311,9 +379,11 @@ GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node, ComputeSafety* 
 
 bool CanSkipCompute(const ComputeNode& compute, ComputeSafety* safety) {
   return std::ranges::all_of(compute.exprs, [&](const ExprPtr& expr) {
-    return std::holds_alternative<ColumnExpr>(expr->node) ||
-           std::holds_alternative<ConstantExpr>(expr->node) ||
-           (safety != nullptr && safety->Arithmetic(*expr, compute.input));
+    if (safety != nullptr) {
+      return expr && safety->Total(*expr, compute.input);
+    }
+    return expr && (std::holds_alternative<ColumnExpr>(expr->node) ||
+                    std::holds_alternative<ConstantExpr>(expr->node));
   });
 }
 
@@ -324,6 +394,10 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
   }
   ANTB1_CHECK(predicate.column.has_value());  // the equality or its remapped copy
   if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+    if (state.compute_safety.use == ComputeSafety::Use::kSharedProducer &&
+        !std::ranges::all_of(filter->predicates, CanSkipPredicate)) {
+      return Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
+    }
     if (std::ranges::any_of(filter->predicates,
                             [&](const Predicate& p) { return SameEquality(p, predicate); })) {
       return node;
@@ -338,7 +412,8 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
     return WithInputs(*node, {std::move(below)});
   }
   if (const auto* project = std::get_if<ProjectNode>(node.get())) {
-    if (const auto below = ThroughProject(*project, predicate)) {
+    if (const auto below = ThroughProject(
+            *project, predicate, state.compute_safety.use == ComputeSafety::Use::kSharedProducer)) {
       return WithInputs(*node, {PushKeyFilter(project->input, *below, state)});
     }
   }
@@ -435,6 +510,10 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
 // route into their already-bound bodies. A nullable side contributes no guaranteed equality.
 GroupEqualities KnownGroupEqualities(const LogicalNodePtr& node, ComputeSafety* safety) {
   if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+    if (safety != nullptr && safety->use == ComputeSafety::Use::kSharedProducer &&
+        !std::ranges::all_of(filter->predicates, CanSkipPredicate)) {
+      return {};
+    }
     GroupEqualities out = KnownGroupEqualities(filter->input, safety);
     if (!out.safe) {
       return out;
@@ -1280,6 +1359,54 @@ bool CanPrecomputeScalarKey(const Expr& expr, const LogicalNodePtr& input) {
   ComputeSafety safety;
   safety.use = ComputeSafety::Use::kScalarKey;
   return safety.Arithmetic(expr, input);
+}
+
+std::vector<Predicate> SharedConsumerFilters::ReaderPredicates(const LogicalNode* member) const {
+  std::vector<Predicate> result;
+  std::size_t materialized = 0;
+  std::vector<const ProjectNode*> projects;
+  ComputeSafety safety;
+  safety.use = ComputeSafety::Use::kSharedProducer;
+  // Walk from the shared output towards this reader. Only a restriction reached before a
+  // barrier holds for the producer. A node reached through two edges ends the walk as well.
+  for (auto at = parents_.find(member); at != parents_.end() && at->second != nullptr;
+       at = parents_.find(at->second)) {
+    const LogicalNode* parent = at->second;
+    if (const auto* filter = std::get_if<FilterNode>(parent)) {
+      // Adjacent filters evaluate on the same batch before combining masks. A Project or
+      // Compute between them materializes the lower selection, so that restriction stands.
+      if (!std::ranges::all_of(filter->predicates, CanSkipPredicate)) {
+        result.resize(materialized);
+        break;
+      }
+      const auto ids = OutputIds(*filter->input);
+      for (const auto& predicate : filter->predicates) {
+        if (!predicate.column || !HasBoundedDomain(predicate) ||
+            !ReadsSlot(*predicate.column, ids)) {
+          continue;
+        }
+        std::optional<Predicate> below = predicate;
+        for (const auto* project : projects | std::views::reverse) {
+          below = ThroughProject(*project, *below, /*check_input_slot=*/true);
+          if (!below) {
+            break;
+          }
+        }
+        if (below) {
+          result.push_back(std::move(*below));
+        }
+      }
+    } else if (const auto* project = std::get_if<ProjectNode>(parent)) {
+      materialized = result.size();
+      projects.push_back(project);
+    } else if (const auto* compute = std::get_if<ComputeNode>(parent);
+               compute != nullptr && CanSkipCompute(*compute, &safety)) {
+      materialized = result.size();
+    } else {
+      break;
+    }
+  }
+  return result;
 }
 
 LogicalNodePtr SharedConsumerFilters::PushGroupKey(const LogicalNodePtr& producer,
