@@ -14,6 +14,7 @@ hardening is described in [docs/ci.md](ci.md).
 | Claude in GitHub Actions | `@claude` on issues and PRs; read-only PR review on the `claude` label | the same | [Claude GitHub App and token](#claude-github-app-and-token) |
 | Codex | Codex CLI; ChatGPT Codex cloud tasks; `@codex review` on PRs | AGENTS.md | [Codex](#codex) |
 | Codex harness audit | GitHub Actions, one audit per PR | base-commit prompt and AGENTS.md | [Codex harness audit and API key](#codex-harness-audit-and-api-key) |
+| Grok review | GitHub Actions, one review per PR | base-commit prompt, script and AGENTS.md | [Grok review and API key](#grok-review-and-api-key) |
 | Copilot | coding agent and code review on github.com | `.github/copilot-instructions.md`, AGENTS.md | [Copilot](#copilot) |
 | antb1-bot | GitHub Actions, weekly | none (no model) | [Bot App antb1-bot](#bot-app-antb1-bot) |
 
@@ -26,21 +27,24 @@ merge. They follow the workflow security rules in [docs/ci.md](ci.md).
 | --- | --- | --- | --- |
 | `Claude` ([claude.yml](../.github/workflows/claude.yml)) | `@claude` in an issue comment, PR comment, review or review comment; an issue opened with `@claude`; the issue label `claude` | Claude Code answers or works on the issue or PR, runs allowed tasks, pushes a branch and keeps one reply comment up to date | `CLAUDE_CODE_OAUTH_TOKEN` |
 | `Claude review` ([claude-review.yml](../.github/workflows/claude-review.yml)) | a collaborator applies the `claude` label to a ready, same-repository PR (including Copilot PRs) | Claude applies the AGENTS.md Code Review Rules from the base branch to the diff: inline comments for P0/P1 problems and one summary comment per run (the action's progress comment, updated even when the run fails); the job summary and the log list denied tool calls | `CLAUDE_CODE_OAUTH_TOKEN` |
+| `Grok review` ([grok-review.yml](../.github/workflows/grok-review.yml)) | PR opened, ready for review or reopened (same repository, not a draft; Copilot PRs included) | Grok 4.7 applies the AGENTS.md Code Review Rules from the base commit to the diff and posts one sticky comment | `XAI_API_KEY` |
 | `Codex harness audit` ([codex-review.yml](../.github/workflows/codex-review.yml)) | PR opened, ready for review or reopened (same repository, not a draft, no bots); the label `codex-review` | Codex CLI 0.155.1, read-only and without sudo, checks the diff against the harness rules and posts one sticky comment | `OPENAI_API_KEY` |
 | `Copilot Setup Steps` ([copilot-setup-steps.yml](../.github/workflows/copilot-setup-steps.yml)) | before every Copilot coding-agent task; manual; PRs and pushes that change it, `pixi.toml` or `pixi.lock` | installs the locked `default` and `lint` environments and builds `build/dev` | none |
 | `pixi.lock update` ([pixi-lock-update.yml](../.github/workflows/pixi-lock-update.yml)) | Mondays 05:00 UTC; manual | `pixi update` with pixi 0.81.0, then a PR `build(deps): update pixi.lock` from antb1-bot | `BOT_CLIENT_ID` (variable), `BOT_PRIVATE_KEY` (environment `automation`) |
 
 The workflow token (`GITHUB_TOKEN`) is read-only in every job that runs a model. The Claude jobs write through the
-Claude GitHub App's token, which the action obtains with the job's OIDC token. The Codex audit job writes nothing;
-a separate job with only `pull-requests: write` posts its comment. The lock update writes through antb1-bot's token.
+Claude GitHub App's token, which the action obtains with the job's OIDC token. The Grok review and the Codex audit
+write nothing; a separate job with only `pull-requests: write` posts each comment. The lock update writes through
+antb1-bot's token.
 
 ## How AI reviews work
 
-- Codex runs the automatic harness audit on eligible PRs. To request a read-only Claude review, apply the
-  `claude` label after the PR is ready for review. Remove and reapply it for a fresh review.
-- Claude, Codex and Copilot apply the AGENTS.md "Code Review Rules". They report concrete problems with a failure
-  scenario and omit formatting comments, ClickBench data values and material derived from TPC-H or TPC-DS.
-- They are advisory and never approve. Claude and Codex post comments, Copilot's reviews are comment reviews, and
+- Grok reviews every eligible pull request when it is opened, marked ready or reopened. A later push does not
+  request another review. Codex runs the automatic harness audit on the same events. To request a read-only Claude
+  review, apply the `claude` label after the PR is ready for review. Remove and reapply it for a fresh review.
+- Claude, Grok, Codex and Copilot apply the AGENTS.md "Code Review Rules". They report concrete problems with a
+  failure scenario and omit formatting comments, ClickBench data values and material derived from TPC-H or TPC-DS.
+- They are advisory and never approve. Claude, Grok and Codex post comments, Copilot's reviews are comment reviews, and
   the repository does not let GitHub Actions approve pull requests. Merging still needs `CI OK`, `PR title` and one
   human approval.
 - The ruleset requires every review thread to be resolved, AI threads included. Fix the problem, or reply why the
@@ -72,10 +76,11 @@ A repository admin does this once, in this order (the steps are detailed below):
 
 1. Install the Claude GitHub App and set `CLAUDE_CODE_OAUTH_TOKEN`.
 2. Create a spend-capped OpenAI project key and set `OPENAI_API_KEY`.
-3. After the AI workflows are on `main`: set up the Codex connection, cloud environment and review; the Claude Code
+3. Create an xAI API key and set `XAI_API_KEY`. Calls are billed per token, not from an X Subscription pool.
+4. After the AI workflows are on `main`: set up the Codex connection, cloud environment and review; the Claude Code
    cloud environment; and Copilot, if the organization has seats.
-4. Create the antb1-bot App, set `BOT_CLIENT_ID` and `BOT_PRIVATE_KEY`, then run `pixi.lock update` once by hand.
-5. Confirm that Copilot runs are not blocked by the repository's "Require actions to be pinned to a full-length
+5. Create the antb1-bot App, set `BOT_CLIENT_ID` and `BOT_PRIVATE_KEY`, then run `pixi.lock update` once by hand.
+6. Confirm that Copilot runs are not blocked by the repository's "Require actions to be pinned to a full-length
    commit SHA" setting (see [Copilot](#copilot)).
 
 Each collaborator then completes the [per-person prerequisites](#per-person-prerequisites).
@@ -229,6 +234,29 @@ To set up the key:
    gh secret set OPENAI_API_KEY -R ydb-campus/antb1   # paste the key at the prompt
    ```
 
+### Grok review and API key
+
+[grok-review.yml](../.github/workflows/grok-review.yml) reviews every ready same-repository pull request when it is
+opened, marked ready or reopened. It takes its prompt
+([.github/grok/review-prompt.md](../.github/grok/review-prompt.md)), its script
+([.github/scripts/grok_review.py](../.github/scripts/grok_review.py)) and AGENTS.md from the PR's base commit, so a
+PR cannot rewrite its own instructions or the program that sees the key, and sends the file list and the diff to
+`grok-4.7`. The answer is posted as one sticky comment. A later push does not request another review. The review
+is skipped with a notice when the base commit has no prompt yet, and when the `XAI_API_KEY` secret is not set, so
+the workflow stays inert until the key exists.
+
+The key is an xAI API key. Those calls are billed per token. They do not draw on the weekly pool of an X
+Subscription (Grok Build, Grok Bot or Cursor).
+
+To set up the key:
+
+1. In the xAI console (<https://console.x.ai>), create an API key for this repository.
+2. Store it:
+
+   ```bash
+   gh secret set XAI_API_KEY -R ydb-campus/antb1   # paste the key at the prompt
+   ```
+
 ## Copilot
 
 Copilot needs organization seats and policy; skip this section if the organization has none.
@@ -294,6 +322,7 @@ no changes while the PR is still open, the PR is closed and its branch deleted.
 | --- | --- | --- | --- |
 | `CLAUDE_CODE_OAUTH_TOKEN` | repository secret | Claude, Claude review | workflows of this repository's events and same-repo branches; never fork PRs |
 | `OPENAI_API_KEY` | repository secret | Codex harness audit | the same |
+| `XAI_API_KEY` | repository secret | Grok review | the same; billed per token, not from an X Subscription pool |
 | `BOT_PRIVATE_KEY` | secret of the environment `automation` | pixi.lock update | only jobs that run on `main` and name the environment |
 | `BOT_CLIENT_ID` | repository variable (not secret) | pixi.lock update | any workflow; useless without the key |
 
@@ -301,15 +330,15 @@ no changes while the PR is still open, the PR is closed and its branch deleted.
   forks need a maintainer's approval, and every AI job also skips fork PRs.
 - Anyone with write access can push a branch whose workflow change reads a repository secret in a PR run. That is
   inherent to repository secrets; the mitigations are that only organization members have write access,
-  `.github/` changes request review from the code owners, the OpenAI key is spend-capped, the Claude token only
-  draws on a subscription, and every secret can be rotated in minutes. `BOT_PRIVATE_KEY` is out of reach for PR
-  branches because the `automation` environment deploys from `main` only.
+  `.github/` changes request review from the code owners, the OpenAI key is spend-capped, the xAI key is billed per
+  token, the Claude token only draws on a subscription, and every secret can be rotated in minutes.
+  `BOT_PRIVATE_KEY` is out of reach for PR branches because the `automation` environment deploys from `main` only.
 - Prompt injection (instructions hidden in issues, PRs, comments or files) is handled in depth: `@claude` requires
   write access for both the sender and the author and refuses forks; the review workflows run only on same-repo,
   non-draft PRs; Claude runs with hooks disabled, a fixed tool allowlist and `.claude/` and CLAUDE.md restored from
-  the base branch; the Codex audit reads its prompt and rules from the base commit, does not load the PR's AGENTS.md
-  as instructions, and runs read-only without sudo, with no write token in its job; and all AI output is advisory,
-  behind CI and a human approval.
+  the base branch; the Codex audit and the Grok review read their prompt, script and rules from the base commit
+  and do not load the PR's AGENTS.md as instructions; the Codex job runs read-only without sudo; neither review job
+  has a write token; and all AI output is advisory, behind CI and a human approval.
 - What remains: the `@claude` job builds and tests the branch, so code in the branch runs with the job's credentials
   (the Claude token and the Claude App token); the tool allowlist limits Claude's commands, not what the code it
   builds does. That is why both the sender and the author need write access; on a Copilot PR, the person who
@@ -331,7 +360,7 @@ no changes while the PR is still open, the PR is closed and its branch deleted.
   tag ([SECURITY.md](../SECURITY.md#verifying-a-release)).
 - The workflows never print secrets. codex-action keeps the OpenAI key in a local proxy process that Codex cannot
   read; claude-code-action does not print Claude's full output to the log unless `show_full_output` is set (it is
-  not).
+  not). The Grok review sends `XAI_API_KEY` only as a bearer token and does not print it.
 
 To rotate a secret (and immediately after any suspected leak):
 
@@ -340,6 +369,8 @@ To rotate a secret (and immediately after any suspected leak):
   the Claude account that created it and watch that subscription's usage.
 - `OPENAI_API_KEY`: create a new key in the OpenAI project, store it with `gh secret set`, then delete the old key
   in the project and check the project's usage.
+- `XAI_API_KEY`: create a new key in the xAI console, store it with `gh secret set`, then delete the old key and
+  check the console's usage.
 - `BOT_PRIVATE_KEY`: generate a new private key on the App's page, store it with
   `gh secret set BOT_PRIVATE_KEY -R ydb-campus/antb1 --env automation`, then delete the old key on the App's page.
 
@@ -371,6 +402,7 @@ Local notes:
 | Claude workflows fail with `workflow_not_found_on_default_branch` | the workflow is not on `main` yet |
 | Claude workflows fail to authenticate | `CLAUDE_CODE_OAUTH_TOKEN` expired or is missing; renew it |
 | Codex audit ends with a notice and no comment | `OPENAI_API_KEY` is not set, or the base commit predates the prompt |
+| Grok review ends with a notice and no comment | `XAI_API_KEY` is not set, or the base commit has no `.github/grok/review-prompt.md` |
 | The audit did not re-run after adding `codex-review` | the label was already present; remove it and add it again |
 | `pixi.lock update` is skipped | the variable `BOT_CLIENT_ID` is not set |
 | `pixi.lock update` fails at the App token step | wrong client ID, wrong key, or the App is not installed on antb1 |
