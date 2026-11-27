@@ -38,8 +38,8 @@ a separate job with only `pull-requests: write` posts its comment. The lock upda
 
 - Codex runs the automatic harness audit on eligible PRs. To request a read-only Claude review, apply the
   `claude` label after the PR is ready for review. Remove and reapply it for a fresh review.
-- Claude, Codex and Copilot apply the AGENTS.md "Code Review Rules": concrete, high-confidence problems with a failure scenario, no
-  formatting comments, no ClickBench data values and nothing derived from TPC-H or TPC-DS.
+- Claude, Codex and Copilot apply the AGENTS.md "Code Review Rules". They report concrete problems with a failure
+  scenario and omit formatting comments, ClickBench data values and material derived from TPC-H or TPC-DS.
 - They are advisory and never approve. Claude and Codex post comments, Copilot's reviews are comment reviews, and
   the repository does not let GitHub Actions approve pull requests. Merging still needs `CI OK`, `PR title` and one
   human approval.
