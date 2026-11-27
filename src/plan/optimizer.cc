@@ -29,6 +29,7 @@
 
 #include "aggregate_placement.h"
 #include "arithmetic_rewrite.h"
+#include "compute_safety.h"
 #include "join_order.h"
 #include "union_aggregate.h"
 #include "union_branches.h"
@@ -90,20 +91,28 @@ std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predic
 // Cache exact footer ranges by physical field so multiple consumers of a table pay once.
 class ComputeSafety {
  public:
-  bool for_shared_producer = false;
+  enum class Use : std::uint8_t { kFilter, kSharedProducer, kScalarKey };
+  Use use = Use::kFilter;
 
   bool Arithmetic(const Expr& expr, const LogicalNodePtr& input) {
     const auto* op = std::get_if<ArithExpr>(&expr.node);
     if (op == nullptr || op->left == nullptr || op->right == nullptr) {
       return false;
     }
-    if (for_shared_producer && NarrowExact(expr.type) &&
-        (op->op == ArithOp::kAdd || op->op == ArithOp::kSubtract)) {
+    if ((use != Use::kFilter) && NarrowExact(expr.type) &&
+        (op->op == ArithOp::kAdd || op->op == ArithOp::kSubtract ||
+         (use == Use::kScalarKey && op->op == ArithOp::kMultiply && IsInteger(expr.type)))) {
       const auto left = OperandBounds(*op->left, input, expr.type);
       const auto right = OperandBounds(*op->right, input, expr.type);
       if (left && right) {
         const auto limit = RangeOf(expr.type);
         // Operands fit in int64 at the result scale. The intermediate bounds fit in Int128.
+        if (op->op == ArithOp::kMultiply) {
+          const auto products = {left->min * right->min, left->min * right->max,
+                                 left->max * right->min, left->max * right->max};
+          const auto [lo, hi] = std::ranges::minmax(products);
+          return lo >= limit.min && hi <= limit.max;
+        }
         const bool add = op->op == ArithOp::kAdd;
         return (add ? left->min + right->min : left->min - right->max) >= limit.min &&
                (add ? left->max + right->max : left->max - right->min) <= limit.max;
@@ -142,9 +151,33 @@ class ComputeSafety {
     if (const auto* filter = std::get_if<FilterNode>(node.get())) {
       return RangeFor(filter->input, id);
     }
+    if (use == Use::kScalarKey) {
+      // Earlier scalar and mark subqueries append values. A later key still reads the same
+      // outer column, even when the earlier dependent join has yet to be unnested.
+      if (const auto* dep = std::get_if<DependentJoinNode>(node.get())) {
+        return RangeFor(dep->left, id);
+      }
+      if (const auto* join = std::get_if<JoinNode>(node.get())) {
+        const auto traits = Traits(join->kind);
+        if (traits.one_row || traits.single_match || traits.appends_mark) {
+          return RangeFor(join->left, id);
+        }
+      }
+      if (const auto* compute = std::get_if<ComputeNode>(node.get())) {
+        return std::ranges::contains(compute->ids, id) ? nullptr : RangeFor(compute->input, id);
+      }
+      if (const auto* project = std::get_if<ProjectNode>(node.get())) {
+        const auto at = std::ranges::find(project->ids, id);
+        if (at == project->ids.end()) {
+          return nullptr;
+        }
+        const auto index = Narrow<std::size_t>(at - project->ids.begin());
+        return RangeFor(project->input, project->columns.at(index).id);
+      }
+    }
     if (const auto* join = std::get_if<JoinNode>(node.get());
         join != nullptr && (join->kind == JoinKind::kInner ||
-                            (for_shared_producer && join->kind == JoinKind::kLeft))) {
+                            ((use != Use::kFilter) && join->kind == JoinKind::kLeft))) {
       const ColumnRange* left = RangeFor(join->left, id);
       return left != nullptr ? left : RangeFor(join->right, id);
     }
@@ -181,9 +214,11 @@ class ComputeSafety {
     if (const auto* col = std::get_if<ColumnExpr>(&expr.node)) {
       const ColumnRange* range = RangeFor(input, col->id);
       if (range == nullptr || !range->exact) {
-        return std::nullopt;
-      }
-      if (range->non_null > 0) {
+        if (use != Use::kScalarKey || !IsInteger(expr.type)) {
+          return std::nullopt;
+        }
+        bounds = RangeOf(expr.type);
+      } else if (range->non_null > 0) {
         if (!range->min.has_value() || !range->max.has_value()) {
           return std::nullopt;
         }
@@ -195,6 +230,10 @@ class ComputeSafety {
         return std::nullopt;
       }
       bounds = {.min = *value, .max = *value};
+    } else if (const auto* cast = std::get_if<CastExpr>(&expr.node);
+               use == Use::kScalarKey && cast != nullptr &&
+               IsExactWidening(cast->operand->type, expr.type)) {
+      return OperandBounds(*cast->operand, input, target);
     } else if (const auto* arms = std::get_if<CaseExpr>(&expr.node);
                arms != nullptr && arms->thens.size() == arms->whens.size() &&
                std::ranges::all_of(arms->whens, [](const ExprPtr& when) { return !when; })) {
@@ -278,18 +317,6 @@ bool CanSkipCompute(const ComputeNode& compute, ComputeSafety* safety) {
   });
 }
 
-// Wide sums check the accumulator and AVG(DATE) checks the conversion to timestamp. Groups
-// removed by a consumer's pushed filter must stay unevaluated regardless of the sharing gate.
-bool CanFailOnGroup(const AggregateCall& call) {
-  if (!call.arg.has_value() || (call.kind != AggKind::kSum && call.kind != AggKind::kAvg)) {
-    return false;
-  }
-  const LogicalType type = call.arg->type;
-  return type == LogicalType::kHugeInt ||
-         (type == LogicalType::kDecimal && type.width() > LogicalType::kMaxNarrowDecimalWidth) ||
-         (call.kind == AggKind::kAvg && type == LogicalType::kDate);
-}
-
 LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predicate,
                              PushdownState& state) {
   if (state.preserve.contains(node.get())) {
@@ -319,7 +346,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
     const auto at = std::ranges::find(group->key_ids, predicate.column->id);
     if (at != group->key_ids.end()) {
       if (std::ranges::any_of(group->aggregates, CanFailOnGroup)) {
-        if (state.compute_safety.for_shared_producer) {
+        if (state.compute_safety.use == ComputeSafety::Use::kSharedProducer) {
           return Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
         }
         state.keep_filtered_plan = true;
@@ -369,7 +396,7 @@ LogicalNodePtr PushKeyFilter(const LogicalNodePtr& node, const Predicate& predic
   }
   LogicalNodePtr placed =
       Make(FilterNode{.input = node, .predicates = {predicate}, .span = predicate.span});
-  if (state.compute_safety.for_shared_producer) {
+  if (state.compute_safety.use == ComputeSafety::Use::kSharedProducer) {
     const auto distribute = [&](const auto& set) {
       const auto key = std::ranges::find(set.ids, predicate.column->id);
       if (key == set.ids.end()) {
@@ -1198,10 +1225,67 @@ LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstim
 
 }  // namespace
 
+// Wide sums check the accumulator and AVG(DATE) checks the conversion to timestamp. Groups
+// removed by a consumer's pushed filter must stay unevaluated regardless of the sharing gate.
+bool CanFailOnGroup(const AggregateCall& call) {
+  if (!call.arg.has_value() || (call.kind != AggKind::kSum && call.kind != AggKind::kAvg)) {
+    return false;
+  }
+  const LogicalType type = call.arg->type;
+  return type == LogicalType::kHugeInt ||
+         (type == LogicalType::kDecimal && type.width() > LogicalType::kMaxNarrowDecimalWidth) ||
+         (call.kind == AggKind::kAvg && type == LogicalType::kDate);
+}
+
+bool CanPrecomputeScalarKey(const Expr& expr, const LogicalNodePtr& input) {
+  if (std::holds_alternative<ColumnExpr>(expr.node) ||
+      std::holds_alternative<ConstantExpr>(expr.node)) {
+    return true;
+  }
+  if (const auto* cast = std::get_if<CastExpr>(&expr.node)) {
+    return IsExactWidening(cast->operand->type, expr.type) &&
+           CanPrecomputeScalarKey(*cast->operand, input);
+  }
+  if (const auto* fn = std::get_if<FunctionExpr>(&expr.node)) {
+    return (fn->function == Function::kStrlen || fn->function == Function::kLower ||
+            fn->function == Function::kUpper) &&
+           CanPrecomputeScalarKey(*fn->args.front(), input);
+  }
+  if (const auto* op = std::get_if<ArithExpr>(&expr.node);
+      op != nullptr && IsInteger(expr.type) &&
+      (op->op == ArithOp::kModulo || op->op == ArithOp::kIntegerDivide)) {
+    const auto* divisor = std::get_if<ConstantExpr>(&op->right->node);
+    const auto* value = divisor == nullptr ? nullptr : std::get_if<Int128>(&divisor->value.value);
+    return value != nullptr && *value > 0 && *value <= RangeOf(expr.type).max &&
+           IsExactWidening(op->left->type, expr.type) && CanPrecomputeScalarKey(*op->left, input);
+  }
+  const auto safe = [&](const ExprPtr& operand) { return CanPrecomputeScalarKey(*operand, input); };
+  if (const auto* pred = std::get_if<PredicateExpr>(&expr.node)) {
+    return std::ranges::all_of(pred->operands, safe);
+  }
+  if (const auto* boolean = std::get_if<BoolExpr>(&expr.node)) {
+    return std::ranges::all_of(boolean->args, safe);
+  }
+  if (const auto* arms = std::get_if<CaseExpr>(&expr.node)) {
+    const auto safe_arm = [&](const ExprPtr& arm) {
+      return arm == nullptr ||
+             (IsExactWidening(arm->type, expr.type) && CanPrecomputeScalarKey(*arm, input));
+    };
+    return std::ranges::all_of(arms->whens,
+                               [&](const ExprPtr& when) {
+                                 return when == nullptr || CanPrecomputeScalarKey(*when, input);
+                               }) &&
+           std::ranges::all_of(arms->thens, safe_arm) && safe_arm(arms->otherwise);
+  }
+  ComputeSafety safety;
+  safety.use = ComputeSafety::Use::kScalarKey;
+  return safety.Arithmetic(expr, input);
+}
+
 LogicalNodePtr SharedConsumerFilters::PushGroupKey(const LogicalNodePtr& producer,
                                                    const Predicate& predicate) {
   PushdownState state;
-  state.compute_safety.for_shared_producer = true;
+  state.compute_safety.use = ComputeSafety::Use::kSharedProducer;
   auto filtered = PushKeyFilter(producer, predicate, state);
   return state.pushed_group_keys.empty() ? producer : ResolveSubtreePositions(filtered);
 }

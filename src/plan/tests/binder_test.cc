@@ -8785,6 +8785,70 @@ TEST(BinderTest, ScalarAggregateWidensItsEqualityKeyWithoutABindingDomain) {
   EXPECT_EQ(explain.find("Join INNER"), std::string::npos) << explain;
 }
 
+TEST(BinderTest, ComputedScalarKeysGroupOnSideLocalExpressions) {
+  const auto plan = BindSql(
+      "SELECT (SELECT COUNT(*) FROM u WHERE u.i32 % 7 IS NOT DISTINCT FROM "
+      "CAST(t.i16 AS BIGINT) + 1) FROM t",
+      MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  const auto optimized = Optimize(*plan);
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+  const std::string text = Explain(*optimized);
+  EXPECT_NE(text.find("Join LEFT"), std::string::npos) << text;
+  EXPECT_NE(text.find("IS NOT DISTINCT FROM"), std::string::npos) << text;
+  EXPECT_NE(text.find("GroupAggregate"), std::string::npos) << text;
+  EXPECT_EQ(text.find("Join INNER"), std::string::npos) << text;
+}
+
+TEST(BinderTest, ComputedScalarKeysKeepAnExistingWidenedRepresentative) {
+  const auto bound = BindSql(
+      "SELECT (SELECT COUNT(*) FROM u WHERE u.i32 = t.i64 "
+      "AND u.i32 % 7 = t.i64 AND u.i32 + 1 < t.i64) FROM t",
+      MakeCatalog());
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto optimized = Optimize(*bound);
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  const std::string text = Explain(*optimized);
+  EXPECT_NE(text.find("GroupAggregate keys=[\"CAST(u.i32 AS BIGINT)\"]"), std::string::npos)
+      << text;
+  EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+}
+
+TEST(BinderTest, ComputedScalarKeysDeclineUnsafeOrMixedOperands) {
+  for (const std::string_view condition :
+       {"u.i32 + 1 = t.i32", "u.i32 = CAST(t.i64 AS INTEGER)", "u.i32 // 0 = t.i32",
+        "u.i32 + t.i32 = t.i16", "u.i32 < t.i32 % 7"}) {
+    const auto query = std::format("SELECT (SELECT COUNT(*) FROM u WHERE {}) FROM t", condition);
+    const auto plan = BindSql(query, MakeCatalog());
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    const auto optimized = Optimize(*plan);
+    ASSERT_FALSE(optimized.ok()) << condition;
+    const auto error = GetSqlError(optimized.status());
+    ASSERT_NE(error, nullptr) << condition;
+    EXPECT_EQ(error->kind(), kUnsupported);
+    EXPECT_EQ(SpanText(query, optimized.status()), "(");
+  }
+}
+
+TEST(BinderTest, ComputedScalarKeysKeepThrowingGroupsUnevaluated) {
+  for (const std::string_view subquery :
+       {"SELECT MAX(u.i32 + 1) FROM u WHERE u.i32 % 7 = t.i32",
+        "SELECT SUM(u.h) FROM u WHERE u.i32 % 7 = t.i32",
+        "SELECT COUNT(*) FROM u WHERE u.i32 % 7 = t.i32 AND u.i32 + 1 < t.i32"}) {
+    const auto query = std::format("SELECT ({}) FROM t", subquery);
+    const auto bound = BindSql(query, MakeCatalog());
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto optimized = Optimize(*bound);
+    ASSERT_FALSE(optimized.ok()) << query;
+    const auto detail = GetSqlError(optimized.status());
+    ASSERT_NE(detail, nullptr);
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_NE(optimized.status().ToString().find("potentially failing"), std::string::npos)
+        << query;
+  }
+}
+
 // Widening an enclosing key for equality does not make its wider inner equivalent a
 // SMALLINT in other expressions. Substituting it there could change arithmetic or overflow.
 TEST(BinderTest, WidenedEqualityKeepsTheOriginalOuterTypeInOtherConjuncts) {

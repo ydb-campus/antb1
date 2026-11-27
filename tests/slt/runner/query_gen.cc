@@ -3302,7 +3302,23 @@ class Builder {
         used_.Add(Feature::kWidenedScalarKey);
       }
     }
+    // A positive divisor gives a many-to-one key without overflow, including at signed minima.
+    Rng expr_rng = corr_rng_;
+    const bool computed = !keyless && inner_key == c.inner_key &&
+                          inner_key->kind == ValueKind::kInteger &&
+                          allowed_.Contains({Feature::kComputedScalarKey, Feature::kArithmetic,
+                                             Feature::kIntegerLiteral}) &&
+                          (agg == Agg::kMin || agg == Agg::kMax) && expr_rng.Percent(35);
+    const auto mod = [&] {
+      Symbol("%");
+      ValueNumber(7);
+      used_.Add({Feature::kComputedScalarKey, Feature::kArithmetic, Feature::kIntegerLiteral});
+    };
+    const bool inner_expr = computed && expr_rng.Percent(50);
     InnerColumn(c, *inner_key);
+    if (inner_expr) {
+      mod();
+    }
     if (keyless) {
       used_.Add(Feature::kKeylessDomainAggregate);
       used_.Add(Feature::kCompareColumns);
@@ -3311,8 +3327,12 @@ class Builder {
       CorrelatedKeyComparison();
     }
     OuterColumn(c);
-    if (!keyless && inner_key == c.inner_key && allowed_.Has(Feature::kKeyedDomainAggregate) &&
-        allowed_.Has(Feature::kWhereAnd) && domain_rng_.Percent(35)) {
+    if (computed && (!inner_expr || expr_rng.Percent(50))) {
+      mod();
+    }
+    if (!computed && !keyless && inner_key == c.inner_key &&
+        allowed_.Has(Feature::kKeyedDomainAggregate) && allowed_.Has(Feature::kWhereAnd) &&
+        domain_rng_.Percent(35)) {
       auto pairs = ResidualPairs(c);
       std::erase_if(pairs, [&c](const auto& pair) { return pair.second == c.outer_key; });
       if (!pairs.empty()) {
@@ -3330,9 +3350,9 @@ class Builder {
     // grouping key exercises SINGLE when the measured inner key is already unique.
     // Copy the stream so that enabling this draw never changes an unrelated clause.
     Rng group_rng = corr_rng_;
-    if (!keyless && inner_key == c.inner_key && !used_.Has(Feature::kKeyedDomainAggregate) &&
-        allowed_.Has(Feature::kGroupBy) && allowed_.Has(Feature::kCorrelatedSingle) &&
-        group_rng.Percent(25)) {
+    if (!computed && !keyless && inner_key == c.inner_key &&
+        !used_.Has(Feature::kKeyedDomainAggregate) && allowed_.Has(Feature::kGroupBy) &&
+        allowed_.Has(Feature::kCorrelatedSingle) && group_rng.Percent(25)) {
       used_.Add(Feature::kCorrelatedSingle);
       used_.Add(Feature::kGroupBy);
       Keyword("GROUP");

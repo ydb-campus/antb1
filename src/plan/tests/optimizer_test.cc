@@ -2258,6 +2258,25 @@ TEST(OptimizerTest, TheSemiJoinReductionReplaysAWidenedOuterKeyBelowAStack) {
   EXPECT_EQ(PositionMismatch(plan), std::nullopt);
 }
 
+TEST(OptimizerTest, TheSemiJoinReductionReplaysAComputedBindingBelowAStack) {
+  auto catalog = MakeCatalog();
+  auto facts = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 250'000);
+  ASSERT_TRUE(catalog.Register("facts", std::move(facts)).ok());
+  const auto bound = BindSql(
+      "SELECT (SELECT COUNT(*) FROM t a WHERE a.i16 = o.i16), "
+      "(SELECT COUNT(*) FROM facts b WHERE b.i32 IS NOT DISTINCT FROM o.i16 % 7) FROM t o",
+      catalog);
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto plan = Optimized(*bound);
+  const auto* restriction = RestrictionUnder(plan);
+  ASSERT_NE(restriction, nullptr) << Explain(plan);
+  EXPECT_EQ(restriction->kind, JoinKind::kSemi);
+  const auto* domain = std::get_if<ComputeNode>(restriction->right.get());
+  ASSERT_NE(domain, nullptr) << Explain(plan);
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(*domain->input));
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+}
+
 // What the base below a stack may not be. A key computed above it -- here a Compute over the lower
 // rewrite defines the upper one's outer column -- is a column no clone of the base carries, so the
 // upper rewrite declines and only the lower one restricts. A base that holds a Limit declines too:

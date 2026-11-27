@@ -438,6 +438,169 @@ INTEGER	BIGINT
 8	NULL
 9	NULL
 
+# Computed equality keys partition by the expression value. Repeated outer bindings see the
+# same aggregate. NULL-safe equality also reads the group for a NULL expression result.
+query III rowsort
+SELECT o.id,
+       (SELECT COUNT(*) FROM edge i WHERE i.i16 % 3 = o.i16 % 3),
+       (SELECT COUNT(*) FROM edge i WHERE o.i16 % 3 IS NOT DISTINCT FROM i.i16 % 3)
+FROM edge o
+----
+INTEGER	BIGINT	BIGINT
+0	1	1
+1	4	4
+10	3	3
+11	4	4
+2	3	3
+3	2	2
+4	4	4
+5	0	2
+6	4	4
+7	2	2
+8	0	2
+9	3	3
+
+# Both sides can compute independent keys. A binding with no group keeps the empty SUM.
+query II rowsort
+SELECT c.ct_id, (SELECT SUM(z.zn_id) FROM zones z WHERE z.zn_city + 2 = c.ct_id - 1)
+FROM cities c
+----
+SMALLINT	HUGEINT
+1	NULL
+2	NULL
+3	NULL
+4	148
+5	156
+6	126
+
+# Exact widening after expression evaluation; two conditions constrain the same computed key.
+query II rowsort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE o.i16 % 3 = i.id
+              AND o.i16 % 3 IS NOT DISTINCT FROM i.i16)
+FROM edge o
+----
+INTEGER	BIGINT
+0	0
+1	0
+10	0
+11	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+
+# The computed key may also be a string function. An empty input supplies zero for COUNT.
+query II rowsort
+SELECT c.ct_id, (SELECT COUNT(*) FROM promos p WHERE strlen(p.pm_code) = c.ct_id)
+FROM cities c
+----
+SMALLINT	BIGINT
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+
+# A widened plain key still supplies the binding for a computed equality and a residual.
+query II rowsort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE i.id = o.i64
+              AND i.id % 7 = o.i64 AND i.id + 1 < o.i64) FROM edge o
+----
+INTEGER	BIGINT
+0	0
+1	0
+10	0
+11	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+
+# HAVING on a computed binding includes the aggregate's empty row.
+query II rowsort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE i.id % 3 = o.id
+              HAVING COUNT(*) = 0 OR COUNT(*) > 1) FROM edge o
+----
+INTEGER	BIGINT
+0	4
+1	4
+10	0
+11	0
+2	4
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+
+# An earlier scalar adds an output without changing the enclosing key's bounds.
+query III rowsort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE i.id = o.id + 1),
+       (SELECT COUNT(*) FROM edge i WHERE i.id = o.id + 2) FROM edge o
+----
+INTEGER	BIGINT	BIGINT
+0	1	1
+1	1	1
+10	1	0
+11	0	0
+2	1	1
+3	1	1
+4	1	1
+5	1	1
+6	1	1
+7	1	1
+8	1	1
+9	1	1
+
+query III rowsort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE i.id = o.id + 2),
+       (SELECT COUNT(*) FROM edge i WHERE i.id = o.id + 1) FROM edge o
+----
+INTEGER	BIGINT	BIGINT
+0	1	1
+1	1	1
+10	0	1
+11	0	0
+2	1	1
+3	1	1
+4	1	1
+5	1	1
+6	1	1
+7	1	1
+8	1	1
+9	1	1
+
+# Renaming a scan column on either input preserves its exact bounds.
+query II rowsort
+SELECT o.x, (SELECT COUNT(*) FROM (SELECT id AS y FROM edge) i
+              WHERE i.y + 1 IS NOT DISTINCT FROM o.x - 1)
+FROM (SELECT id AS x FROM edge) o
+----
+INTEGER	BIGINT
+0	0
+1	0
+10	1
+11	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+8	1
+9	1
+
 # ---- uncorrelated scalar subqueries that are no aggregate (ADR 0041's SQ4a; more in values.slt) ----
 
 # Zero rows give NULL; several rows are an error.

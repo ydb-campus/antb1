@@ -625,6 +625,13 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   Each side widens to that type before grouping and joining. This also works for a NULL-equal key.
   A separate expression that reads the enclosing column at its original width still needs a
   representative of that type.
+  An equality key can also be an expression on either or both sides when each operand reads only
+  its own input and the planner can prove it safe to evaluate before matching. Examples include
+  integer addition within proven bounds, exact casts and string length. The two keys must have
+  an exact common hash type. Duplicate computed values share a group. Ordinary equality skips
+  NULL keys and `IS NOT DISTINCT FROM` matches them. If precomputing a key or grouping unbound
+  rows could introduce an evaluation error, the computed-key rewrite declines (exit 4 when no
+  existing rule applies).
   A scalar aggregate can also correlate through inequalities and through AND, OR or NOT over comparisons
   between plain inner and enclosing columns of the same hashable type. SQ9 groups the distinct tuples of
   enclosing values. A top-level equality conjunct (`=` or `IS NOT DISTINCT FROM`) supplies a hash key.
