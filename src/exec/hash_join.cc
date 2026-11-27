@@ -1539,7 +1539,13 @@ arrow::Result<int64_t> HashJoinOperator::KeepPassingOrPadded(int64_t count, int6
 
 arrow::Result<int64_t> HashJoinOperator::NextSlots() {
   const int64_t length = batch_.data->num_rows();
-  const int64_t limit = std::min<int64_t>(batch_size_, std::numeric_limits<std::uint32_t>::max());
+  // A keyless scalar needs at most two passing pairs to report a cardinality error.
+  // Test short vectorized windows before allocating space for further candidates.
+  constexpr int64_t kScalarCandidateRows = 2048;
+  const int64_t max_slots = plan::Traits(kind_).single_match && probe_keys_.empty()
+                                ? kScalarCandidateRows
+                                : std::numeric_limits<std::uint32_t>::max();
+  const int64_t limit = std::min(batch_size_, max_slots);
   // A probe row without a match is padded where the kind pads the probe's side: the left input's
   // rows (`pads_right`) for a right build, the right input's (`pads_left`) for a left one.
   const plan::JoinKindTraits traits = plan::Traits(kind_);

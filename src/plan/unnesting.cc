@@ -1268,7 +1268,7 @@ arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spi
     ARROW_ASSIGN_OR_RAISE(auto mapped, MembershipMaps(correlation, spine, item, false));
     right = std::move(mapped.right);
   }
-  if (keys.empty() &&
+  if (keys.empty() && !Traits(join.kind).single_match &&
       (!join.membership.has_value() || join.kind != JoinKind::kSemi || deferred_item != nullptr)) {
     // ADR 0023: as a LEFT JOIN without one does in ADR 0022, since the hash table and the
     // candidate pairs need a key (ADR 0040's decision 3).
@@ -1524,7 +1524,8 @@ bool CollectDomainColumns(const Expr& expr, const std::set<ColumnId>& outer_ids,
 // SQ9's second terminal. D has one row per complete binding. Without an equality anchor
 // the existing nested-loop join evaluates the correlation before emitting each passing pair.
 arrow::Result<Representatives> ScalarDomain(const Correlation& correlation, const Spine& spine,
-                                            Equivalences& equivalences, LogicalNodePtr& input) {
+                                            Equivalences& equivalences, LogicalNodePtr& input,
+                                            const LogicalNodePtr& single_build = nullptr) {
   const auto refuse = [&correlation] {
     return correlation.Refuse("with an outer column that has no inner equivalent");
   };
@@ -1591,6 +1592,18 @@ arrow::Result<Representatives> ScalarDomain(const Correlation& correlation, cons
       equivalences.kept.push_back(expr.get());
     }
     residual.clear();
+  }
+  if (single_build != nullptr) {
+    // The build already carries the scalar item. Check cardinality during the probe,
+    // once per distinct binding, before the join back repeats its value for outer rows.
+    ANTB1_CHECK(anchors.empty());
+    input = Make(JoinNode{.kind = JoinKind::kSingle,
+                          .left = Make(std::move(domain)),
+                          .right = single_build,
+                          .residual = std::move(residual),
+                          .build = BuildSide::kRight,
+                          .span = correlation.join.span});
+    return out;
   }
   // An empty inner build short-circuits the nested loop before it opens the binding domain.
   const BuildSide build =
@@ -1663,6 +1676,7 @@ arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation,
     const auto it = out.of.find(id);
     return it == out.of.end() ? id : it->second;
   };
+  const auto existing = equivalences.kept.size();
   for (const Equality& equality : equivalences.equalities) {
     if (substituted(equality.a) != substituted(equality.b) || out.null_equal.contains(equality.a) ||
         out.null_equal.contains(equality.b)) {
@@ -1675,6 +1689,11 @@ arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation,
     if (!out.used_links.contains(&link)) {
       equivalences.kept.push_back(link.expr);
     }
+  }
+  if (Traits(correlation.join.kind).single_match) {
+    // Surviving equality keys still decide which rows can reach a throwing residual.
+    std::ranges::rotate(equivalences.kept,
+                        equivalences.kept.begin() + Narrow<std::ptrdiff_t>(existing));
   }
   return out;
 }
@@ -1715,6 +1734,43 @@ arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlatio
                        .build = BuildSide::kRight,
                        .estimate = estimate,
                        .span = correlation.join.span});
+}
+
+ExprPtr SubstituteBindings(const ExprPtr& expr, const std::map<ColumnId, BoundColumn>& carried) {
+  return MapColumns(expr, [&carried](ColumnExpr column) {
+    if (const auto found = carried.find(column.id); found != carried.end()) {
+      column.id = found->second.id;
+    }
+    return column;
+  });
+}
+
+arrow::Result<LogicalNodePtr> FilterBindingRows(const Correlation& correlation, const Spine& spine,
+                                                const Representatives& representatives,
+                                                const Equivalences& equivalences,
+                                                const std::map<ColumnId, BoundColumn>& carried,
+                                                LogicalNodePtr right, bool& restricted) {
+  for (const Expr* expr : equivalences.kept) {
+    if (Traits(correlation.join.kind).single_match && !restricted && !SafeBeforeMembership(*expr)) {
+      ARROW_ASSIGN_OR_RAISE(
+          right, RestrictBindingInput(correlation, right, carried, representatives, equivalences));
+      restricted = true;
+    }
+    const ColumnId id{std::to_underlying(correlation.last_id) + 1};
+    correlation.last_id = id;
+    right = Make(
+        ComputeNode{.input = std::move(right),
+                    .exprs = {SubstituteBindings(std::make_shared<const Expr>(*expr), carried)},
+                    .ids = {id},
+                    .span = spine.computed->span});
+    right = Make(FilterNode{
+        .input = std::move(right),
+        .predicates = {Predicate{
+            .kind = Predicate::Kind::kIsTrue,
+            .column = BoundColumn{.id = id, .name = expr->name, .type = LogicalType::kBoolean}}},
+        .span = spine.filter->span});
+  }
+  return right;
 }
 
 // A HAVING conjunct as a BOOLEAN expression over the columns the filter read, as the binder builds
@@ -1920,7 +1976,17 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     });
   };
   // Bottom-up: the kept conjuncts over the terminal, then the steps.
-  if (!equivalences.kept.empty()) {
+  bool restricted = has_domain;
+  if (Traits(join.kind).single_match &&
+      std::ranges::any_of(equivalences.kept,
+                          [](const Expr* expr) { return !SafeBeforeMembership(*expr); })) {
+    std::map<ColumnId, BoundColumn> carried;
+    for (const auto& [outer, inner] : equivalent) {
+      carried.emplace(outer, described.at(inner));
+    }
+    ARROW_ASSIGN_OR_RAISE(right, FilterBindingRows(correlation, spine, representatives,
+                                                   equivalences, carried, right, restricted));
+  } else if (!equivalences.kept.empty()) {
     std::vector<ExprPtr> exprs;
     std::vector<ColumnId> ids;
     std::vector<Predicate> predicates;
@@ -1960,7 +2026,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
       }
       case Role::kStatic: {
         GroupAggregateNode node = grouped;  // the one static step
-        node.input = has_domain
+        node.input = restricted
                          ? std::move(right)
                          : RestrictToTheOuterKeys(std::move(right), join, equivalent,
                                                   representatives.null_equal, described, join_back,
@@ -2264,12 +2330,12 @@ LogicalNodePtr EmptyExistence(const Correlation& correlation) {
   return ExistenceValue(correlation, correlation.join.left, no);
 }
 
-// Normalize the operators above an EXISTS block's static aggregate. DISTINCT and
+// Normalize the operators above a block's static aggregate. DISTINCT and
 // ORDER BY cannot change its one row per binding, including after GROUP BY ().
 // A static aggregate has a row even over empty input. Its HAVING's IN/NOT IN must
 // therefore be decided after the empty-value join back, as a mark followed by a
 // HAVING condition, rather than filtering away an outer row before EXISTS reads it.
-LogicalNodePtr StaticExistenceInput(const LogicalNodePtr& node, ColumnId& last_id) {
+LogicalNodePtr StaticBlockInput(const LogicalNodePtr& node, ColumnId* having_mark_id = nullptr) {
   if (std::holds_alternative<AggregateNode>(*node)) {
     return node;
   }
@@ -2277,7 +2343,7 @@ LogicalNodePtr StaticExistenceInput(const LogicalNodePtr& node, ColumnId& last_i
   if (inputs.empty()) {
     return node;
   }
-  inputs.front() = StaticExistenceInput(inputs.front(), last_id);
+  inputs.front() = StaticBlockInput(inputs.front(), having_mark_id);
   LogicalNodePtr rewritten = WithInputs(*node, std::move(inputs));
   if (const auto* sort = std::get_if<SortNode>(rewritten.get())) {
     return sort->input;
@@ -2290,6 +2356,10 @@ LogicalNodePtr StaticExistenceInput(const LogicalNodePtr& node, ColumnId& last_i
                             .ids = group->key_ids,
                             .span = group->span});
   }
+  if (having_mark_id == nullptr) {
+    return rewritten;
+  }
+  ColumnId& last_id = *having_mark_id;
   const auto* join = std::get_if<JoinNode>(rewritten.get());
   if (join == nullptr || !Traits(join->kind).filters_left || !FreeVariables(*join->right).empty()) {
     return rewritten;
@@ -2344,7 +2414,7 @@ arrow::Result<Rewritten> StaticExistence(const Correlation& correlation,
   columns.push_back(BoundColumn{.index = -1, .name = column.name, .type = column.type});
   constants.emplace_back(Constant{.type = column.type, .value = Int128{1}});
   ids.push_back(present);
-  scalar.right = Make(ProjectNode{.input = StaticExistenceInput(input, last_id),
+  scalar.right = Make(ProjectNode{.input = StaticBlockInput(input, &last_id),
                                   .columns = std::move(columns),
                                   .constants = std::move(constants),
                                   .ids = std::move(ids),
@@ -2430,27 +2500,8 @@ arrow::Result<Rewritten> PartitionedBlock(const Correlation& correlation, const 
     }
     carried.emplace(outer, found->second);
   }
-  const auto substitute = [&carried](const ExprPtr& expr) {
-    return MapColumns(expr, [&carried](ColumnExpr column) {
-      if (const auto found = carried.find(column.id); found != carried.end()) {
-        column.id = found->second.id;
-      }
-      return column;
-    });
-  };
-  for (const Expr* expr : equivalences.kept) {
-    const ColumnId id = fresh();
-    right = Make(ComputeNode{.input = std::move(right),
-                             .exprs = {substitute(std::make_shared<const Expr>(*expr))},
-                             .ids = {id},
-                             .span = spine.computed->span});
-    right = Make(FilterNode{
-        .input = std::move(right),
-        .predicates = {Predicate{
-            .kind = Predicate::Kind::kIsTrue,
-            .column = BoundColumn{.id = id, .name = expr->name, .type = LogicalType::kBoolean}}},
-        .span = spine.filter->span});
-  }
+  ARROW_ASSIGN_OR_RAISE(right, FilterBindingRows(correlation, spine, representatives, equivalences,
+                                                 carried, right, restricted));
   const auto group_keys = [&](auto& node) {
     for (auto& [outer, column] : carried) {
       const auto at = std::ranges::find(node.keys, column.id, &BoundColumn::id);
@@ -2510,7 +2561,7 @@ arrow::Result<Rewritten> PartitionedBlock(const Correlation& correlation, const 
           }
           out.input = std::move(right);
           for (ExprPtr& expr : out.exprs) {
-            expr = substitute(expr);
+            expr = SubstituteBindings(expr, carried);
           }
           right = Make(std::move(out));
         }
@@ -2843,18 +2894,48 @@ arrow::Result<Rewritten> SingleJoin(const Correlation& correlation) {
                           [](const Step& step) { return step.role == Role::kStatic; })) {
     auto value = correlation;
     value.mode = Mode::kValue;
-    if (const auto aggregate = Descend(value.mode, input, &declined, value.outer)) {
+    const auto normalized = StaticBlockInput(input);
+    if (const auto aggregate = Descend(value.mode, normalized, &declined, value.outer)) {
       return ValueJoin(value, *aggregate);
     }
     return correlation.RefuseShape();
   }
-  ARROW_ASSIGN_OR_RAISE(const auto conjuncts, ConjunctsOf(correlation, *spine));
-  if (PlainScalarMaps(correlation, *spine) &&
-      std::ranges::any_of(conjuncts, [&](const ExprPtr* expr) {
-        return AsKey(**expr, correlation.outer).has_value();
-      })) {
+  if (PlainScalarMaps(correlation, *spine)) {
     ARROW_ASSIGN_OR_RAISE(auto node, LiftJoin(correlation, *spine));
-    return Rewritten{.node = node, .right = std::get<JoinNode>(*node).right};
+    const auto& single = std::get<JoinNode>(*node);
+    // A LIMIT can stop between input batches. A filter or join above the scalar may
+    // also move below it. Only check bindings eagerly when every outer row is consumed.
+    const bool all_bindings = std::ranges::all_of(correlation.above, [](const Ancestor& step) {
+      const auto& ancestor = *step.node;
+      return std::holds_alternative<ProjectNode>(ancestor) ||
+             std::holds_alternative<ComputeNode>(ancestor) ||
+             std::holds_alternative<SortNode>(ancestor) ||
+             std::holds_alternative<AggregateNode>(ancestor) ||
+             std::holds_alternative<GroupAggregateNode>(ancestor) ||
+             std::holds_alternative<GroupingSetsNode>(ancestor);
+    });
+    if (!single.keys.empty() || EstimateRows(*single.right) == 0 || !all_bindings) {
+      return Rewritten{.node = node, .right = single.right};
+    }
+    LogicalNodePtr values = spine->below;
+    Equivalences equivalences;
+    ARROW_ASSIGN_OR_RAISE(const auto bindings,
+                          ScalarDomain(correlation, *spine, equivalences, values, single.right));
+    std::vector<JoinKey> keys;
+    keys.reserve(bindings.of.size());
+    for (const auto& [outer, binding] : bindings.of) {
+      keys.push_back(JoinKey{.left = equivalences.described.at(outer),
+                             .right = equivalences.described.at(binding),
+                             .null_equal = true});
+    }
+    return Rewritten{.node = Make(JoinNode{.kind = JoinKind::kLeft,
+                                           .left = single.left,
+                                           .right = values,
+                                           .keys = std::move(keys),
+                                           .build = BuildSide::kRight,
+                                           .estimate = single.estimate,
+                                           .span = single.span}),
+                     .right = values};
   }
   return PartitionedBlock(correlation, *spine);
 }

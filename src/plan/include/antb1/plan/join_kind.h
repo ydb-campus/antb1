@@ -94,7 +94,11 @@ constexpr JoinKindTraits Traits(JoinKind kind) {
     case JoinKind::kNullAwareAnti:
       return {.filters_left = true, .null_aware = true};
     case JoinKind::kSingle:
-      return {.outputs_right = true, .pads_right = true, .residuals = true, .single_match = true};
+      return {.outputs_right = true,
+              .pads_right = true,
+              .nested_loop = true,
+              .residuals = true,
+              .single_match = true};
     case JoinKind::kOneRow:
       return {.outputs_right = true, .one_row = true};
     case JoinKind::kFull:

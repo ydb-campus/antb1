@@ -125,3 +125,100 @@ INTEGER	SMALLINT	SMALLINT
 6	1	2
 7	2	3
 8	3	4
+
+# The mixed residual overflows for inner id 1, outside the only outer binding.
+query II nosort
+SELECT o.id, (SELECT i.id+1 FROM edge i WHERE i.id=o.id AND i.i32+1 <= o.id)
+FROM edge o WHERE o.id=2
+----
+INTEGER	INTEGER
+2	3
+
+query II nosort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE i.id=o.id AND i.i32+1 <= o.id GROUP BY i.id)
+FROM edge o WHERE o.id=2
+----
+INTEGER	BIGINT
+2	1
+
+statement error Overflow in addition
+SELECT (SELECT COUNT(*) FROM edge i WHERE i.id=o.id AND i.i32+1 <= o.id GROUP BY i.id)
+FROM edge o WHERE o.id=1
+
+# DISTINCT keeps the static group's empty value and HAVING still decides whether its row exists.
+query IIII nosort
+SELECT o.id, (SELECT DISTINCT COUNT(*) FROM edge i WHERE i.id=o.id GROUP BY ()),
+       (SELECT DISTINCT COUNT(*) FROM edge i WHERE i.id=o.id AND i.id<0 GROUP BY ()),
+       (SELECT DISTINCT COUNT(*) FROM edge i WHERE i.id=o.id GROUP BY () HAVING COUNT(*)>1)
+FROM edge o WHERE o.id=2
+----
+INTEGER	BIGINT	BIGINT	BIGINT
+2	1	0	NULL
+
+# D39: DuckDB evaluates the selected multiplication for an unprobed key.
+onlyif antb1
+query I nosort
+SELECT (SELECT i.i16*2 FROM edge i WHERE i.id=o.id) FROM edge o WHERE o.id=2
+----
+SMALLINT
+0
+
+onlyif duckdb
+statement error Overflow in multiplication
+SELECT (SELECT i.i16*2 FROM edge i WHERE i.id=o.id) FROM edge o WHERE o.id=2
+
+statement error Overflow in multiplication
+SELECT (SELECT i.i16*2 FROM edge i WHERE i.id=o.id) FROM edge o WHERE o.id=0
+
+# Keyless scalar probes: zero, one, and multiple matches. NULL never passes the comparison.
+query II nosort
+SELECT z.zn_id, (SELECT c.ct_id FROM cities c WHERE c.ct_id < z.zn_city)
+FROM zones z WHERE z.zn_city <= 2 OR z.zn_city IS NULL ORDER BY z.zn_id
+----
+INTEGER	SMALLINT
+1	NULL
+2	1
+6	NULL
+7	1
+11	NULL
+12	1
+16	NULL
+17	1
+21	NULL
+22	1
+26	NULL
+27	1
+31	NULL
+32	1
+36	NULL
+37	1
+38	NULL
+
+statement error More than one row returned by a subquery used as an expression
+SELECT (SELECT c.ct_id FROM cities c WHERE c.ct_id < z.zn_city) FROM zones z
+
+# Remaining equality keys must reject a row before the mixed residual can overflow.
+query III nosort
+SELECT o.id, (SELECT i.id+1 FROM edge i WHERE i.id=o.id AND i.i32=o.id AND i.i32+1<=o.id),
+       (SELECT COUNT(*) FROM edge i WHERE i.id=o.id AND i.i32=o.id AND i.i32+1<=o.id GROUP BY i.id)
+FROM edge o WHERE o.id=1
+----
+INTEGER	INTEGER	BIGINT
+1	NULL	NULL
+
+# The single static group has the same guarded WHERE under DISTINCT and ORDER BY.
+query III nosort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE i.id=o.id AND i.i32+1<=o.id GROUP BY () ORDER BY 1),
+       (SELECT DISTINCT COUNT(*) FROM edge i WHERE i.id=o.id AND i.i32+1<=o.id GROUP BY () ORDER BY 1)
+FROM edge o WHERE o.id=2
+----
+INTEGER	BIGINT	BIGINT
+2	1	1
+
+# LIMIT stops before a later UNION ALL arm whose binding has two scalar matches.
+query II nosort
+SELECT o.k, (SELECT i.id FROM edge i WHERE i.id<o.k) AS v
+FROM (SELECT 1 AS k FROM edge UNION ALL SELECT 2 AS k FROM edge) o LIMIT 1
+----
+INTEGER	INTEGER
+1	0

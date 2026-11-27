@@ -3060,6 +3060,18 @@ TEST(BinderTest, GroupingCallsAreColumnsOfTheNode) {
 // A block with a GROUP BY in grouping-set syntax is a grouped block wherever the binder asks
 // (HasGroupBy): a correlated EXISTS or scalar subquery over one is refused as over a plain GROUP
 // BY, with the same message at the same span, and an uncorrelated one is answered alike.
+TEST(BinderTest, KeylessScalarChecksCardinalityWhileProbing) {
+  const auto bound =
+      BindSql("SELECT (SELECT u.i16 FROM u WHERE u.i16 < t.i16) FROM t", MakeCatalog());
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto optimized = Optimize(*bound);
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  const auto plan = Explain(*optimized);
+  EXPECT_NE(plan.find("Join SINGLE"), std::string::npos) << plan;
+  EXPECT_NE(plan.find("GroupAggregate"), std::string::npos) << plan;
+  EXPECT_EQ(plan.find("Join INNER"), std::string::npos) << plan;
+}
+
 TEST(BinderTest, GroupingSetsMakeAGroupedBlock) {
   const Catalog catalog = MakeCatalog();
   // SQ8b answers plain grouping; a ROLLUP's empty set remains SQ16. Scalar grouped
