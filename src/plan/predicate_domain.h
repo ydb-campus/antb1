@@ -5,9 +5,16 @@
 #include <optional>
 #include <span>
 
+#include "antb1/common/narrow.h"
 #include "antb1/plan/logical_plan.h"
 
 namespace antb1::plan {
+
+// A physical producer reads by position, even if a hand-built plan attaches a different id.
+inline bool ReadsSlot(const BoundColumn& column, std::span<const ColumnId> ids) {
+  const auto slot = TryNarrow<std::size_t>(column.index);
+  return slot && *slot < ids.size() && column.id != kNoColumnId && ids[*slot] == column.id;
+}
 
 struct PredicateDomainKey {
   ColumnId id = kNoColumnId;

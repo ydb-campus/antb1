@@ -764,6 +764,162 @@ LogicalNodePtr JoinedOnFirst(const LogicalNodePtr& left, const LogicalNodePtr& r
       .span = {}});
 }
 
+TEST(SharedSubPlansTest, MapsOnlyAliasesOfAGroupingKeyToTheUnderlyingScan) {
+  const auto left = Grouped("t", 10);
+  const auto right = Grouped("t", 20);
+  const SharedSubPlan shared{.members = {left, right}, .columns = {{0, 1}, {0, 1}}};
+  enum class Alias { kGroupKey, kLiteral, kComputed, kStaleFilter, kStaleProjection };
+  // Both projects put the group count first and the filtered output second.
+  const auto reader = [](const LogicalNodePtr& group, std::uint32_t first, int value, Alias alias) {
+    const auto ids = OutputIds(*group);
+    const Constant constant{.type = LogicalType::kBigInt, .value = Int128{value}};
+    ProjectNode project{.input = group,
+                        .columns = {{.index = 1, .id = ids.at(1)}, {.index = 0, .id = ids.at(0)}},
+                        .ids = {ColumnId{first}, ColumnId{first + 1}},
+                        .span = {}};
+    if (alias == Alias::kLiteral) {
+      project.constants = {std::nullopt, constant};
+    } else if (alias == Alias::kStaleProjection) {
+      project.columns.back().index = 1;  // physically reads the count, but named the key
+    }
+    BoundColumn column{.index = alias == Alias::kStaleFilter ? 0 : 1, .id = project.ids.back()};
+    auto input = Node(std::move(project));
+    if (alias == Alias::kComputed) {
+      // This id is introduced above the project; it cannot refer to a slot below it.
+      column = BoundColumn{.index = 2, .id = ColumnId{first + 2}};
+      const auto expr = std::make_shared<const Expr>(
+          Expr{.node = ConstantExpr{.value = constant}, .type = constant.type});
+      input = Node(ComputeNode{.input = input, .exprs = {expr}, .ids = {column.id}, .span = {}});
+    }
+    const Predicate equality{.column = column, .constant = constant, .span = {}};
+    return Node(FilterNode{.input = input, .predicates = {equality}, .span = {}});
+  };
+  for (const Alias alias : {Alias::kGroupKey, Alias::kLiteral, Alias::kComputed,
+                            Alias::kStaleFilter, Alias::kStaleProjection}) {
+    const auto root =
+        JoinedOnFirst(reader(left, 30, 4, Alias::kGroupKey), reader(right, 40, 9, alias));
+    const auto producer = SharedConsumerFilters({.root = root, .output = {}}).Producer(shared);
+    if (alias != Alias::kGroupKey) {
+      EXPECT_EQ(producer, left);
+      continue;
+    }
+    const auto& group = std::get<GroupAggregateNode>(*producer);
+    const auto* filter = std::get_if<FilterNode>(group.input.get());
+    ASSERT_NE(filter, nullptr);
+    ASSERT_TRUE(std::holds_alternative<ScanNode>(*filter->input));
+    ASSERT_EQ(filter->predicates.size(), 1U);
+    const auto& predicate = filter->predicates.front();
+    ASSERT_EQ(predicate.kind, Predicate::Kind::kIn);
+    EXPECT_EQ(predicate.column.value_or(BoundColumn{}).id, group.keys.front().id);
+    ASSERT_EQ(predicate.values.size(), 2U);
+    EXPECT_EQ(std::get<Int128>(predicate.values[0].value), 4);
+    EXPECT_EQ(std::get<Int128>(predicate.values[1].value), 9);
+  }
+}
+
+TEST(SharedSubPlansTest, PreservesTheSlotOfAProjectedKeyInsideTheProducer) {
+  const auto member = [](std::uint32_t first, bool stale) {
+    const auto group = Grouped("t", first);
+    return Node(ProjectNode{.input = group,
+                            .columns = {{.index = stale ? 1 : 0, .id = OutputIds(*group).front()}},
+                            .ids = {ColumnId{first + 5}},
+                            .span = {}});
+  };
+  const auto reader = [](const LogicalNodePtr& project, int value) {
+    const Predicate p{.column = BoundColumn{.index = 0, .id = OutputIds(*project).front()},
+                      .constant = {.type = LogicalType::kBigInt, .value = Int128{value}},
+                      .span = {}};
+    return Node(FilterNode{.input = project, .predicates = {p}, .span = {}});
+  };
+  for (const bool stale : {false, true}) {
+    const auto left = member(10, stale);
+    const auto right = member(20, stale);
+    const SharedSubPlan shared{.members = {left, right}, .columns = {{0}, {0}}};
+    const auto root = JoinedOnFirst(reader(left, 3), reader(right, 7));
+    EXPECT_EQ(SharedConsumerFilters({.root = root, .output = {}}).Producer(shared) == left, stale);
+  }
+}
+
+TEST(SharedSubPlansTest, KeepsLowerReaderRestrictionsOnlyAfterTheirSelectionWasMaterialized) {
+  const auto left = Grouped("t", 10);
+  const auto right = Grouped("t", 20);
+  const SharedSubPlan shared{.members = {left, right}, .columns = {{0, 1}, {0, 1}}};
+  const auto filter_key = [](const LogicalNodePtr& input, int value) {
+    const Predicate p{.column = BoundColumn{.id = OutputIds(*input).front()},
+                      .constant = {.type = LogicalType::kBigInt, .value = Int128{value}},
+                      .span = {}};
+    return Node(FilterNode{.input = input, .predicates = {p}, .span = {}});
+  };
+  const auto a = filter_key(left, 4);
+  const Constant zero{.type = LogicalType::kDouble, .value = 0.0};
+  const auto literal =
+      std::make_shared<const Expr>(Expr{.node = ConstantExpr{.value = zero}, .type = zero.type});
+  const auto tagged =
+      Node(ComputeNode{.input = right, .exprs = {literal}, .ids = {ColumnId{30}}, .span = {}});
+  const auto selected = filter_key(tagged, 9);
+  const auto ids = OutputIds(*selected);
+  const auto project = Node(ProjectNode{
+      .input = selected,
+      .columns = {{.index = 1, .id = ids[1]}, {.index = 2, .id = ids[2], .type = zero.type}},
+      .ids = {ColumnId{40}, ColumnId{41}},
+      .span = {}});
+  const auto compute =
+      Node(ComputeNode{.input = selected, .exprs = {literal}, .ids = {ColumnId{42}}, .span = {}});
+  for (const auto& middle : {selected, project, compute}) {
+    const int count = middle == project ? 0 : 1;
+    const auto outputs = OutputIds(*middle);
+    const Predicate mixed{
+        .kind = Predicate::Kind::kCompareColumns,
+        .column = BoundColumn{.index = count, .id = outputs.at(Narrow<std::size_t>(count))},
+        .other = BoundColumn{.index = count + 1,
+                             .id = outputs.at(Narrow<std::size_t>(count + 1)),
+                             .type = zero.type},
+        .op = CompareOp::kGt,
+        .span = {}};
+    const auto b = Node(FilterNode{.input = middle, .predicates = {mixed}, .span = {}});
+    const auto root = JoinedOnFirst(a, b);
+    const auto producer = SharedConsumerFilters({.root = root, .output = {}}).Producer(shared);
+    EXPECT_EQ(producer == left, middle == selected);
+  }
+}
+
+TEST(SharedSubPlansTest, EveryUseOfTheGroupedOutputMustHaveASafeKeyRestriction) {
+  const auto left = Grouped("t", 10);
+  const auto right = Grouped("t", 20);
+  const SharedSubPlan shared{.members = {left, right}, .columns = {{0, 1}, {0, 1}}};
+  const auto key_filter = [](const LogicalNodePtr& group, int value) {
+    return Predicate{.column = BoundColumn{.id = OutputIds(*group).front()},
+                     .constant = {.type = LogicalType::kBigInt, .value = Int128{value}},
+                     .span = {}};
+  };
+  const auto a = Node(FilterNode{.input = left, .predicates = {key_filter(left, 4)}, .span = {}});
+  const auto b = Node(FilterNode{.input = right, .predicates = {key_filter(right, 9)}, .span = {}});
+  // The same grouped node also feeds an unfiltered branch of this plan DAG.
+  const auto with_third_reader = JoinedOnFirst(a, JoinedOnFirst(b, right));
+  EXPECT_EQ(SharedConsumerFilters({.root = with_third_reader, .output = {}}).Producer(shared),
+            left);
+
+  // A range between columns of different types has no same-type comparison proof.
+  // Both conjuncts evaluate on the entire batch regardless of their written order.
+  const Constant limit{.type = LogicalType::kDouble, .value = 0.5};
+  const auto expr =
+      std::make_shared<const Expr>(Expr{.node = ConstantExpr{.value = limit}, .type = limit.type});
+  const auto computed =
+      Node(ComputeNode{.input = right, .exprs = {expr}, .ids = {ColumnId{30}}, .span = {}});
+  const Predicate mixed{.kind = Predicate::Kind::kCompareColumns,
+                        .column = BoundColumn{.index = 1, .id = OutputIds(*right).back()},
+                        .other = BoundColumn{.index = 2, .id = ColumnId{30}, .type = limit.type},
+                        .op = CompareOp::kGt,
+                        .span = {}};
+  std::vector predicates{key_filter(right, 9), mixed};
+  for (int i = 0; i < 2; ++i) {
+    const auto reader = Node(FilterNode{.input = computed, .predicates = predicates, .span = {}});
+    const auto root = JoinedOnFirst(a, reader);
+    EXPECT_EQ(SharedConsumerFilters({.root = root, .output = {}}).Producer(shared), left);
+    std::ranges::reverse(predicates);
+  }
+}
+
 TEST_F(SharedSubPlansFilteredGroupsTest, ChecksRawFieldTypeAndPredicatePositionBeforeWidening) {
   const auto query = BandCount("p.band=1") + " UNION ALL " + BandCount("p.band=2");
   const auto groups = Combined(query);

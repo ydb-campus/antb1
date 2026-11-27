@@ -250,6 +250,27 @@ TEST_F(SharedBuildsTest, UnionsEveryReadersKeyValuesBeforeMaterializing) {
   }
 }
 
+TEST_F(SharedBuildsTest, KeepsReaderKeyRestrictionsAlongsideLikeAndNotLike) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("tag", arrow::binary())});
+  const auto batch = arrow::RecordBatch::Make(
+      schema, 5,
+      {testing::Int64s({1, 2, 3, 4, 5}),
+       testing::Strings({"tag\xff", "other", "tagx", std::nullopt, "more"})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+  table->set_claimed_rows(20'000'000);
+  const auto run = Execute(
+      "WITH labels AS (SELECT k, MAX(tag) AS label, COUNT(*) AS n FROM t GROUP BY k) "
+      "SELECT a.k,b.k FROM labels a JOIN labels b ON a.n=b.n "
+      "WHERE a.k IN (1,2) AND a.label LIKE 'tag_' AND b.k IN (2,3) AND b.label NOT LIKE 'tag_'",
+      table);
+  ASSERT_TRUE(run.ok()) << run.status();
+  EXPECT_EQ(run->shared_rows, 3);
+  ASSERT_EQ(run->rows->num_rows(), 1);
+  EXPECT_TRUE(run->rows->column(0)->Equals(arrow::ChunkedArray(testing::Int64s({1}))));
+  EXPECT_TRUE(run->rows->column(1)->Equals(arrow::ChunkedArray(testing::Int64s({2}))));
+}
+
 TEST_F(SharedBuildsTest, AppliesOnlyShortCombinedListsBeforeGrouping) {
   const auto table = KeyedTable();
   table->set_claimed_rows(20'000'000);
@@ -268,6 +289,150 @@ TEST_F(SharedBuildsTest, AppliesOnlyShortCombinedListsBeforeGrouping) {
     ASSERT_TRUE(run.ok()) << run.status();
     EXPECT_EQ(run->shared_rows, shared_rows);
   }
+}
+
+TEST_F(SharedBuildsTest, CollectsReaderKeysThroughAComputedScoreAndAPostAggregateFilter) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto batch =
+      arrow::RecordBatch::Make(schema, 8,
+                               {testing::Int64s({1, 1, 3, 3, 7, 7, std::nullopt, std::nullopt}),
+                                testing::Int64s({1, 3, 8, std::nullopt, 6, 6, -2, 0})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+  const std::string query =
+      "WITH scores AS (SELECT k AS band, COUNT(*) AS n, "
+      "CASE WHEN AVG(v)>0e0 THEN AVG(v)*2e0 ELSE 0e0 END AS points FROM t GROUP BY k "
+      "HAVING STDDEV_POP(v)>=0e0), "
+      "published AS (SELECT points AS score, n AS samples, band AS channel FROM scores) "
+      "SELECT a.channel,b.channel,a.score,b.score FROM published a JOIN published b "
+      "ON a.samples=b.samples WHERE a.channel=1 ";
+  struct Case {
+    std::string_view right;
+    int64_t shared_groups;
+    int64_t pairs;
+  };
+  for (const Case test : {Case{.right = "AND b.channel=3", .shared_groups = 2, .pairs = 1},
+                          Case{.right = "AND b.channel>1", .shared_groups = 4, .pairs = 2},
+                          Case{.right = "AND b.channel IS NULL", .shared_groups = 4, .pairs = 1},
+                          Case{.right = "", .shared_groups = 4, .pairs = 4}}) {
+    SCOPED_TRACE(test.right);
+    const auto sql = query + std::string(test.right) + " ORDER BY a.channel,b.channel";
+    table->set_claimed_rows(20'000'000);
+    const auto shared = Execute(sql, table);
+    ASSERT_TRUE(shared.ok()) << shared.status();
+    EXPECT_EQ(shared->shared_rows, test.shared_groups);
+    EXPECT_EQ(shared->shared_fallbacks, 0);
+    table->set_claimed_rows(batch->num_rows());
+    const auto control = Execute(sql, table);
+    ASSERT_TRUE(control.ok()) << control.status();
+    EXPECT_EQ(control->shared_rows, std::nullopt);
+    EXPECT_EQ(control->rows->num_rows(), test.pairs);
+    EXPECT_TRUE(shared->rows->Equals(*control->rows));
+  }
+}
+
+std::string ReadTwoScores(std::string_view score) {
+  return std::format(
+      "WITH scores AS (SELECT k, COUNT(*) AS n, {} AS score FROM t GROUP BY k "
+      "HAVING STDDEV_POP(v)>=0e0) SELECT a.score,b.score FROM scores a JOIN scores b "
+      "ON a.n=b.n WHERE a.k=1 AND b.k=2",
+      score);
+}
+
+TEST_F(SharedBuildsTest, WidensBothCoalesceFallbacksForASelectedNullAverage) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64()),
+                     arrow::field("reserve", arrow::decimal128(38, 2))});
+  const auto batch =
+      arrow::RecordBatch::Make(schema, 6,
+                               {testing::Int64s({1, 1, 2, 2, 3, 3}),
+                                testing::Int64s({std::nullopt, std::nullopt, 2, 5, 6, 8}),
+                                testing::Decimals(38, 2, {"325", "425", "900", "900", "0", "0"})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+  table->set_claimed_rows(20'000'000);
+  // The HAVING input is present even in the selected group whose average is NULL.
+  const auto shared = Execute(
+      "WITH g AS (SELECT k, COUNT(*) AS n, COALESCE(AVG(v),MAX(k)) AS whole, "
+      "COALESCE(AVG(v),MAX(reserve)) AS scaled FROM t GROUP BY k HAVING STDDEV_POP(k)>=0e0) "
+      "SELECT a.whole,a.scaled,b.whole,b.scaled FROM g a JOIN g b ON a.n=b.n "
+      "WHERE a.k=1 AND b.k=2",
+      table);
+  ASSERT_TRUE(shared.ok()) << shared.status();
+  EXPECT_EQ(shared->shared_rows, 2);
+  EXPECT_EQ(shared->shared_fallbacks, 0);
+  ASSERT_EQ(shared->rows->num_rows(), 1);
+  ASSERT_EQ(shared->rows->num_columns(), 4);
+  const auto value = [&](int col) { return shared->rows->column(col)->GetScalar(0).ValueOrDie(); };
+  EXPECT_TRUE(value(0)->Equals(arrow::DoubleScalar(1.0)));
+  EXPECT_TRUE(value(1)->Equals(arrow::DoubleScalar(4.25)));
+  EXPECT_TRUE(value(2)->Equals(arrow::DoubleScalar(3.5)));
+  EXPECT_TRUE(value(3)->Equals(arrow::DoubleScalar(3.5)));
+}
+
+TEST_F(SharedBuildsTest, PreservesSelectedValuesThroughNullableAndWidenedCaseArms) {
+  const auto table = KeyedTable();
+  struct Case {
+    std::string_view score;
+    int64_t groups = 2;
+  };
+  for (const auto& [score, groups] :
+       {Case{.score = "CASE WHEN MAX(v) IS NULL THEN 17 ELSE MAX(v) END"},
+        // The binder represents IS NOT NULL in an expression as a boolean NOT around IS NULL.
+        // General boolean expressions are outside the sharing rule's skip-safety proof.
+        Case{.score = "CASE WHEN MAX(v) IS NOT NULL THEN COUNT(*) END", .groups = 7},
+        Case{.score = "CASE WHEN MAX(v) IN (2,3) THEN COUNT(*) ELSE NULL END"},
+        Case{.score = "CASE WHEN MAX(v) NOT IN (1,2) THEN MAX(v) END"},
+        Case{.score = "CASE WHEN MAX(v)>MIN(v) THEN MAX(v) END"},
+        Case{.score = "CASE WHEN MAX(v) IS DISTINCT FROM MIN(v) THEN 4 ELSE MAX(k) END"},
+        Case{.score = "CASE WHEN MAX(v) IS NOT DISTINCT FROM MIN(v) THEN 4 ELSE MAX(k) END"}}) {
+    SCOPED_TRACE(score);
+    const auto sql = ReadTwoScores(score);
+    table->set_claimed_rows(60);
+    const auto control = Execute(sql, table);
+    ASSERT_TRUE(control.ok()) << control.status();
+    ASSERT_EQ(control->rows->num_rows(), 1);
+    table->set_claimed_rows(20'000'000);
+    const auto shared = Execute(sql, table);
+    ASSERT_TRUE(shared.ok()) << shared.status();
+    EXPECT_EQ(shared->shared_rows, groups);
+    EXPECT_TRUE(shared->rows->Equals(*control->rows));
+  }
+}
+
+TEST_F(SharedBuildsTest, AReaderKeyCannotHideACheckedCastInAnUnusedGroup) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(
+      schema, 3, {testing::Int64s({1, 2, 3}), testing::Int64s({5, 9, 999'999'999})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+  // The first conversion is explicit. The second comes from the CASE result type.
+  for (const std::string_view score :
+       {"CASE WHEN AVG(v)>0e0 THEN CAST(MAX(v) AS SMALLINT) ELSE 0 END",
+        "CASE WHEN CAST(MAX(v) AS SMALLINT)>0 THEN 1 ELSE 0 END",
+        "CASE WHEN k=3 THEN MAX(v) ELSE CAST(0 AS DECIMAL(38,30)) END"}) {
+    SCOPED_TRACE(score);
+    const auto query = ReadTwoScores(score);
+    table->set_claimed_rows(3);
+    const auto control = Execute(query, table);
+    ASSERT_FALSE(control.ok());
+    ASSERT_TRUE(control.status().message().contains("cast")) << control.status();
+    table->set_claimed_rows(20'000'000);
+    const auto shared = Execute(query, table);
+    ASSERT_FALSE(shared.ok());
+    EXPECT_EQ(shared.status(), control.status());
+  }
+}
+
+TEST_F(SharedBuildsTest, ReaderKeysAboveAnOrderedLimitCannotChangeItsFirstGroups) {
+  const auto table = KeyedTable();  // Keys 0 through 6.
+  table->set_claimed_rows(20'000'000);
+  const auto shared = Execute(
+      "WITH first_two AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k ORDER BY k LIMIT 2) "
+      "SELECT a.n,b.n FROM first_two a JOIN first_two b ON a.k=b.k WHERE a.k=5 AND b.k=5",
+      table);
+  ASSERT_TRUE(shared.ok()) << shared.status();
+  EXPECT_EQ(shared->shared_rows, 7);
+  EXPECT_EQ(shared->rows->num_rows(), 0);
 }
 
 TEST_F(SharedBuildsTest, RejectsIncompleteUnionColumnMapsBeforeSharing) {
@@ -557,6 +722,44 @@ plan::LogicalNodePtr Grouped(const std::shared_ptr<MemoryTable>& table, std::uin
                         .columns = {Bigint(Id(first + 2)), Bigint(Id(first + 3))},
                         .constants = {},
                         .ids = {Id(first + 4), Id(first + 5)}});
+}
+
+TEST_F(SharedBuildsTest, AReaderAliasThatReadsTheCountKeepsEveryMatchingGroup) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto keys = testing::Int64s({1, 1, 2, 3});
+  auto table = std::make_shared<MemoryTable>(
+      schema, arrow::RecordBatchVector{arrow::RecordBatch::Make(schema, 4, {keys, keys})}, true);
+  const auto group = [&](std::uint32_t first) {
+    return std::get<plan::ProjectNode>(*Grouped(table, first)).input;
+  };
+  const auto select_one = [](plan::LogicalNodePtr input, plan::ColumnId id) {
+    return Node(plan::FilterNode{
+        .input = std::move(input),
+        .predicates = {{.column = Bigint(id),
+                        .constant = {.type = plan::LogicalType::kBigInt, .value = Int128{1}},
+                        .span = {}}}});
+  };
+  auto alias = Bigint(Id(12));  // The ID names k, but the physical slot reads COUNT(*).
+  alias.index = 1;
+  const auto projected =
+      Node(plan::ProjectNode{.input = group(10), .columns = {alias}, .ids = {Id(14)}});
+  const auto join = Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                        .left = select_one(projected, Id(14)),
+                                        .right = select_one(group(20), Id(22)),
+                                        .keys = {{.left = Bigint(Id(14)), .right = Bigint(Id(22))}},
+                                        .build = plan::BuildSide::kRight});
+  const auto root =
+      Node(plan::ProjectNode{.input = join, .columns = {Bigint(Id(14))}, .ids = {Id(30)}});
+  const plan::LogicalPlan query{.root = root, .output = {{.name = "alias", .id = Id(30)}}};
+  const auto control = ExecutePlan(query, table);
+  ASSERT_TRUE(control.ok()) << control.status();
+  ASSERT_EQ(control->rows->num_rows(), 2);  // Keys 2 and 3 each occur once.
+  table->set_claimed_rows(20'000'000);
+  const auto shared = ExecutePlan(query, table);
+  ASSERT_TRUE(shared.ok()) << shared.status();
+  EXPECT_EQ(shared->shared_rows, 3);
+  EXPECT_TRUE(shared->rows->Equals(*control->rows));
 }
 
 // The union of `a` and `b`, its two columns #first and #first + 1.

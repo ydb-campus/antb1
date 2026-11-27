@@ -43,16 +43,18 @@ struct SharedSubPlan {
   std::vector<Predicate> reader_predicates;
 };
 
-// Direct consumer filters, indexed once when the physical planner admits its first shared
-// producer. A member used without a filter (or via multiple edges) supplies its full output.
+// Index parents once so a shared producer can find restrictions common to all its readers.
+// A consumer with no restriction on a key needs its full domain.
 class SharedConsumerFilters {
  public:
   explicit SharedConsumerFilters(const LogicalPlan& plan);
   [[nodiscard]] LogicalNodePtr Producer(const SharedSubPlan& group) const;
 
  private:
+  static bool HasBoundedDomain(const Predicate& predicate);
+  std::vector<Predicate> ReaderPredicates(const LogicalNode* member) const;
   static LogicalNodePtr PushGroupKey(const LogicalNodePtr& producer, const Predicate& predicate);
-  std::unordered_map<const LogicalNode*, const FilterNode*> parents_;
+  std::unordered_map<const LogicalNode*, const LogicalNode*> parents_;
 };
 
 // The maximal groups of `plan`, in the order a walk from the root meets them; empty when nothing
