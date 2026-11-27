@@ -1208,13 +1208,11 @@ arrow::Status HashJoinOperator::Pull() {
       ARROW_RETURN_NOT_OK(table_->Find(keys_, in.selection.get(), ctx_.pool, matches_));
     }
   }
-  if (plan::Traits(kind_).single_match && residual_.empty() && !table_->unique()) {
-    // Find gives unselected rows empty ranges. Duplicates of unprobed keys never reach this check.
-    if (std::ranges::any_of(
-            std::span(matches_).first(static_cast<std::size_t>(in.data->num_rows())),
-            [](const JoinMatches& m) { return m.end - m.begin > 1; })) {
-      return ScalarCardinalityError();
-    }
+  // Find gives unselected rows empty ranges. Duplicates of unprobed keys never reach this check.
+  if (plan::Traits(kind_).single_match && residual_.empty() && !table_->unique() &&
+      std::ranges::any_of(std::span(matches_).first(static_cast<std::size_t>(in.data->num_rows())),
+                          [](const JoinMatches& m) { return m.end - m.begin > 1; })) {
+    return ScalarCardinalityError();
   }
   batch_ = std::move(in);
   row_ = 0;
