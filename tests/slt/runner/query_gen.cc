@@ -1293,9 +1293,8 @@ struct Binding {
 
 // One correlated subquery this query could write (ADR 0023's T3): an equality between a column of
 // a FROM binding and a column of a table the block reads, which is the key the subquery correlates
-// through. Both ends have the same type, not merely the same ValueKind: ADR 0023's Path 2 feeds an
-// equivalence class only from an equality of two columns of one type, so a widening pair would
-// generate a shape U3 cannot answer and that would therefore never be compared.
+// through. Both ends have the same SQL type. SQ10 may choose a different-width inner column
+// for an ungrouped scalar aggregate; shapes that depend on the ref's statistics keep its key.
 struct CorrelatedCandidate {
   const Binding* outer = nullptr;        // the FROM item the subquery reads out to
   const GenColumn* outer_key = nullptr;  // of `outer`
@@ -3242,7 +3241,7 @@ class Builder {
 
   // `<lit> <op> (SELECT <AGG>(inner.c) FROM inner WHERE inner.k = outer.k)`, or the mirror, ADR
   // 0023's Path 2: an ungrouped aggregate under a NULL-rejecting comparison that is a top-level
-  // WHERE conjunct, correlated through one equality of two columns of one type. The other operand
+  // WHERE conjunct, correlated through two columns with an exact common key type. The other operand
   // is a literal: comparing against an outer column needs a result-type rule for divergence D13
   // that the generator does not have, and the hand-written .slt records cover that shape.
   // Returns whether it wrote one.
@@ -3283,11 +3282,27 @@ class Builder {
     used_.Add(Feature::kTableName);
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
     Keyword("WHERE");
-    InnerColumn(c, *c.inner_key);
     const bool keyless = allowed_.Has(Feature::kKeylessDomainAggregate) &&
                          allowed_.Has(Feature::kCompareColumns) &&
                          SaturatingProduct(c.binding_bound, c.inner->rows) <= kMaxJoinRows &&
                          keyless_domain_rng_.Percent(25);
+    const GenColumn* inner_key = c.inner_key;
+    // Use a copy so a mixed-width key never perturbs the surrounding clauses.
+    Rng widen_rng = corr_rng_;
+    if (!keyless && allowed_.Has(Feature::kWidenedScalarKey) &&
+        c.outer_key->kind == ValueKind::kInteger && widen_rng.Below(4) == 0) {
+      std::vector<const GenColumn*> alternatives;
+      for (const GenColumn& column : c.inner->columns) {
+        if (column.kind == ValueKind::kInteger && !OneSqlType(column, *c.outer_key)) {
+          alternatives.push_back(&column);
+        }
+      }
+      if (!alternatives.empty()) {
+        inner_key = widen_rng.Pick(alternatives);
+        used_.Add(Feature::kWidenedScalarKey);
+      }
+    }
+    InnerColumn(c, *inner_key);
     if (keyless) {
       used_.Add(Feature::kKeylessDomainAggregate);
       used_.Add(Feature::kCompareColumns);
@@ -3296,7 +3311,7 @@ class Builder {
       CorrelatedKeyComparison();
     }
     OuterColumn(c);
-    if (!keyless && allowed_.Has(Feature::kKeyedDomainAggregate) &&
+    if (!keyless && inner_key == c.inner_key && allowed_.Has(Feature::kKeyedDomainAggregate) &&
         allowed_.Has(Feature::kWhereAnd) && domain_rng_.Percent(35)) {
       auto pairs = ResidualPairs(c);
       std::erase_if(pairs, [&c](const auto& pair) { return pair.second == c.outer_key; });
@@ -3315,8 +3330,9 @@ class Builder {
     // grouping key exercises SINGLE when the measured inner key is already unique.
     // Copy the stream so that enabling this draw never changes an unrelated clause.
     Rng group_rng = corr_rng_;
-    if (!keyless && !used_.Has(Feature::kKeyedDomainAggregate) && allowed_.Has(Feature::kGroupBy) &&
-        allowed_.Has(Feature::kCorrelatedSingle) && group_rng.Percent(25)) {
+    if (!keyless && inner_key == c.inner_key && !used_.Has(Feature::kKeyedDomainAggregate) &&
+        allowed_.Has(Feature::kGroupBy) && allowed_.Has(Feature::kCorrelatedSingle) &&
+        group_rng.Percent(25)) {
       used_.Add(Feature::kCorrelatedSingle);
       used_.Add(Feature::kGroupBy);
       Keyword("GROUP");

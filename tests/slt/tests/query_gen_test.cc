@@ -2688,6 +2688,8 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
           .Minus({Feature::kLayout, Feature::kKeywordCase});
   const std::vector<GenTable> tables = JoinTables();
   const auto gen = MakeOver(tables, 71, {.supported = plain, .target_percent = 0});
+  const auto without_widening = MakeOver(
+      tables, 71, {.supported = plain.Minus({Feature::kWidenedScalarKey}), .target_percent = 0});
   const auto without_keyless =
       MakeOver(tables, 71,
                {.supported = plain.Minus({Feature::kKeylessDomainAggregate}), .target_percent = 0});
@@ -2710,6 +2712,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   int avg = 0;
   int avg_integer = 0;
   int avg_decimal = 0;
+  int widened_keys = 0;
   int keyed_domains = 0;
   int keyless_domains = 0;
   int grouped_scalars = 0;
@@ -2717,6 +2720,15 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedAggregate)) {
       continue;
+    }
+    const auto ordinary = without_widening.Generate(i);
+    if (q.features.Has(Feature::kWidenedScalarKey)) {
+      ++widened_keys;
+      EXPECT_FALSE(ordinary.features.Has(Feature::kWidenedScalarKey));
+      EXPECT_NE(q.sql, ordinary.sql) << i;
+      EXPECT_FALSE(q.features.Has(Feature::kCorrelatedSingle)) << q.sql;
+    } else {
+      EXPECT_EQ(q.sql, ordinary.sql) << i;
     }
     if (!q.features.Has(Feature::kKeylessDomainAggregate)) {
       const auto previous = without_keyless.Generate(i);
@@ -2761,6 +2773,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     EXPECT_FALSE(q.features.Has(Feature::kInSubquery)) << q.sql;
     EXPECT_FALSE(q.features.Has(Feature::kScalarSubquery)) << q.sql;
   }
+  EXPECT_GT(widened_keys, 0);
   EXPECT_GT(grouped_scalars, 0);
   EXPECT_GT(calls, 150) << "calls: " << calls;
   EXPECT_GT(literal_first, 20) << "literal_first: " << literal_first;

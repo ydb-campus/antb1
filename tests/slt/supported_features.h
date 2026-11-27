@@ -234,6 +234,7 @@ enum class Feature : std::uint8_t {
   // SQ9: a scalar aggregate whose correlation has no equality key.
   kKeylessDomainAggregate,
   kCorrelatedSingle,  // SQ4b: zero or one row per binding, checked at probe time
+  kWidenedScalarKey,  // SQ10: an aggregate correlation over two exact numeric types
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -433,6 +434,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_single";
     case Feature::kKeylessDomainAggregate:
       return "keyless_domain_aggregate";
+    case Feature::kWidenedScalarKey:
+      return "widened_scalar_key";
     case Feature::kNestedCorrelation:
       return "nested_correlation";
     case Feature::kWindowWholePartition:
@@ -660,6 +663,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kKeyedDomainAggregate,
     Feature::kKeylessDomainAggregate,
     Feature::kCorrelatedSingle,
+    Feature::kWidenedScalarKey,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

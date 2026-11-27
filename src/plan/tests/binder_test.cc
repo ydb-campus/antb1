@@ -8772,22 +8772,32 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16, (SELECT COUNT(*) FROM u WHERE u.i64 < t.i64) FROM t ORDER BY nope",
                   kBind, "nope", "column 'nope' does not exist"}));
 
-// The unnesting refuses an item's subquery whose correlation it cannot substitute -- here one of
-// two types -- once the whole query is bound: the binder answers it, and Optimize reports it.
-TEST(BinderTest, AnItemsCorrelationOfTwoTypesIsTheUnnestingsRefusal) {
-  const Catalog catalog = MakeCatalog();
+TEST(BinderTest, ScalarAggregateWidensItsEqualityKeyWithoutABindingDomain) {
+  const auto plan =
+      BindSql("SELECT i16, (SELECT COUNT(*) FROM u WHERE u.i32 = t.i16) FROM t", MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  const auto optimized = Optimize(*plan);
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  const std::string explain = Explain(*optimized);
+  EXPECT_NE(explain.find("CAST("), std::string::npos) << explain;
+  EXPECT_NE(explain.find("GroupAggregate"), std::string::npos) << explain;
+  EXPECT_EQ(explain.find("DependentJoin"), std::string::npos) << explain;
+  EXPECT_EQ(explain.find("Join INNER"), std::string::npos) << explain;
+}
+
+// Widening an enclosing key for equality does not make its wider inner equivalent a
+// SMALLINT in other expressions. Substituting it there could change arithmetic or overflow.
+TEST(BinderTest, WidenedEqualityKeepsTheOriginalOuterTypeInOtherConjuncts) {
   constexpr std::string_view kSql =
-      "SELECT i16, (SELECT COUNT(*) FROM u WHERE u.i32 = t.i16) FROM t";
-  auto plan = BindSql(kSql, catalog);
-  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+      "SELECT (SELECT COUNT(*) FROM u WHERE u.i32 = t.i16 AND u.i64 < t.i16 + 1) FROM t";
+  const auto plan = BindSql(kSql, MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
   const auto optimized = Optimize(*plan);
   ASSERT_FALSE(optimized.ok()) << Explain(*optimized);
   const auto detail = GetSqlError(optimized.status());
-  ASSERT_NE(detail, nullptr) << optimized.status().ToString();
-  EXPECT_EQ(detail->kind(), kUnsupported) << optimized.status().ToString();
-  EXPECT_EQ(SpanText(kSql, optimized.status()), "(") << optimized.status().ToString();
-  EXPECT_NE(optimized.status().message().find("has no inner equivalent"), std::string::npos)
-      << optimized.status().message();
+  ASSERT_NE(detail, nullptr) << optimized.status();
+  EXPECT_EQ(detail->kind(), kUnsupported);
+  EXPECT_EQ(SpanText(kSql, optimized.status()), "(");
 }
 
 // A correlated value the select list binds waits in the slot's tail, above WHERE's filters, as a
