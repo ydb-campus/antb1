@@ -822,7 +822,7 @@ std::optional<SharedSubPlan> GroupOf(std::vector<LogicalNodePtr> members, const 
 
 SharedConsumerFilters::SharedConsumerFilters(const LogicalPlan& plan) {
   const auto visit = [&](const auto& self, const LogicalNodePtr& node,
-                         const FilterNode* parent) -> void {
+                         const LogicalNode* parent) -> void {
     if (node == nullptr) {
       return;
     }
@@ -832,10 +832,22 @@ SharedConsumerFilters::SharedConsumerFilters(const LogicalPlan& plan) {
       return;
     }
     for (const auto& input : InputsOf(*node)) {
-      self(self, input, std::get_if<FilterNode>(node.get()));
+      self(self, input, node.get());
     }
   };
   visit(visit, plan.root, nullptr);
+}
+
+bool SharedConsumerFilters::HasBoundedDomain(const Predicate& p) {
+  if (IsIntegerOrDateEquality(p)) {
+    return true;
+  }
+  return p.kind == Predicate::Kind::kIn && p.column &&
+         (IsInteger(p.column->type) || p.column->type == LogicalType::kDate) && !p.values.empty() &&
+         p.values.size() <= kMaxSharedFilterValues &&
+         std::ranges::all_of(p.values, [&](const Constant& v) {
+           return v.type == p.column->type && std::holds_alternative<Int128>(v.value);
+         });
 }
 
 LogicalNodePtr SharedConsumerFilters::Producer(const SharedSubPlan& group) const {
@@ -849,21 +861,13 @@ LogicalNodePtr SharedConsumerFilters::Producer(const SharedSubPlan& group) const
   Domains common;
   std::map<int, BoundColumn> producer_columns;
   for (std::size_t i = 0; i < group.members.size(); ++i) {
-    const auto parent = parents_.find(group.members[i].get());
-    if (parent == parents_.end() || parent->second == nullptr) {
-      return widest;
-    }
     const auto ids = OutputIds(*group.members[i]);
     Domains local;
-    for (const Predicate& p : parent->second->predicates) {
-      if (!p.column.has_value()) {
+    for (const Predicate& p : ReaderPredicates(group.members[i].get())) {
+      if (!p.column || p.column->id == kNoColumnId) {
         continue;
       }
       const auto& column = *p.column;
-      if ((!IsInteger(column.type) && column.type != LogicalType::kDate) ||
-          column.id == kNoColumnId) {
-        continue;
-      }
       const auto at = std::ranges::find(ids, column.id);
       if (at == ids.end()) {
         continue;
@@ -872,13 +876,9 @@ LogicalNodePtr SharedConsumerFilters::Producer(const SharedSubPlan& group) const
       if (i == group.widest) {
         producer_columns.try_emplace(position, column);
       }
-      if (IsIntegerOrDateEquality(p)) {
+      if (p.kind == Predicate::Kind::kCompare) {
         local[position] = {std::get<Int128>(p.constant.value)};
-      } else if (p.kind == Predicate::Kind::kIn && !p.values.empty() &&
-                 p.values.size() <= kMaxSharedFilterValues &&
-                 std::ranges::all_of(p.values, [&](const Constant& v) {
-                   return v.type == column.type && std::holds_alternative<Int128>(v.value);
-                 })) {
+      } else {
         auto& values = local[position];
         // All predicates of this reader are conjuncts, so its shortest list suffices.
         if (values.empty() || p.values.size() < values.size()) {
@@ -1032,11 +1032,6 @@ struct GroupPartition {
   std::bitset<kMaxPredicateDomainKeys> fixed_keys;
   bool prunes_only_scan = false;
 };
-
-bool ReadsSlot(const BoundColumn& column, std::span<const ColumnId> ids) {
-  const auto slot = TryNarrow<std::size_t>(column.index);
-  return slot && *slot < ids.size() && column.id != kNoColumnId && ids[*slot] == column.id;
-}
 
 bool PrunesScanParts(const FilterNode& filter) {
   const auto* input = filter.input.get();
