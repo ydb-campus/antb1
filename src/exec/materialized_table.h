@@ -5,6 +5,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <arrow/record_batch.h>
@@ -56,6 +57,11 @@ class MaterializedTable final : public plan::Table {
       const std::shared_ptr<plan::ScanContext>& context) const override;
 
  private:
+  friend class MaterializedGroupPartition;
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ProjectBatches(
+      const std::vector<int>& fields, int64_t batch_size, int key = -1,
+      const arrow::Scalar* value = nullptr) const;
+
   std::shared_ptr<arrow::Schema> schema_;
   // Guards the batches against the consumer threads: filling happens before any of them starts,
   // but a scan is const and may run on any of them, so the handover needs the lock to be visible.
@@ -64,6 +70,31 @@ class MaterializedTable final : public plan::Table {
   int64_t rows_ = 0;
   bool filled_ = false;
   MemoryReservation memory_;
+};
+
+// Each emitted batch of a split aggregate belongs to one reader. Keep its boundaries and
+// order, so callers see the same stream that their original grouped aggregate produced.
+class MaterializedGroupPartition final : public plan::Table {
+ public:
+  MaterializedGroupPartition(std::shared_ptr<MaterializedTable> table, int key,
+                             std::shared_ptr<arrow::Scalar> value)
+      : table_(std::move(table)), key_(key), value_(std::move(value)) {}
+
+  const std::shared_ptr<arrow::Schema>& schema() const override { return table_->schema(); }
+  std::optional<int64_t> exact_row_count() const override { return std::nullopt; }
+  std::string Describe() const override { return "shared-group-partition"; }
+
+ protected:
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
+      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* /*pool*/,
+      const std::shared_ptr<plan::ScanContext>& /*context*/) const override {
+    return table_->ProjectBatches(fields, batch_size, key_, value_.get());
+  }
+
+ private:
+  std::shared_ptr<MaterializedTable> table_;
+  int key_;
+  std::shared_ptr<arrow::Scalar> value_;
 };
 
 }  // namespace antb1::exec

@@ -22,6 +22,7 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
@@ -109,6 +110,246 @@ arrow::Result<ExecutionResult> Execute(std::string_view sql,
                                        const std::shared_ptr<MemoryTable>& table) {
   ARROW_ASSIGN_OR_RAISE(const plan::LogicalPlan plan, PlanOf(sql, table));
   return ExecutePlan(plan, table);
+}
+
+// Two branches read the same event row groups through different slices of a lookup. Keep
+// a double subtotal per original row group, including when a lookup key matches both slices.
+struct PeriodSums {
+  std::shared_ptr<MemoryTable> events;
+  plan::Catalog catalog;
+
+  PeriodSums() {
+    const auto schema =
+        arrow::schema({arrow::field("account", arrow::int64()), arrow::field("day", arrow::int64()),
+                       arrow::field("amount", arrow::float64())});
+    arrow::RecordBatchVector parts;
+    for (const double leading : {1e16, -1e16}) {
+      parts.push_back(arrow::RecordBatch::Make(
+          schema, 5,
+          {testing::Int64s({0, 0, 1, 2, 3}), testing::Int64s({1, 1, 2, 2, 9}),
+           testing::ArrayOf<arrow::DoubleBuilder, double>(arrow::float64(),
+                                                          {leading, 1., 2., std::nullopt, 3.})}));
+    }
+    events = std::make_shared<MemoryTable>(schema, std::move(parts), true);
+    const auto lookup =
+        arrow::schema({arrow::field("day", arrow::int64()), arrow::field("period", arrow::int64()),
+                       arrow::field("weight", arrow::float64())});
+    auto rows = arrow::RecordBatch::Make(
+        lookup, 5,
+        {testing::Int64s({1, 1, 2, 2, 2}), testing::Int64s({5, 7, 5, 7, 5}),
+         testing::ArrayOf<arrow::DoubleBuilder, double>(arrow::float64(), {1., 1., 1., 1., 1.})});
+    EXPECT_TRUE(catalog.Register("events", events).ok());
+    EXPECT_TRUE(catalog
+                    .Register("bands", std::make_shared<MemoryTable>(
+                                           lookup, arrow::RecordBatchVector{rows}, true))
+                    .ok());
+  }
+
+  static std::string Branch(int period, std::string_view lookup) {
+    return std::format(
+        "SELECT e.account AS k, b.period AS p, SUM(e.amount * b.weight) AS amount "
+        "FROM events e JOIN {} b ON e.day=b.day WHERE b.period={} GROUP BY e.account,b.period",
+        lookup, period);
+  }
+
+  arrow::Result<plan::LogicalPlan> Query(std::string_view sql, bool large) const {
+    events->set_claimed_rows(large ? 20'000'000 : 100);
+    const auto parsed = sql::Parse(sql);
+    if (!parsed) {
+      return arrow::Status::Invalid("parse failed");
+    }
+    ARROW_ASSIGN_OR_RAISE(auto bound, plan::Bind(*parsed, catalog, {}));
+    return plan::Optimize(bound);
+  }
+
+  arrow::Result<plan::LogicalPlan> Plan(int right_period, bool large,
+                                        std::string_view lookup = "bands") const {
+    return Query(std::format("SELECT a.k AS k, a.amount AS x, b.amount AS y FROM ({}) a JOIN "
+                             "({}) b ON a.k=b.k ORDER BY k,x,y",
+                             Branch(5, lookup), Branch(right_period, lookup)),
+                 large);
+  }
+};
+
+int64_t MetricSum(const ProfileNode& node, std::string_view name) {
+  int64_t result = 0;
+  for (const auto& metric : node.metrics()) {
+    if (metric.name == name) {
+      result += metric.value;
+    }
+  }
+  for (const auto& child : node.children()) {
+    result += MetricSum(*child, name);
+  }
+  return result;
+}
+
+arrow::Result<std::shared_ptr<arrow::Table>> RunPeriods(const plan::LogicalPlan& plan,
+                                                        ProfileNode& profile,
+                                                        MemoryBudget& budget) {
+  ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(plan, &profile));
+  ExecContext ctx{.pool = &budget, .batch_size = 1, .budget = &budget};
+  return Drain(*op, ctx);
+}
+
+TEST_F(SharedBuildsTest, OneScanKeepsEachPartitionSumNullsAndJoinMultiplicity) {
+  PeriodSums fixture;
+  MemoryBudget budget(std::nullopt);
+  ProfileNode ordinary;
+  auto small = fixture.Plan(7, false);
+  ASSERT_TRUE(small.ok()) << small.status();
+  auto expected = RunPeriods(*small, ordinary, budget);
+  ASSERT_TRUE(expected.ok()) << expected.status();
+  EXPECT_EQ(fixture.events->scanned_parts().size(), 4U);
+  ProfileNode shared;
+  auto plan = fixture.Plan(7, true);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  auto got = RunPeriods(*plan, shared, budget);
+  ASSERT_TRUE(got.ok()) << got.status();
+  EXPECT_EQ(fixture.events->scanned_parts().size(), 6U);
+  EXPECT_EQ(MetricSum(shared, "split_scan_parts"), 2);
+  const auto first_rows = MetricSum(shared, "split_rows_0");
+  const auto second_rows = MetricSum(shared, "split_rows_1");
+  EXPECT_EQ(std::min(first_rows, second_rows), 8);
+  EXPECT_EQ(std::max(first_rows, second_rows), 12);
+  EXPECT_EQ(MetricSum(shared, "shared_rows"), 6);
+  ASSERT_TRUE((*got)->Equals(**expected));
+  // Per-part cancellation gives zero; two matches in the first band count twice.
+  const auto combined = (*got)->CombineChunks();
+  ASSERT_TRUE(combined.ok()) << combined.status();
+  ASSERT_EQ((*combined)->num_rows(), 3);
+  const auto& x = static_cast<const arrow::DoubleArray&>(*(*combined)->column(1)->chunk(0));
+  const auto& y = static_cast<const arrow::DoubleArray&>(*(*combined)->column(2)->chunk(0));
+  EXPECT_EQ(x.Value(0), 0.);
+  EXPECT_EQ(y.Value(0), 0.);
+  EXPECT_EQ(x.Value(1), 8.);
+  EXPECT_EQ(y.Value(1), 4.);
+  EXPECT_TRUE(x.IsNull(2));
+  EXPECT_TRUE(y.IsNull(2));
+}
+
+TEST_F(SharedBuildsTest, EmptyJoinedPartitionsRetryWithTheOriginalScans) {
+  PeriodSums fixture;
+  const auto bands = std::dynamic_pointer_cast<MemoryTable>(fixture.catalog.Find("bands"));
+  ASSERT_NE(bands, nullptr);
+  bands->set_stats(false);
+  auto plan = fixture.Plan(9, true);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  MemoryBudget budget(std::nullopt);
+  ProfileNode profile;
+  auto rows = RunPeriods(*plan, profile, budget);
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ((*rows)->num_rows(), 0);
+  EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 1);
+}
+
+TEST_F(SharedBuildsTest, MissingLookupPeriodAvoidsTheSharedFactScan) {
+  PeriodSums fixture;
+  auto plan = fixture.Plan(9, true);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  MemoryBudget budget(std::nullopt);
+  ProfileNode profile;
+  auto rows = RunPeriods(*plan, profile, budget);
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ((*rows)->num_rows(), 0);
+  EXPECT_TRUE(fixture.events->scanned_parts().empty());
+  EXPECT_NE(profile.name(), "SharedGroupPartitions");
+  EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 0);
+}
+
+TEST_F(SharedBuildsTest, SeparateStatesRetryWhenOnlyIndependentGroupsFit) {
+  PeriodSums fixture;
+  int64_t original_peak = 0;
+  {
+    MemoryBudget budget(std::nullopt);
+    ProfileNode profile;
+    auto original = fixture.Plan(7, false);
+    ASSERT_TRUE(original.ok()) << original.status();
+    auto rows = RunPeriods(*original, profile, budget);
+    ASSERT_TRUE(rows.ok()) << rows.status();
+    original_peak = budget.max_memory();
+  }
+  auto plan = fixture.Plan(7, true);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  MemoryBudget budget(original_peak);
+  ProfileNode profile;
+  auto rows = RunPeriods(*plan, profile, budget);
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ((*rows)->num_rows(), 3);
+  ASSERT_EQ(profile.children().size(), 2U);
+  EXPECT_EQ(MetricSum(*profile.children().front(), "shared_fallbacks"), 0);
+  EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 1);
+}
+
+arrow::Status RegisterWideBands(PeriodSums& fixture) {
+  const auto schema =
+      arrow::schema({arrow::field("day", arrow::int64()), arrow::field("period", arrow::int64()),
+                     arrow::field("weight", arrow::float64())});
+  // Each original lookup fits, but the two homogeneous parts together exceed the exact-key cap.
+  constexpr int64_t kRows = (KeyFilter::kMaxPublishedKeys / 2) + 1;
+  std::vector<std::optional<int64_t>> days;
+  days.reserve(kRows);
+  for (int64_t i = 0; i < kRows; ++i) {
+    days.emplace_back(i);
+  }
+  const auto keys = testing::Int64s(days);
+  ARROW_ASSIGN_OR_RAISE(auto weights, arrow::MakeArrayFromScalar(arrow::DoubleScalar(1.), kRows));
+  arrow::RecordBatchVector batches;
+  for (const int64_t value : {5, 7}) {
+    ARROW_ASSIGN_OR_RAISE(auto period,
+                          arrow::MakeArrayFromScalar(arrow::Int64Scalar(value), kRows));
+    batches.push_back(arrow::RecordBatch::Make(schema, kRows, {keys, period, weights}));
+  }
+  return fixture.catalog.Register("wide_bands",
+                                  std::make_shared<MemoryTable>(schema, std::move(batches), true));
+}
+
+TEST_F(SharedBuildsTest, DeclinedLookupUsesOrdinaryPhysicalRoot) {
+  PeriodSums fixture;
+  ASSERT_TRUE(RegisterWideBands(fixture).ok());
+  const auto plan = fixture.Plan(7, true, "wide_bands");
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  ASSERT_TRUE(std::ranges::any_of(plan::MaterializableSubPlans(*plan),
+                                  &plan::SharedSubPlan::separate_partition_states));
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(*plan, &profile);
+  ASSERT_TRUE(op.ok()) << op.status();
+  EXPECT_NE(profile.name(), "SharedGroupPartitions");
+  MemoryBudget budget(std::nullopt);
+  auto rows = Drain(**op, ExecContext{.pool = &budget, .budget = &budget});
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ((*rows)->num_rows(), 4);
+  EXPECT_EQ(MetricSum(profile, "shared_rows"), 0);
+  EXPECT_EQ(MetricSum(profile, "split_scan_parts"), 0);
+}
+
+TEST_F(SharedBuildsTest, DeclinedLookupKeepsExactSharingAlongsideAnAcceptedSplit) {
+  PeriodSums fixture;
+  ASSERT_TRUE(RegisterWideBands(fixture).ok());
+  // Only the two wide branches outside the union are candidates for a split. Declining that
+  // split frees the period-7 group to share with its identical copy inside the union.
+  const auto wide = PeriodSums::Branch(7, "wide_bands");
+  const auto sql = std::format(
+      "SELECT a.amount AS v,b.amount AS w,c.amount AS x,d.amount AS y,e.amount AS z "
+      "FROM ({}) a JOIN ({}) b ON a.k=b.k JOIN ({} UNION ALL {}) c ON b.k=c.k "
+      "JOIN ({}) d ON c.k=d.k JOIN ({}) e ON d.k=e.k ORDER BY v,w,x,y,z",
+      PeriodSums::Branch(5, "wide_bands"), wide, wide, PeriodSums::Branch(9, "wide_bands"),
+      PeriodSums::Branch(5, "bands"), PeriodSums::Branch(7, "bands"));
+  const auto plan = fixture.Query(sql, true);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(*plan, &profile);
+  ASSERT_TRUE(op.ok()) << op.status();
+  MemoryBudget budget(std::nullopt);
+  const auto rows = Drain(**op, ExecContext{.pool = &budget, .budget = &budget});
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ((*rows)->num_rows(), 3);
+  EXPECT_EQ(MetricSum(profile, "split_scan_parts"), 2);
+  // The narrow producer emits three groups for each period. The four wide period-7 groups
+  // must be materialized once for their two readers.
+  EXPECT_EQ(MetricSum(profile, "shared_rows"), 10);
+  EXPECT_EQ(fixture.events->scanned_parts().size(), 6U);
+  EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 0);
 }
 
 // A CTE referenced twice: the sub-plan is a grouped aggregate, which reduces, so with a table large

@@ -7,6 +7,17 @@
 
 namespace antb1::plan {
 
+// Moving a grouped filter can change which qualifying rows share one join-output batch.
+class GroupFilterContext {
+ public:
+  [[nodiscard]] bool CanMove() const { return !preserve_batches_; }
+  [[nodiscard]] GroupFilterContext ForInput(const LogicalNode& parent) const;
+
+ private:
+  bool limited_ = false;
+  bool preserve_batches_ = false;
+};
+
 // Rule-based rewrites of a bound plan, applied in this order (docs/architecture.md). The unnesting
 // pass runs first and is the only one that can fail:
 //  0. Unnesting (ADR 0023): every DependentJoin becomes ordinary joins -- a semi or anti join
@@ -42,7 +53,9 @@ namespace antb1::plan {
 //     projections; compatible join keys propagate them to matching grouped inputs. A LEFT join
 //     only propagates a preserved-side restriction to its nullable side. Limits, windows,
 //     grouping sets and potentially failing computations remain barriers. New union filters
-//     use rule 1, and rule 7 runs again to refresh the changed filters' column demand.
+//     use rule 1. A conjunction of bound comparisons on completed aggregate results can move
+//     from a residual-free INNER join to its grouped probe, above the aggregation. Rule 7 then
+//     refreshes the changed join's and filters' column demand.
 // Rules 5 and 8 preserve materializable aggregates shared across consumers. A shared partial
 // aggregate can still serve those consumers after their outer groups specialize.
 // Rules 1 to 8 find columns by their ids and ignore the input's indices; last,

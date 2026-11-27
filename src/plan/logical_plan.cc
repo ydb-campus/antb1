@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -25,6 +26,8 @@
 #include "antb1/common/narrow.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/types.h"
+
+#include "predicate_domain.h"
 
 namespace antb1::plan {
 namespace {
@@ -787,6 +790,41 @@ std::vector<ColumnId> JoinIds(JoinKind kind, std::vector<ColumnId> left,
   return left;
 }
 
+// A positional physical plan may omit every output id. Rebasing onto a right-hand probe
+// still has to skip the real columns of the left input, including unnamed ones.
+struct PhysicalWidthOf {
+  static std::size_t Width(const LogicalNodePtr& node) {
+    return node ? std::visit(PhysicalWidthOf{}, *node) : 0;
+  }
+  std::size_t operator()(const ScanNode& n) const { return n.fields.size(); }
+  std::size_t operator()(const RowCountNode& /*node*/) const { return 1; }
+  std::size_t operator()(const ProjectNode& n) const { return n.columns.size(); }
+  std::size_t operator()(const FilterNode& n) const { return Width(n.input); }
+  std::size_t operator()(const SortNode& n) const { return Width(n.input); }
+  std::size_t operator()(const LimitNode& n) const { return Width(n.input); }
+  std::size_t operator()(const ComputeNode& n) const { return Width(n.input) + n.exprs.size(); }
+  std::size_t operator()(const WindowNode& n) const { return Width(n.input) + n.calls.size(); }
+  std::size_t operator()(const AggregateNode& n) const { return n.aggregates.size(); }
+  std::size_t operator()(const GroupAggregateNode& n) const {
+    return n.keys.size() + n.aggregates.size();
+  }
+  std::size_t operator()(const GroupingSetsNode& n) const {
+    return n.keys.size() + n.aggregates.size() + n.grouping.size();
+  }
+  template <class Set>
+    requires(std::same_as<Set, SetOperationNode> || std::same_as<Set, UnionAllNode>)
+  std::size_t operator()(const Set& n) const {
+    return n.columns.empty() ? 0 : n.columns.front().size();
+  }
+  template <class Join>
+    requires(std::same_as<Join, JoinNode> || std::same_as<Join, DependentJoinNode>)
+  std::size_t operator()(const Join& n) const {
+    const auto traits = Traits(n.kind);
+    return Width(n.left) + (traits.outputs_right ? Width(n.right) : 0) +
+           static_cast<std::size_t>(traits.appends_mark);
+  }
+};
+
 struct OutputIdsOf {
   std::vector<ColumnId> operator()(const ScanNode& node) const { return node.ids; }
   std::vector<ColumnId> operator()(const FilterNode& node) const { return OutputIds(*node.input); }
@@ -1527,6 +1565,61 @@ class Resolver {
 
 std::vector<ColumnId> OutputIds(const LogicalNode& node) { return std::visit(OutputIdsOf{}, node); }
 
+LogicalNodePtr FilterGroupedProbe(const FilterNode& filter, GroupedProbeFilterMode mode) {
+  const auto* join = std::get_if<JoinNode>(filter.input.get());
+  if (join == nullptr || join->kind != JoinKind::kInner || !join->residual.empty() || !join->left ||
+      !join->right || filter.predicates.empty()) {
+    return nullptr;
+  }
+  // Preserve the build and the complete aggregation. An empty build still skips this probe.
+  const bool build_left = join->build == BuildSide::kLeft;
+  const auto& probe = build_left ? join->right : join->left;
+  const auto* group = std::get_if<GroupAggregateNode>(probe.get());
+  if (group == nullptr || group->key_ids.size() != group->keys.size()) {
+    return nullptr;
+  }
+  const bool physical = mode == GroupedProbeFilterMode::kPhysical;
+  const auto ids = OutputIds(*probe);
+  const std::size_t offset = physical && build_left ? PhysicalWidthOf::Width(join->left) : 0;
+  std::vector<Predicate> predicates = filter.predicates;
+  for (auto& p : predicates) {
+    if (p.kind != Predicate::Kind::kCompare || !p.column || p.other ||
+        p.column->id == kNoColumnId) {
+      return nullptr;
+    }
+    const auto at = std::ranges::find(ids, p.column->id);
+    if (at == ids.end()) {
+      return nullptr;
+    }
+    const auto slot = Narrow<std::size_t>(at - ids.begin());
+    if (physical && !std::cmp_equal(p.column->index, offset + slot)) {
+      return nullptr;
+    }
+    if (slot < group->keys.size()) {
+      if (!physical || !IsIntegerOrDateEquality(p) || p.column->type != group->keys[slot].type) {
+        return nullptr;
+      }
+    } else {
+      const auto type = group->aggregates[slot - group->keys.size()].type;
+      // Bound constant comparisons are total, including a DECIMAL compared in DOUBLE. Check
+      // hand-built predicates too: a malformed constant could otherwise escape an Open error
+      // when an empty join build skips the probe.
+      if (p.column->type != type ||
+          (p.constant.type != type && !ComparesDecimalInDouble(*p.column, p.constant))) {
+        return nullptr;
+      }
+    }
+    if (!ToArrowScalar(p.constant).ok()) {
+      return nullptr;
+    }
+    p.column->index = Narrow<int>(slot);
+  }
+  JoinNode out = *join;
+  (build_left ? out.right : out.left) = std::make_shared<const LogicalNode>(
+      FilterNode{.input = probe, .predicates = std::move(predicates), .span = filter.span});
+  return std::make_shared<const LogicalNode>(std::move(out));
+}
+
 ColumnId MaxColumnId(const LogicalNode& node) {
   std::set<ColumnId> reads;
   std::set<ColumnId> defines;
@@ -1783,6 +1876,33 @@ LogicalPlan ResolvePositions(const LogicalPlan& plan, std::source_location locat
     internal::CheckFailed(resolver.failure()->c_str(), location);
   }
   return LogicalPlan{.root = std::move(root.node), .output = plan.output};
+}
+
+const SortNode* FullyOrderedJoin(const LogicalPlan& plan) {
+  const auto* output = std::get_if<ProjectNode>(plan.root.get());
+  if (output == nullptr ||
+      (!output->constants.empty() && output->constants.size() != output->columns.size())) {
+    return nullptr;
+  }
+  const auto* limit = std::get_if<LimitNode>(output->input.get());
+  if (limit != nullptr && limit->limit == 0) {
+    return nullptr;
+  }
+  const auto* sort =
+      std::get_if<SortNode>(limit != nullptr ? limit->input.get() : output->input.get());
+  if (sort == nullptr || std::get_if<JoinNode>(sort->input.get()) == nullptr) {
+    return nullptr;
+  }
+  // Sort consumes the whole candidate before emitting anything. Cover all observable values
+  // as well: changing a hash join's keys can change the choice among otherwise tied rows.
+  for (const auto& column : output->columns) {
+    if (column.id != kNoColumnId && !std::ranges::any_of(sort->keys, [&](const SortKey& key) {
+          return key.column.id == column.id;
+        })) {
+      return nullptr;
+    }
+  }
+  return sort;
 }
 
 std::optional<std::string> PositionMismatch(const LogicalPlan& plan) {

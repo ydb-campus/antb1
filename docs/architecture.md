@@ -274,6 +274,14 @@ steps (only step 7 uses more than one thread):
    scan columns needed for the final grouping, counting only the offset for a string. The
    choice applies at every thread count to preserve the probe and accumulation order. A
    finite memory limit keeps the previous build side for an OOM retry.
+   A comparison against a completed aggregate such as a decimal sum or an integer count can also
+   run on the grouped probe of a residual-free inner join. The planner moves the filter as a whole
+   when its predicates can safely read the probe alone. The aggregate still evaluates every input
+   row, and only qualifying groups reach the join. The filter stays above the join when moving it
+   could hide a row from an error-producing predicate or pack a later row into a batch evaluated
+   before a limit is satisfied. A scalar aggregate consumes its input before emitting one row,
+   so a limit above it cannot observe its input batches. Group cardinality estimates and shared-reader
+   key lists continue to require their own proofs of which grouping-key values can survive.
    Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
@@ -293,9 +301,10 @@ steps (only step 7 uses more than one thread):
    nested loop, [ADR 0040](adr/0040-nested-loop-joins.md)), made once per
    pipeline before the factory of its parts, and a probe of the other, in that input's part pipeline or over it; a
    malformed join (keys of two types, say) is `Invalid`.
-   For an inner join without a residual, a filter consisting of integer or DATE equalities on
-   the probe’s grouping keys can run on the completed groups before the join gathers build columns.
-   The build still runs first, and the aggregate evaluates the same input rows.
+   When planning an inner join without a residual, the physical planner can also place a filter
+   directly on completed probe groups. It checks the resolved column positions before moving
+   grouping-key equalities or comparisons on aggregate results. The build still runs first, so an
+   empty build can skip the probe.
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
    error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns. The part
    pipelines run on the session's thread pool (`--threads`, `engine::SessionOptions::threads`), and so do the batches
@@ -487,6 +496,29 @@ prove that whole parts pass the lookup filter and contain more non-NULL keys tha
 If the shared attempt fails or returns an empty joined result, the executor can retry the
 independent aggregates with deferred lookup and a fresh scan context. Only the winning attempt
 contributes files to final validation.
+
+**Sharing a fact scan between grouped sums.** Two branches of an inner join may sum the same
+DOUBLE expression for different values of a lookup column. When both group by that column and
+one other key, one producer can read the two lookup values together and probe the fact table once.
+Within each fact part it routes joined rows to separate aggregate states. Each value keeps its
+own partition merges in fact-part order and its own output batches. Each consumer sees only the
+batches for its original equality. This preserves floating-point addition order and avoids
+materializing the joined fact rows.
+
+The planner considers fact inputs with at least ten million rows and checks the combined group
+estimate against the 256 MiB materialization cap. If every lookup part excludes one reader's value,
+the independent join can skip the fact scan. When some split candidates exceed the exact-key cap,
+the planner retains the accepted splits and rechecks the remaining branches for exact sharing.
+
+The final sort must cover all observable columns and a result row must depend on both readers.
+The planner also checks the final projection against its own 256 MiB cap. A top-N bounds the
+rows directly. For an unlimited result, the planner requires known output widths and bounds
+the joined rows using table counts and grouping-key domains. Each left row fixes the right
+join keys, limiting the number of groups it can match. A top-N with variable-width columns
+still checks the actual string bytes at execution. The executor buffers the sorted
+result and validates the scans before publication. An empty result can mean that a join skipped
+a reader. In that case, or if the attempt fails, the original execution determines the result
+and the files to validate.
 
 | Operator | Logical node | Does |
 | --- | --- | --- |

@@ -38,13 +38,15 @@ bool SameTypes(const arrow::Schema& first, const arrow::Schema& second) {
   return true;
 }
 
-class DeferredDimensionJoinOperator final : public Operator {
+enum class Proof { kUniqueDimension, kSharedGroups };
+
+class VerifiedPlanOperator final : public Operator {
  public:
-  DeferredDimensionJoinOperator(plan::LogicalPlan fast, plan::LogicalPlan original,
-                                DimensionPlanBuilder build, DimensionPlanBuilder build_fast,
-                                std::shared_ptr<arrow::Schema> schema,
-                                std::unique_ptr<Operator> first)
-      : fast_(std::move(fast)),
+  VerifiedPlanOperator(Proof proof, plan::LogicalPlan fast, plan::LogicalPlan original,
+                       DimensionPlanBuilder build, DimensionPlanBuilder build_fast,
+                       std::shared_ptr<arrow::Schema> schema, std::unique_ptr<Operator> first)
+      : proof_(proof),
+        fast_(std::move(fast)),
         original_(std::move(original)),
         build_(build),
         build_fast_(build_fast),
@@ -63,7 +65,7 @@ class DeferredDimensionJoinOperator final : public Operator {
 
   arrow::Result<Batch> Next() override {
     if (!ctx_) {
-      return arrow::Status::Invalid("deferred dimension join: Next() before Open()");
+      return arrow::Status::Invalid("verified plan: Next() before Open()");
     }
     ExecContext& ctx = *ctx_;
     if (!started_) {
@@ -101,7 +103,7 @@ class DeferredDimensionJoinOperator final : public Operator {
     try {
       const auto kept = KeyTableNoBadAlloc([&] { return TryCandidate(ctx); });
       if (kept.ok() && *kept) {
-        if (profile() != nullptr) {
+        if (profile() != nullptr && proof_ == Proof::kUniqueDimension) {
           profile()->AddNoThrow("dimension_verified", MetricUnit::kCount, 1);
         }
         return arrow::Status::OK();
@@ -111,7 +113,9 @@ class DeferredDimensionJoinOperator final : public Operator {
       first_.reset();
       DiscardOutput();
       if (profile() != nullptr) {
-        profile()->AddNoThrow("dimension_fallbacks", MetricUnit::kCount, 1);
+        profile()->AddNoThrow(
+            proof_ == Proof::kUniqueDimension ? "dimension_fallbacks" : "shared_fallbacks",
+            MetricUnit::kCount, 1);
       }
       const auto caller_scans = std::exchange(ctx.scans, std::make_shared<plan::ScanContext>());
       ARROW_ASSIGN_OR_RAISE(original_op_, build_(original_, Child(1)));
@@ -126,7 +130,7 @@ class DeferredDimensionJoinOperator final : public Operator {
       return opened;
     } catch (const std::bad_alloc&) {
       static_cast<void>(Close());
-      return arrow::Status::OutOfMemory("out of memory opening a deferred dimension join");
+      return arrow::Status::OutOfMemory("out of memory opening a verified plan");
     }
   }
 
@@ -187,10 +191,13 @@ class DeferredDimensionJoinOperator final : public Operator {
   arrow::Result<bool> TryCandidate(const ExecContext& ctx) {
     auto fast = std::move(first_);
     if (fast == nullptr) {
-      auto built = KeyTableNoBadAlloc([&] { return build_fast_(fast_, Child(0)); });
+      auto built = KeyTableNoBadAlloc([&] {
+        return build_fast_(fast_, proof_ == Proof::kSharedGroups ? profile() : Child(0));
+      });
       if (built.ok()) {
         fast = *std::move(built);
-      } else if (build_fast_ == build_) {
+      }
+      if (fast == nullptr && (proof_ == Proof::kSharedGroups || build_fast_ == build_)) {
         return false;
       }
     }
@@ -200,7 +207,7 @@ class DeferredDimensionJoinOperator final : public Operator {
         return true;
       }
       const auto* shared = dynamic_cast<const SharedBuildsOperator*>(fast.get());
-      if (shared == nullptr || !shared->UsedCombinedDomains()) {
+      if (proof_ == Proof::kSharedGroups || shared == nullptr || !shared->UsedCombinedDomains()) {
         return false;
       }
     }
@@ -218,6 +225,7 @@ class DeferredDimensionJoinOperator final : public Operator {
     return Verify(*independent, ctx);
   }
 
+  Proof proof_;
   plan::LogicalPlan fast_;
   plan::LogicalPlan original_;
   DimensionPlanBuilder build_;
@@ -233,33 +241,43 @@ class DeferredDimensionJoinOperator final : public Operator {
   std::size_t next_ = 0;
 };
 
-}  // namespace
-
-arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(
-    plan::LogicalPlan fast, plan::LogicalPlan original, ProfileNode* profile,
-    DimensionPlanBuilder build, DimensionPlanBuilder build_fast) {
+arrow::Result<std::unique_ptr<Operator>> MakeVerifiedPlan(Proof proof, plan::LogicalPlan fast,
+                                                          plan::LogicalPlan original,
+                                                          ProfileNode* profile,
+                                                          DimensionPlanBuilder build,
+                                                          DimensionPlanBuilder build_fast) {
   ARROW_ASSIGN_OR_RAISE(auto ordinary, build(original, nullptr));
   auto schema = ordinary->output_schema();
   ordinary.reset();
-  if (profile != nullptr) {
+  ProfileNode* child = profile;
+  if (profile != nullptr && proof == Proof::kUniqueDimension) {
     profile->set_name("DeferredDimensionJoin");
     profile->set_detail("verify unique, non-NULL surrogate and business keys");
+    child = profile->Child(0);
   }
-  ProfileNode* child = profile == nullptr ? nullptr : profile->Child(0);
   if (build_fast == nullptr) {
     build_fast = build;
   }
   const auto candidate = [&] -> arrow::Result<std::unique_ptr<Operator>> {
     ARROW_ASSIGN_OR_RAISE(auto op, build_fast(fast, child));
-    if (!SameTypes(*schema, *op->output_schema())) {
+    if (op != nullptr && !SameTypes(*schema, *op->output_schema())) {
       return arrow::Status::Invalid("deferred dimension join candidate has incompatible types");
     }
     return op;
   };
   auto first = KeyTableNoBadAlloc(candidate);
-  if (!first.ok() && build_fast != build) {
+  if (!first.ok() && proof == Proof::kUniqueDimension && build_fast != build) {
     build_fast = build;
     first = KeyTableNoBadAlloc(candidate);
+  }
+  if (proof == Proof::kSharedGroups) {
+    if (first.ok() && !*first) {
+      return build(original, profile);
+    }
+    if (profile != nullptr) {
+      profile->set_name("SharedGroupPartitions");
+      profile->set_detail("scan once with independent grouped sums");
+    }
   }
   if (!first.ok()) {
     // An optional physical shape may cost more to construct than the ordinary tree.
@@ -270,14 +288,30 @@ arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(
     profile->set_detail("original plan after planning fallback");
     return std::make_unique<ProfiledOperator>(std::move(fallback), profile);
   }
-  auto guarded = std::make_unique<DeferredDimensionJoinOperator>(
-      std::move(fast), std::move(original), build, build_fast, std::move(schema),
-      *std::move(first));
+  auto guarded =
+      std::make_unique<VerifiedPlanOperator>(proof, std::move(fast), std::move(original), build,
+                                             build_fast, std::move(schema), *std::move(first));
   if (profile == nullptr) {
     return guarded;
   }
   guarded->set_profile(profile);
   return std::make_unique<ProfiledOperator>(std::move(guarded), profile);
+}
+
+}  // namespace
+
+arrow::Result<std::unique_ptr<Operator>> MakeDeferredDimensionJoin(
+    plan::LogicalPlan fast, plan::LogicalPlan original, ProfileNode* profile,
+    DimensionPlanBuilder build, DimensionPlanBuilder build_fast) {
+  return MakeVerifiedPlan(Proof::kUniqueDimension, std::move(fast), std::move(original), profile,
+                          build, build_fast);
+}
+
+arrow::Result<std::unique_ptr<Operator>> MakeGuardedSharedGroups(const plan::LogicalPlan& plan,
+                                                                 ProfileNode* profile,
+                                                                 DimensionPlanBuilder independent,
+                                                                 DimensionPlanBuilder combined) {
+  return MakeVerifiedPlan(Proof::kSharedGroups, plan, plan, profile, independent, combined);
 }
 
 }  // namespace antb1::exec

@@ -15,6 +15,7 @@
 #include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
+#include "antb1/exec/filter.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
@@ -232,6 +233,10 @@ class PartGroupAggregateOperator final : public PartSink {
                              std::optional<PartitionTopN> top_n = std::nullopt,
                              LocalGroupLayout layout = LocalGroupLayout::kAdaptive);
   ~PartGroupAggregateOperator() override;
+  void SplitDomains(std::vector<PredicateEvaluator> predicates, ProfileNode* counters) {
+    domain_predicates_ = std::move(predicates);
+    domain_counters_ = counters;
+  }
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
@@ -245,7 +250,12 @@ class PartGroupAggregateOperator final : public PartSink {
   std::optional<std::size_t> routing_key_;
   BatchPartition partition_{.count = GroupTable::kPartitions};
 
-  using PartTable = std::shared_ptr<PartGroups>;
+  struct PartTable {
+    std::shared_ptr<PartGroups> first;
+    // A split producer routes rows into two independent part tables. A reader sees the
+    // same grouping order and the same per-part subtotals as in its standalone aggregation.
+    std::shared_ptr<PartGroups> second;
+  };
 
   std::shared_ptr<const PartPipeline> pipeline_;
   int64_t num_parts_;
@@ -255,6 +265,8 @@ class PartGroupAggregateOperator final : public PartSink {
   std::shared_ptr<arrow::Schema> schema_;
   std::optional<PartitionTopN> top_n_;
   LocalGroupLayout requested_layout_;
+  std::vector<PredicateEvaluator> domain_predicates_;
+  ProfileNode* domain_counters_ = nullptr;
   LocalGroupLayout layout_ = LocalGroupLayout::kAdaptive;
   std::optional<RowComparator> comparator_;  // with top_n_: its order, over schema_
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();

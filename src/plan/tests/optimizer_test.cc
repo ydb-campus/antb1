@@ -1069,6 +1069,229 @@ const T* Find(const LogicalNodePtr& node) {
   return nullptr;
 }
 
+TEST(OptimizerTest, FiltersCompletedScalarSumAndCountBeforeProbingTheJoin) {
+  auto catalog = MakeCatalog();
+  auto events = std::make_shared<testing::FakeTable>(
+      arrow::schema(
+          {arrow::field("k", arrow::int32()), arrow::field("fee", arrow::decimal128(15, 2))}),
+      100'000);
+  ASSERT_TRUE(catalog.Register("events", std::move(events)).ok());
+  for (const auto& [expression, kind] :
+       {std::pair{"SUM(fee)", AggKind::kSum}, std::pair{"COUNT(*)", AggKind::kCountStar}}) {
+    const auto bound =
+        BindSql(std::format("SELECT i16 FROM t WHERE (SELECT {} FROM events WHERE k=t.i32) > {}",
+                            expression, kind == AggKind::kSum ? "80.25" : "3"),
+                catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    const auto* join = Find<JoinNode>(plan.root);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    ASSERT_EQ(join->kind, JoinKind::kInner);
+    ASSERT_EQ(join->build, BuildSide::kLeft);
+    const auto* filter = std::get_if<FilterNode>(join->right.get());
+    ASSERT_NE(filter, nullptr) << Explain(plan);
+    const auto* group = std::get_if<GroupAggregateNode>(filter->input.get());
+    ASSERT_NE(group, nullptr);
+    ASSERT_EQ(group->aggregates.size(), 1U);
+    ASSERT_EQ(filter->predicates.size(), 1U);
+    const auto& predicate = filter->predicates.front();
+    const ColumnId aggregate_id = group->aggregates.front().id;
+    EXPECT_EQ(group->aggregates.front().kind, kind);
+    EXPECT_EQ(predicate.column.value_or(BoundColumn{}).id, aggregate_id);
+    EXPECT_EQ(predicate.op, CompareOp::kGt);
+    EXPECT_FALSE(std::ranges::contains(join->needed_above, aggregate_id));
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+    EXPECT_EQ(Explain(Optimized(plan)), Explain(plan));
+  }
+}
+
+TEST(OptimizerTest, KeepsProbeBatchesForACheckedCastBeforeALimit) {
+  auto catalog = MakeCatalog();
+  ASSERT_TRUE(catalog
+                  .Register("events", std::make_shared<testing::FakeTable>(
+                                          testing::AllTypesSchema(), 100'000))
+                  .ok());
+  // The join can gather qualifying rows from a later window into its first output batch.
+  // Under LIMIT that can expose an overflowing cast on a later row.
+  const std::string query =
+      "WITH p AS (SELECT a.i16 AS k, a.i64 AS v FROM t AS a "
+      "WHERE (SELECT COUNT(*) FROM events AS e WHERE e.i32=a.i32)>3) "
+      "SELECT k FROM p WHERE CAST(v AS SMALLINT)>0 ";
+  for (const auto& [tail, pushed] :
+       {std::pair{"LIMIT 1", false}, std::pair{"ORDER BY k LIMIT 1", true}}) {
+    const auto bound = BindSql(query + tail, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    const auto* join = Find<JoinNode>(plan.root);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    EXPECT_EQ(std::holds_alternative<FilterNode>(*join->right), pushed) << Explain(plan);
+    EXPECT_EQ(std::holds_alternative<GroupAggregateNode>(*join->right), !pushed) << Explain(plan);
+  }
+}
+
+TEST(OptimizerTest, ScalarAggregateHidesInputBatchesFromAnOuterLimit) {
+  auto catalog = MakeCatalog();
+  ASSERT_TRUE(catalog
+                  .Register("events", std::make_shared<testing::FakeTable>(
+                                          testing::AllTypesSchema(), 100'000))
+                  .ok());
+  constexpr std::string_view kGroups =
+      "WITH p AS (SELECT a.i16 AS k, a.i64 AS v FROM t AS a "
+      "WHERE (SELECT COUNT(*) FROM events AS e WHERE e.i32=a.i32)=3) ";
+  // The outer count always consumes its whole input. A separate limit inside that input
+  // can still stop before a later batch reaches a checked cast.
+  for (const auto& [input, pushed] :
+       {std::pair{"p", true},
+        std::pair{"(SELECT k FROM p WHERE CAST(v AS SMALLINT)>0 LIMIT 1) q", false}}) {
+    const auto bound =
+        BindSql(std::format("{}SELECT COUNT(*) FROM {} LIMIT 1", kGroups, input), catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    ASSERT_NE(Find<AggregateNode>(plan.root), nullptr) << Explain(plan);
+    const auto* join = Find<JoinNode>(plan.root);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    ASSERT_EQ(join->build, BuildSide::kLeft);
+    EXPECT_EQ(std::holds_alternative<FilterNode>(*join->right), pushed) << Explain(plan);
+    EXPECT_EQ(std::holds_alternative<GroupAggregateNode>(*join->right), !pushed) << Explain(plan);
+  }
+}
+
+TEST(OptimizerTest, KeepsAggregateComparisonsInOrderAndObservesAdjacentFilters) {
+  const ColumnId count_id{21};
+  const auto group =
+      Node(GroupAggregateNode{.input = FourFields(1),
+                              .keys = {FieldOf(1, 1)},
+                              .key_ids = {ColumnId{20}},
+                              .aggregates = {{.kind = AggKind::kCountStar, .id = count_id}}});
+  auto key = FieldOf(1, 1);
+  key.id = ColumnId{20};
+  const auto join = Node(JoinNode{.kind = JoinKind::kInner,
+                                  .left = group,
+                                  .right = FourFields(11),
+                                  .keys = {{.left = key, .right = FieldOf(11, 1)}},
+                                  .build = BuildSide::kRight});
+  const BoundColumn count{.id = count_id, .name = "n"};
+  const Constant three{.type = count.type, .value = Int128{3}};
+  std::vector<Predicate> bounds;
+  for (const auto op : {CompareOp::kGe, CompareOp::kGt, CompareOp::kEq}) {
+    bounds.push_back({.column = count, .op = op, .constant = three});
+  }
+  const auto lower = Node(FilterNode{.input = join, .predicates = bounds});
+  const auto pushed = Optimized(PlanOver(lower));
+  const auto* placed = std::get_if<JoinNode>(pushed.root.get());
+  ASSERT_NE(placed, nullptr) << Explain(pushed);
+  const auto* filter = std::get_if<FilterNode>(placed->left.get());
+  ASSERT_NE(filter, nullptr);
+  ASSERT_EQ(filter->predicates.size(), bounds.size());
+  for (std::size_t i = 0; i < bounds.size(); ++i) {
+    EXPECT_EQ(filter->predicates[i].op, bounds[i].op);
+  }
+  // When the aggregate result itself is the join key, only its exact equality propagates.
+  auto count_join = std::get<JoinNode>(*join);
+  count_join.keys = {{.left = count, .right = FieldOf(11, 2)}};
+  const auto linked = Optimized(
+      PlanOver(Node(FilterNode{.input = Node(std::move(count_join)), .predicates = bounds})));
+  const auto* linked_join = std::get_if<JoinNode>(linked.root.get());
+  ASSERT_NE(linked_join, nullptr) << Explain(linked);
+  const auto* inferred = std::get_if<FilterNode>(linked_join->right.get());
+  ASSERT_NE(inferred, nullptr);
+  ASSERT_EQ(inferred->predicates.size(), 1U);
+  EXPECT_EQ(inferred->predicates.front().op, CompareOp::kEq);
+  EXPECT_EQ(Explain(Optimized(linked)), Explain(linked));
+  // A total comparison on the build doesn't prevent the existing equality pushdown.
+  const auto build = FieldOf(11, 1);
+  const Predicate build_range{
+      .column = build, .op = CompareOp::kGt, .constant = {.type = build.type, .value = Int128{0}}};
+  const auto split = Optimized(
+      PlanOver(Node(FilterNode{.input = join, .predicates = {bounds.back(), build_range}})));
+  const auto* above = std::get_if<FilterNode>(split.root.get());
+  ASSERT_NE(above, nullptr) << Explain(split);
+  ASSERT_EQ(above->predicates.size(), 1U);
+  EXPECT_EQ(above->predicates.front().op, CompareOp::kGt);
+  const auto* split_join = std::get_if<JoinNode>(above->input.get());
+  ASSERT_NE(split_join, nullptr);
+  EXPECT_TRUE(std::holds_alternative<FilterNode>(*split_join->left));
+  EXPECT_EQ(Explain(Optimized(split)), Explain(split));
+  // A neighboring filter can still evaluate a row rejected by the lower filter's mask.
+  const Predicate mixed{.kind = Predicate::Kind::kCompareColumns,
+                        .column = count,
+                        .other = FieldOf(11, 1),
+                        .op = CompareOp::kLt};
+  const auto adjacent =
+      Optimized(PlanOver(Node(FilterNode{.input = lower, .predicates = {mixed}})));
+  ASSERT_TRUE(std::holds_alternative<FilterNode>(Nth(adjacent, 1))) << Explain(adjacent);
+  EXPECT_TRUE(std::holds_alternative<JoinNode>(Nth(adjacent, 2))) << Explain(adjacent);
+  const auto limited = Node(LimitNode{.input = lower, .limit = 10});
+  const auto through_limit =
+      Optimized(PlanOver(Node(FilterNode{.input = limited, .predicates = {mixed}})));
+  ASSERT_TRUE(std::holds_alternative<LimitNode>(Nth(through_limit, 1))) << Explain(through_limit);
+  ASSERT_TRUE(std::holds_alternative<FilterNode>(Nth(through_limit, 2))) << Explain(through_limit);
+  EXPECT_TRUE(std::holds_alternative<JoinNode>(Nth(through_limit, 3))) << Explain(through_limit);
+  // With no upper filter reading its mask, LIMIT can pull already-filtered probe groups.
+  const auto root_limit = Optimized(PlanOver(limited));
+  EXPECT_TRUE(std::holds_alternative<JoinNode>(Nth(root_limit, 1))) << Explain(root_limit);
+  // After a projection materializes the lower selection, a second filter can still produce
+  // partial batches. Keep their boundaries for the value-dependent comparison above it.
+  const auto projected =
+      Node(ProjectNode{.input = lower, .columns = {count, build}, .ids = {count.id, build.id}});
+  const auto masked = Node(FilterNode{.input = projected, .predicates = {bounds.front()}});
+  const auto observed =
+      Optimized(PlanOver(Node(FilterNode{.input = masked, .predicates = {mixed}})));
+  const auto* guarded_join = Find<JoinNode>(observed.root);
+  ASSERT_NE(guarded_join, nullptr);
+  EXPECT_TRUE(std::holds_alternative<GroupAggregateNode>(*guarded_join->left)) << Explain(observed);
+  bounds.push_back(mixed);
+  const auto together = Optimized(PlanOver(Node(FilterNode{.input = join, .predicates = bounds})));
+  EXPECT_TRUE(std::holds_alternative<JoinNode>(Nth(together, 1))) << Explain(together);
+  const auto* kept = std::get_if<FilterNode>(together.root.get());
+  ASSERT_NE(kept, nullptr);
+  EXPECT_EQ(kept->predicates.size(), bounds.size());
+}
+
+TEST(OptimizerTest, ADecimalComparedInDoubleKeepsTheGroupingKeyRestriction) {
+  // Compare the completed decimal MIN with a DOUBLE and fix the integer grouping key in the
+  // same filter. Only the key can reach the rows that feed the aggregation.
+  const BoundColumn key{.id = ColumnId{20}, .name = "i", .type = LogicalType::kInteger};
+  const auto decimal = LogicalType::Decimal(15, 2);
+  const BoundColumn result{.id = ColumnId{21}, .name = "minimum", .type = decimal};
+  const auto group = Node(GroupAggregateNode{
+      .input = Node(ScanNode{.table = MakeCatalog().Find("dec"),
+                             .table_name = "dec",
+                             .fields = {0, 4},
+                             .ids = {ColumnId{1}, ColumnId{2}}}),
+      .keys = {{.id = ColumnId{2}, .name = "i", .type = key.type}},
+      .key_ids = {key.id},
+      .aggregates = {{.kind = AggKind::kMin,
+                      .arg = BoundColumn{.id = ColumnId{1}, .name = "p", .type = decimal},
+                      .type = decimal,
+                      .id = result.id}}});
+  const auto join = Node(JoinNode{.kind = JoinKind::kInner,
+                                  .left = group,
+                                  .right = FourFields(11),
+                                  .keys = {{.left = key, .right = FieldOf(11, 1)}},
+                                  .build = BuildSide::kRight});
+  const auto plan = Optimized(PlanOver(Node(FilterNode{
+      .input = join,
+      .predicates = {{.column = result,
+                      .op = CompareOp::kGt,
+                      .constant = {.type = LogicalType::kDouble, .value = 80.25}},
+                     {.column = key, .constant = {.type = key.type, .value = Int128{7}}}}})));
+  const auto* placed = std::get_if<JoinNode>(plan.root.get());
+  ASSERT_NE(placed, nullptr) << Explain(plan);
+  const auto* upper = std::get_if<FilterNode>(placed->left.get());
+  ASSERT_NE(upper, nullptr);
+  ASSERT_EQ(upper->predicates.size(), 1U);
+  EXPECT_EQ(upper->predicates.front().op, CompareOp::kGt);
+  const auto* grouped = std::get_if<GroupAggregateNode>(upper->input.get());
+  ASSERT_NE(grouped, nullptr);
+  const auto* lower = std::get_if<FilterNode>(grouped->input.get());
+  ASSERT_NE(lower, nullptr);
+  ASSERT_EQ(lower->predicates.size(), 1U);
+  ASSERT_TRUE(IsIntegerOrDateEquality(lower->predicates.front()));
+  EXPECT_EQ(std::get<Int128>(lower->predicates.front().constant.value), Int128{7});
+  EXPECT_EQ(Explain(Optimized(plan)), Explain(plan));
+}
+
 TEST(OptimizerTest, GroupKeyCrossesDecimalComputeOnlyWithBoundsForEveryPart) {
   const auto schema =
       arrow::schema({arrow::field("k", arrow::int16()), arrow::field("x", arrow::decimal128(4, 1)),
@@ -1245,13 +1468,13 @@ TEST(OptimizerTest, ReconsidersFilteredGroupsForAParallelJoinProbe) {
     int64_t fact_max = kLabels - 1;
     int threads = 4;
     int64_t ratio = 100;
-    bool filtered = true;
+    std::string_view restriction = " WHERE bucket=2";
     bool wide_sum = false;
   };
   const auto run = [&](Scenario sample, bool expect_flip) {
     SCOPED_TRACE(std::format("parts={} complete={} max={} threads={} ratio={} filtered={} wide={}",
                              sample.multipart, sample.complete, sample.fact_max, sample.threads,
-                             sample.ratio, sample.filtered, sample.wide_sum));
+                             sample.ratio, sample.restriction, sample.wide_sum));
     Catalog catalog;
     auto readings = std::make_shared<testing::FakeTable>(
         arrow::schema(
@@ -1281,7 +1504,7 @@ TEST(OptimizerTest, ReconsidersFilteredGroupsForAParallelJoinProbe) {
         "SELECT a,b,c,d,bucket,n FROM (SELECT a,b,c,d,bucket,SUM(v) AS n "
         "FROM readings JOIN labels ON readings.k=labels.k "
         "GROUP BY a,b,c,d,bucket) g";
-    const auto bound = BindSql(sql + (sample.filtered ? " WHERE bucket=2" : ""), catalog);
+    const auto bound = BindSql(sql + std::string(sample.restriction), catalog);
     ASSERT_TRUE(bound.ok()) << bound.status();
     const BindOptions options{.build_side_ratio = sample.ratio,
                               .threads = sample.threads,
@@ -1313,8 +1536,9 @@ TEST(OptimizerTest, ReconsidersFilteredGroupsForAParallelJoinProbe) {
   run({.complete = false}, false);    // missing bounds in one scan part
   run({.fact_max = kLabels}, false);  // the old scan build can prune a grouped key
   run({.ratio = 200}, false);
-  run({.filtered = false}, false);  // another grouping key still varies
-  run({.wide_sum = true}, false);   // changing accumulation order could hide overflow
+  run({.restriction = ""}, false);                 // another grouping key still varies
+  run({.restriction = " WHERE bucket>2"}, false);  // multiple buckets can survive for each join key
+  run({.wide_sum = true}, false);  // changing accumulation order could hide overflow
 }
 
 const JoinNode& JoinBelowProject(const LogicalPlan& plan) {
@@ -2199,14 +2423,33 @@ LogicalPlan Path2Plan(std::vector<ExprPtr> conjuncts, int64_t outer, std::option
                    1));
 }
 
-// The restriction below the group aggregate, or nullptr where the gate refused.
-const JoinNode* RestrictionUnder(const LogicalPlan& plan) {
+// Path 2 groups its right input. When it probes those groups, the join may read them
+// through the consumer's comparison on the aggregate result.
+const GroupAggregateNode* ScalarGroupUnder(const LogicalPlan& plan) {
   const auto* join = JoinUnder(plan);
   if (join == nullptr) {
     return nullptr;
   }
-  const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
-  return grouped == nullptr ? nullptr : std::get_if<JoinNode>(grouped->input.get());
+  const auto* filter = std::get_if<FilterNode>(join->right.get());
+  const auto* group =
+      std::get_if<GroupAggregateNode>(filter != nullptr ? filter->input.get() : join->right.get());
+  if (group != nullptr && filter != nullptr) {
+    EXPECT_EQ(join->kind, JoinKind::kInner);
+    EXPECT_EQ(join->build, BuildSide::kLeft);
+    EXPECT_EQ(filter->predicates.size(), 1U);
+    for (const auto& p : filter->predicates) {
+      EXPECT_TRUE(p.kind == Predicate::Kind::kCompare && p.column &&
+                  std::ranges::contains(group->aggregates, p.column->id, &AggregateCall::id))
+          << Explain(plan);
+    }
+  }
+  return group;
+}
+
+// The restriction below the group aggregate, or nullptr where the gate refused.
+const JoinNode* RestrictionUnder(const LogicalPlan& plan) {
+  const auto* group = ScalarGroupUnder(plan);
+  return group == nullptr ? nullptr : std::get_if<JoinNode>(group->input.get());
 }
 
 // The reduction the ADR defers under its own name: the aggregation's input restricted to the rows
@@ -2424,9 +2667,7 @@ TEST(OptimizerTest, TheSemiJoinReductionLeavesOneKeyToTheDynamicFilter) {
   const LogicalPlan plan =
       Path2Plan({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 10, 1000);
   EXPECT_EQ(RestrictionUnder(plan), nullptr) << Explain(plan);
-  const auto* join = JoinUnder(plan);
-  ASSERT_NE(join, nullptr) << Explain(plan);
-  const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+  const auto* grouped = ScalarGroupUnder(plan);
   ASSERT_NE(grouped, nullptr) << Explain(plan);
   EXPECT_TRUE(std::holds_alternative<ScanNode>(*grouped->input)) << Explain(plan);
 }
@@ -2644,9 +2885,7 @@ TEST(OptimizerTest, TheSemiJoinReductionRefusesWhatItCannotShowIsWorthIt) {
   const auto refuses = [&two](int64_t outer, std::optional<int64_t> inner) {
     const LogicalPlan plan = Path2Plan(two, outer, inner);
     EXPECT_EQ(RestrictionUnder(plan), nullptr) << Explain(plan);
-    const auto* join = JoinUnder(plan);
-    ASSERT_NE(join, nullptr) << Explain(plan);
-    const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+    const auto* grouped = ScalarGroupUnder(plan);
     ASSERT_NE(grouped, nullptr) << Explain(plan);
     EXPECT_TRUE(std::holds_alternative<ScanNode>(*grouped->input)) << Explain(plan);
     EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);

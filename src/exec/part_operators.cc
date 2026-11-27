@@ -676,6 +676,27 @@ arrow::Result<std::shared_ptr<PartGroups>> PartGrouper::Finish(ProfileNode* prof
   return std::move(groups_);
 }
 
+namespace {
+
+// Every lookup match belongs to exactly one reader. Keep the original row order within
+// each part, including duplicate matches to a fact row.
+arrow::Status AddPartition(PartGrouper& grouper, const PredicateEvaluator& predicate,
+                           const std::shared_ptr<arrow::RecordBatch>& rows, arrow::MemoryPool* pool,
+                           ProfileNode* profile) {
+  ARROW_ASSIGN_OR_RAISE(auto selected, predicate.Evaluate(*rows, pool, /*kleene=*/false));
+  auto mask = std::static_pointer_cast<arrow::BooleanArray>(selected.make_array());
+  const int64_t count = mask->true_count();
+  if (count == 0) {
+    return arrow::Status::OK();
+  }
+  if (count == rows->num_rows()) {
+    return grouper.Add(*rows, profile);
+  }
+  return grouper.Add(Batch{.data = rows, .selection = std::move(mask)}, profile);
+}
+
+}  // namespace
+
 // ---- PartGroupAggregateOperator ----
 
 PartGroupAggregateOperator::PartGroupAggregateOperator(
@@ -696,7 +717,7 @@ PartGroupAggregateOperator::~PartGroupAggregateOperator() = default;
 const BatchPartition* PartGroupAggregateOperator::RequestPartitioning(int column,
                                                                       PartitionRequest request) {
   if (column < 0 || std::cmp_greater_equal(column, keys_.size()) ||
-      requested_layout_ != LocalGroupLayout::kAdaptive || top_n_) {
+      requested_layout_ != LocalGroupLayout::kAdaptive || top_n_ || !domain_predicates_.empty()) {
     return nullptr;
   }
   const auto key = static_cast<std::size_t>(column);
@@ -733,7 +754,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   opened_ = true;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
                aggregates = aggregates_, width = input_width_, profile = profile(),
-               layout = layout_, routing_key = routing_key_](
+               layout = layout_, routing_key = routing_key_, predicates = domain_predicates_](
                   int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
     const ProfileTimer part_time(profile, "part_time");
     ARROW_ASSIGN_OR_RAISE(PartGrouper grouper,
@@ -741,12 +762,29 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
     if (routing_key) {
       grouper.SetRoutingKey(routing_key);
     }
-    ARROW_RETURN_NOT_OK(
-        RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
-          ARROW_RETURN_NOT_OK(grouper.Add(batch, profile));
-          return true;
-        }));
-    return grouper.Finish(profile);
+    PartTable result;
+    if (predicates.empty()) {
+      ARROW_RETURN_NOT_OK(
+          RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
+            ARROW_RETURN_NOT_OK(grouper.Add(batch, profile));
+            return true;
+          }));
+    } else {
+      const bool separate_states =
+          predicates.size() == 2 && !routing_key && layout == LocalGroupLayout::kAdaptive;
+      ANTB1_CHECK(separate_states);
+      ARROW_ASSIGN_OR_RAISE(auto second, PartGrouper::Make(keys, aggregates, width, part_ctx));
+      ARROW_RETURN_NOT_OK(
+          RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
+            ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(batch, part_ctx.pool));
+            ARROW_RETURN_NOT_OK(AddPartition(grouper, predicates[0], rows, part_ctx.pool, profile));
+            ARROW_RETURN_NOT_OK(AddPartition(second, predicates[1], rows, part_ctx.pool, profile));
+            return true;
+          }));
+      ARROW_ASSIGN_OR_RAISE(result.second, second.Finish(profile));
+    }
+    ARROW_ASSIGN_OR_RAISE(result.first, grouper.Finish(profile));
+    return result;
   };
   // Merge keeps this full backlog for destination lanes. Its scan lookahead can be smaller.
   scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
@@ -779,10 +817,16 @@ arrow::Status PartGroupAggregateOperator::Merge() {
       break;
     }
     if (profile() != nullptr) {
-      RecordGroupCounts(*profile(), **part, layout_);
+      RecordGroupCounts(*profile(), *part->first, layout_);
     }
-    const std::size_t partitions =
-        (*part)->partitioned ? GroupTable::kPartitions : (*part)->table->num_partitions();
+    const std::size_t per_domain =
+        part->first->partitioned ? GroupTable::kPartitions : part->first->table->num_partitions();
+    const std::size_t partitions = part->second ? 2 * per_domain : per_domain;
+    if (domain_counters_ != nullptr && part->second) {
+      domain_counters_->Add("split_scan_parts", MetricUnit::kCount, 1);
+      domain_counters_->Add("split_rows_0", MetricUnit::kCount, part->first->local_rows);
+      domain_counters_->Add("split_rows_1", MetricUnit::kCount, part->second->local_rows);
+    }
     if (lanes == nullptr) {
       tables_.reserve(partitions);
       for (std::size_t p = 0; p < partitions; ++p) {
@@ -793,32 +837,35 @@ arrow::Status PartGroupAggregateOperator::Merge() {
       lanes = std::make_unique<PartitionLanes>(partitions, executor_, window_, budget_);
     }
     ANTB1_CHECK(tables_.size() == partitions);
-    const int64_t part_local_rows = (*part)->local_rows;
-    const int64_t part_raw_rows = (*part)->raw_rows;
-    const std::uint32_t part_local_groups = tune_scans ? (*part)->table->num_groups() : 0;
-    status = lanes->Add(index, [this, groups = *std::move(part)](std::size_t p) -> arrow::Status {
-      // The rest of each path's cost: a part's groups re-inserted here, against its routed rows
-      // inserted here for the first time. Both add into the same metric as their part-side halves,
-      // so local_path and routed_path are each one path's whole cost.
-      {
-        const ProfileTimer merging(
-            profile(), layout_ == LocalGroupLayout::kAdaptive ? "local_path" : "lane_merge");
-        if (groups->partitioned) {
-          if (auto local = groups->partitioned->ReleasePartition(p)) {
-            ARROW_RETURN_NOT_OK(tables_[p]->Merge(*local));
+    const int64_t part_local_rows = part->first->local_rows;
+    const int64_t part_raw_rows = part->first->raw_rows;
+    const std::uint32_t part_local_groups = tune_scans ? part->first->table->num_groups() : 0;
+    status = lanes->Add(
+        index, [this, domains = *std::move(part), per_domain](std::size_t lane) -> arrow::Status {
+          const auto& groups = lane < per_domain ? domains.first : domains.second;
+          const std::size_t p = lane < per_domain ? lane : lane - per_domain;
+          // The rest of each path's cost: a part's groups re-inserted here, against its routed rows
+          // inserted here for the first time. Both add into the same metric as their part-side
+          // halves, so local_path and routed_path are each one path's whole cost.
+          {
+            const ProfileTimer merging(
+                profile(), layout_ == LocalGroupLayout::kAdaptive ? "local_path" : "lane_merge");
+            if (groups->partitioned) {
+              if (auto local = groups->partitioned->ReleasePartition(p)) {
+                ARROW_RETURN_NOT_OK(tables_[lane]->Merge(*local));
+              }
+            } else {
+              ARROW_RETURN_NOT_OK(tables_[lane]->MergePartition(*groups->table, p));
+            }
           }
-        } else {
-          ARROW_RETURN_NOT_OK(tables_[p]->MergePartition(*groups->table, p));
-        }
-      }
-      if (p < groups->rows.size()) {  // the part's other rows, after its first batch's groups
-        const ProfileTimer merging(profile(), "routed_path");
-        for (const auto& rows : groups->rows[p]) {
-          ARROW_RETURN_NOT_OK(tables_[p]->Consume(*rows));
-        }
-      }
-      return arrow::Status::OK();
-    });
+          if (p < groups->rows.size()) {  // the part's other rows, after its first batch's groups
+            const ProfileTimer merging(profile(), "routed_path");
+            for (const auto& rows : groups->rows[p]) {
+              ARROW_RETURN_NOT_OK(tables_[lane]->Consume(*rows));
+            }
+          }
+          return arrow::Status::OK();
+        });
     if (!status.ok()) {
       break;
     }

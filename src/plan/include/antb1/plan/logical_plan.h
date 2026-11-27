@@ -695,6 +695,12 @@ std::vector<LogicalNodePtr> InputsOf(const LogicalNode& node);
 // node's is a programming error (the process aborts).
 LogicalNodePtr WithInputs(const LogicalNode& node, std::vector<LogicalNodePtr> inputs);
 
+// Move a complete conjunction comparing finished aggregate results from above an inner join to
+// its grouped probe. Logical planning uses column ids; physical planning also checks positions
+// and admits the existing integer/DATE equality on grouping keys. Null means no placement.
+enum class GroupedProbeFilterMode : std::uint8_t { kLogical, kPhysical };
+LogicalNodePtr FilterGroupedProbe(const FilterNode& filter, GroupedProbeFilterMode mode);
+
 // The ids of a node's output columns, in order. A node's output takes one of two shapes, and a node
 // with two inputs may take both. It defines new columns where it creates them: Scan (`ids`),
 // Compute (its input's ids, then `ids`), Project (`ids`), Aggregate (each call's id),
@@ -746,6 +752,10 @@ LogicalNodePtr ResolveSubtreePositions(
     const LogicalNodePtr& node, std::source_location location = std::source_location::current());
 LogicalPlan ResolvePositions(const LogicalPlan& plan,
                              std::source_location location = std::source_location::current());
+
+// A sorted join whose outer projection is completely ordered, optionally limited after sorting.
+// Rewrites that can change the order of tied rows can still use it when their values are equal.
+const SortNode* FullyOrderedJoin(const LogicalPlan& plan);
 
 // Why the plan is not resolved, or std::nullopt: the first broken invariant (a reference without an
 // id, or whose id is not exactly once among the ids it reads; a column defined twice in the plan,
