@@ -967,6 +967,38 @@ void CheckDistinctUnion(arrow::internal::Executor* executor) {
   EXPECT_EQ(tiny.bytes_allocated(), 0);
 }
 
+// A duplicate-only input still needs routing scratch for every buffered candidate.
+void CheckDistinctUnionWindow(arrow::internal::Executor* executor) {
+  constexpr int64_t kDistinct = 32'768;
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  std::vector<std::optional<int64_t>> keys(kDistinct);
+  std::ranges::iota(keys, int64_t{0});
+  const auto prefix = arrow::RecordBatch::Make(schema, kDistinct, {Int64s(keys)});
+  const auto repeated = arrow::RecordBatch::Make(
+      schema, kDistinct, {Int64s(std::vector<std::optional<int64_t>>(kDistinct, 1))});
+  for (const int64_t mib : {5, 8}) {
+    SCOPED_TRACE(mib);
+    MemoryBudget budget(mib * 1024 * 1024);
+    std::vector<std::unique_ptr<Operator>> sources;
+    sources.push_back(
+        std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = prefix}}));
+    sources.push_back(std::make_unique<testing::ScriptedSource>(
+        schema, std::vector<Batch>(8, Batch{.data = repeated})));
+    auto op = SetOperationOperator::Make(std::move(sources), {{0}, {0}}, {LogicalType::kBigInt},
+                                         {{.kind = plan::SetTermKind::kInput, .input = 0},
+                                          {.kind = plan::SetTermKind::kInput, .input = 1},
+                                          {.kind = plan::SetTermKind::kUnion, .operands = 2}});
+    ASSERT_TRUE(op.ok()) << op.status();
+    {
+      auto result = Drain(
+          **op, {.pool = &budget, .executor = executor, .threads = kThreads, .budget = &budget});
+      ASSERT_TRUE(result.ok()) << result.status();
+      ASSERT_TRUE((*result)->column(0)->Equals(arrow::ChunkedArray(prefix->column(0))));
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
 // Each operand has two parts with duplicates across batches, and one mostly unique part.
 // The latter repeats just one key and should pass through untouched. Only the set columns
 // define a duplicate: the filter column differs on otherwise identical selected rows.
@@ -1301,6 +1333,7 @@ void CheckDedupProfileAfterRetry(arrow::internal::Executor* pool);
 // part of input 1, and the first failing input decides the error.
 TEST_F(PartOperatorsTest, UnionsKeepInputThenPartOrder) {
   const auto pool = Pool();
+  CheckDistinctUnionWindow(pool.get());
   CheckDedupProfileAfterRetry(pool.get());
   const auto x = Column(0, "x", LogicalType::kBigInt);
   const auto branch = [&x](const std::shared_ptr<MemoryTable>& table) {
