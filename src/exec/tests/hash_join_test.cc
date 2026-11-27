@@ -3553,6 +3553,29 @@ TEST_F(HashJoinTest, LeftJoinResidualsPadAfterTheLastCandidate) {
   }
 }
 
+TEST_F(HashJoinTest, KeylessSingleFindsTheSecondRowUnderAMemoryLimit) {
+  const auto schema = Int64Schema({"k"});
+  std::vector<std::optional<int64_t>> build_keys(1024);
+  std::ranges::iota(build_keys, int64_t{0});
+  const auto table = std::make_shared<MemoryTable>(
+      schema, arrow::RecordBatchVector{BatchOf(schema, {Int64s(build_keys)})}, false);
+  const auto less = Comparison(plan::CompareOp::kLt, ColumnAt(1, LogicalType::kBigInt),
+                               ColumnAt(0, LogicalType::kBigInt));
+  MemoryBudget budget(4 * 1024 * 1024);
+  auto ctx = ContextOf(nullptr, 65'536);
+  ctx.pool = &budget;
+  ctx.budget = &budget;
+  auto join =
+      MakeJoin(SourceOf(schema, {Int64s(std::vector<std::optional<int64_t>>(128, 1024))}),
+               ScanBuild(plan::JoinKind::kSingle, table, {}), {}, true, BuildSide::kRight, {less});
+  ASSERT_NE(join, nullptr);
+  ASSERT_TRUE(join->Open(ctx).ok());
+  const auto failed = join->Next();
+  ASSERT_TRUE(failed.status().IsExecutionError()) << failed.status();
+  EXPECT_NE(failed.status().message().find("More than one row"), std::string::npos);
+  EXPECT_TRUE(join->Close().ok());
+}
+
 // A batch of candidate pairs holds only the columns the residuals read, whichever they are, and
 // the joins give the nested-loop reference: residuals that read no column (1 > 0, which every
 // pair passes, and 1 < 0, which none does), only the build's VARCHAR (bs <> 'x'), only a probe

@@ -45,6 +45,7 @@ TEST(JoinKindTest, EachKindHasItsRow) {
            Row{.kind = JoinKind::kSingle,
                .traits = {.outputs_right = true,
                           .pads_right = true,
+                          .nested_loop = true,
                           .residuals = true,
                           .single_match = true}},
            Row{.kind = JoinKind::kOneRow, .traits = {.outputs_right = true, .one_row = true}},
