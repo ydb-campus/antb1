@@ -2235,6 +2235,29 @@ TEST(OptimizerTest, TheSemiJoinReductionClonesTheBaseBelowAStack) {
       << "a stacked rewrite costs a constant, not a factor: " << Explain(eight);
 }
 
+TEST(OptimizerTest, TheSemiJoinReductionReplaysAWidenedOuterKeyBelowAStack) {
+  auto catalog = MakeCatalog();
+  auto facts = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 250'000);
+  ASSERT_TRUE(catalog.Register("facts", std::move(facts)).ok());
+  const auto bound = BindSql(
+      "SELECT o.i16, (SELECT COUNT(*) FROM t AS a WHERE a.i16 = o.i16), "
+      "(SELECT COUNT(*) FROM facts AS b WHERE b.i32 IS NOT DISTINCT FROM o.i16) FROM t AS o",
+      catalog);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  const LogicalPlan plan = Optimized(*bound);
+  const auto* restriction = RestrictionUnder(plan);
+  ASSERT_NE(restriction, nullptr) << Explain(plan);
+  ASSERT_EQ(restriction->kind, JoinKind::kSemi);
+  ASSERT_EQ(restriction->keys.size(), 1U);
+  EXPECT_TRUE(restriction->keys.front().null_equal);
+  const auto* domain = std::get_if<ComputeNode>(restriction->right.get());
+  ASSERT_NE(domain, nullptr) << Explain(plan);
+  ASSERT_EQ(domain->ids.size(), 1U);
+  EXPECT_EQ(domain->ids.front(), restriction->keys.front().right.id);
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(*domain->input)) << Explain(plan);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+}
+
 // What the base below a stack may not be. A key computed above it -- here a Compute over the lower
 // rewrite defines the upper one's outer column -- is a column no clone of the base carries, so the
 // upper rewrite declines and only the lower one restricts. A base that holds a Limit declines too:
@@ -2321,9 +2344,24 @@ TEST(OptimizerTest, TheSemiJoinReductionDeclinesABaseItCannotClone) {
   EXPECT_EQ(semi_joins(limited), 0U) << Explain(limited);
 }
 
-// One correlated column is ADR 0029's D5 to restrict: it costs a filter where this costs a build
-// and a probe, and restricting such a query as well was measured at 1.420x. More than one key is
-// what D5 cannot reach, so the key count is what this rewrite is gated on.
+TEST(OptimizerTest, TheSemiJoinReductionRestrictsAWidenedInnerKey) {
+  const auto key = Compare(FieldOf(11, 1), FieldOf(1, 2), CompareOp::kEq);
+  const LogicalPlan plan = Path2Plan({key}, 10, 4096);
+  const auto* restriction = RestrictionUnder(plan);
+  ASSERT_NE(restriction, nullptr) << Explain(plan);
+  ASSERT_EQ(restriction->kind, JoinKind::kSemi);
+  ASSERT_EQ(restriction->keys.size(), 1U);
+  const auto* compute = std::get_if<ComputeNode>(restriction->left.get());
+  ASSERT_NE(compute, nullptr) << Explain(plan);
+  ASSERT_EQ(compute->ids.size(), 1U);
+  EXPECT_EQ(restriction->keys.front().left.id, compute->ids.front());
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+
+  const LogicalPlan small = Path2Plan({key}, 10, 4095);
+  EXPECT_EQ(RestrictionUnder(small), nullptr) << Explain(small);
+}
+
+// D5 can filter this single column at its scan. An additional semi join would repeat that work.
 TEST(OptimizerTest, TheSemiJoinReductionLeavesOneKeyToTheDynamicFilter) {
   const LogicalPlan plan =
       Path2Plan({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 10, 1000);
@@ -2439,7 +2477,7 @@ LogicalNodePtr FourFieldsSetOperation(int64_t rows) {
   return Node(std::move(node));
 }
 
-// A set operation below the aggregation stops the offer as a union does (ReadsAJoinOrUnion, ADR
+// A set operation below the aggregation stops the offer as a union does (ADR
 // 0039): its arm drops it, so the reduction restricts the key over it.
 TEST(OptimizerTest, TheSemiJoinReductionRestrictsOneKeyOverASetOperation) {
   const std::vector<ExprPtr> one = {Compare(FieldOf(71, 1), FieldOf(1, 1), CompareOp::kEq)};

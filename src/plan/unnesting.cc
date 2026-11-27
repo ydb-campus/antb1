@@ -166,13 +166,12 @@ bool RestrictionIsWorth(const std::optional<int64_t>& outer, const std::optional
   return Int128{*inner} >= Int128{kLeastRestriction} * Int128{*outer};
 }
 
-// Whether `node` reads a join or a union: the aggregation's own input holding one is what tells
-// this pass that ADR 0029's filter cannot reach its scan, because the physical planner's offer
-// survives neither on the way down -- a join forwards none to its probe, and a union's inputs are
-// pipelines of their own (ADR 0036). A structural fact about the plan, which is the only kind
-// available here -- and a total one, since a subtree with neither is exactly the chain an offer
-// could travel.
-bool ReadsAJoinOrUnion(const LogicalNodePtr& node) {
+// A join or set operation blocks D5. A computed key also has no scan column to filter,
+// but for a small input the extra hash build can cost more than grouping the whole input.
+// At 3,000 rows with 101 groups it cost 20%; at 4,096 distinct rows it already saved 15%.
+constexpr int64_t kMinComputedKeyRows = 4096;
+
+bool NeedsKeyRestriction(const LogicalNodePtr& node, ColumnId key) {
   if (node == nullptr) {
     return false;
   }
@@ -180,7 +179,32 @@ bool ReadsAJoinOrUnion(const LogicalNodePtr& node) {
       std::holds_alternative<SetOperationNode>(*node)) {
     return true;
   }
-  return std::ranges::any_of(InputsOf(*node), ReadsAJoinOrUnion);
+  if (const auto* compute = std::get_if<ComputeNode>(node.get());
+      compute != nullptr && std::ranges::contains(compute->ids, key) &&
+      EstimateRows(*compute->input).value_or(0) >= kMinComputedKeyRows) {
+    return true;
+  }
+  if (const auto* project = std::get_if<ProjectNode>(node.get())) {
+    const auto at = std::ranges::find(project->ids, key);
+    if (at != project->ids.end()) {
+      key = project->columns.at(Narrow<std::size_t>(at - project->ids.begin())).id;
+    }
+  }
+  return std::ranges::any_of(InputsOf(*node), [key](const LogicalNodePtr& input) {
+    return NeedsKeyRestriction(input, key);
+  });
+}
+
+// A column and its exact widening casts are safe to evaluate on extra binding or probe rows.
+std::optional<ColumnId> WidenedColumn(const Expr& expr) {
+  if (const auto* column = std::get_if<ColumnExpr>(&expr.node)) {
+    return column->id;
+  }
+  if (const auto* cast = std::get_if<CastExpr>(&expr.node);
+      cast != nullptr && IsExactWidening(cast->operand->type, expr.type)) {
+    return WidenedColumn(*cast->operand);
+  }
+  return std::nullopt;
 }
 
 // LIMIT and windows can choose different tied rows on a second evaluation; neither may be cloned
@@ -199,22 +223,37 @@ bool UnsafeToClone(const LogicalNodePtr& node) {
 // The part of a dependent join's left input that the semi-join reduction clones for its domain, or
 // nullptr where it declines: the first node down from `outer` that holds no dependent join and no
 // free variable and outputs every column of `keys`, through the nodes that keep a binding's key
-// values as they are and add no row -- a Filter or a Compute that defines no key, the left input
-// of a dependent join (stacked correlated subqueries, which the pass rewrites after this one), and
-// the left input of a join that outputs no row of it padded. Every binding the outer side makes is
-// then a row of the base, so its keys are a superset of the bound ones, which is all a domain needs
-// to be: the restriction removes only groups no outer row reads.
-LogicalNodePtr DomainBase(const LogicalNodePtr& outer, const std::vector<ColumnId>& keys) {
+// values as they are and add no row -- filters, computes (replaying exact key widenings), the left
+// input of a dependent join (stacked correlated subqueries, which the pass rewrites after this
+// one), and the left input of a join that outputs no row of it padded. Every binding the outer side
+// makes is then a row of the base, so its keys are a superset of the bound ones, which is all a
+// domain needs to be: the restriction removes only groups no outer row reads.
+LogicalNodePtr DomainBase(const LogicalNodePtr& outer, const std::set<ColumnId>& keys) {
   LogicalNodePtr node = outer;
   while (node != nullptr &&
          (FirstDependentJoin(node) != nullptr || !FreeVariables(*node).empty())) {
     if (const auto* filter = std::get_if<FilterNode>(node.get())) {
       node = filter->input;
     } else if (const auto* compute = std::get_if<ComputeNode>(node.get())) {
-      if (std::ranges::any_of(compute->ids, [&keys](ColumnId id) {
-            return std::ranges::find(keys, id) != keys.end();
-          })) {
-        return nullptr;  // a key computed above the base: no clone of it carries the key
+      ComputeNode casts{.span = compute->span};
+      std::set<ColumnId> sources;
+      for (const ColumnId key : keys) {
+        const ExprPtr* expr = DefinedBy(*compute, key);
+        if (expr == nullptr) {
+          sources.insert(key);
+          continue;
+        }
+        const auto source = WidenedColumn(**expr);
+        if (!source || !std::holds_alternative<CastExpr>((*expr)->node)) {
+          return nullptr;
+        }
+        casts.ids.push_back(key);
+        casts.exprs.push_back(*expr);
+        sources.insert(*source);
+      }
+      if (!casts.ids.empty()) {
+        casts.input = DomainBase(compute->input, sources);
+        return casts.input == nullptr ? nullptr : Make(std::move(casts));
       }
       node = compute->input;
     } else if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
@@ -273,23 +312,9 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   // move at all, because D5 had already removed the same rows, while the clone re-read the
   // 600-million-row join its outer side is.
   //
-  // **A join below the aggregation is the case where D5 cannot apply either**, and so is this
-  // rewrite's as much as more than one key is. The reason is not the scan's one filter slot: a join
-  // whose key is not publishable (CanPublishKeyFilter) leaves that slot free and D5 still cannot
-  // reach the scan. What happens is that **the offer does not survive a join** --
-  // physical_planner.cc's Builder threads an AggregateFilter down only through the nodes that keep
-  // every row, and its JoinNode arm forwards no inherited offer to its probe, passing the join's
-  // own instead. Past a pipeline breaker there is no offer at all, the aggregate then having no
-  // part pipeline for one to travel.
-  //
-  // So the test is total rather than incidental: LogicalNode's multi-input alternatives are the two
-  // joins, the union and the set operation (ADR 0039), and the offer crosses none of them (a
-  // union's and a set operation's arms drop it, their inputs being pipelines of their own), so a
-  // subtree with no join and no union *is* the chain an offer
-  // could travel, and ReadsAJoinOrUnion is false exactly where one could arrive.
-  // src/exec/tests/aggregate_filter_test.cc pins that invariant, because threading the offer
-  // through a join or a union is a natural change to make and would silently leave this gate paying
-  // for a reduction D5 had already made.
+  // For a single key, follow the filter through the same column remaps as the physical planner.
+  // It stops at a join, a union, or a Compute that defines the key (including SQ10's widening).
+  // In those cases the costed semi join can still discard unbound keys before grouping.
   //
   // Measured on the query of the 22 shaped this way: **0.931x** and a peak of 483 MiB against
   // 1,011, its aggregation building 47,107 groups over 64,000 rows where it built 11,829,402 over
@@ -306,7 +331,8 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   // the join drops the probe rows that match nothing (ProbeDropsUnmatchedRows), while a LEFT join
   // keeps every outer row and builds the aggregation. Without the restriction it would group and
   // build every inner key.
-  if (join_back == JoinBack::kInner && equivalent.size() < 2 && !ReadsAJoinOrUnion(input)) {
+  if (join_back == JoinBack::kInner && equivalent.size() == 1 &&
+      !NeedsKeyRestriction(input, equivalent.begin()->second)) {
     return input;
   }
   // **An outer side holding a dependent join is not cloned whole, and that is what bounds the
@@ -325,10 +351,9 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   // enter `join.left` through a dependent join, which the base holds none of, and the clone lands
   // in the new join's right input, where a free variable would fail the query with an internal
   // error rather than decline.
-  std::vector<ColumnId> wanted;  // the outer columns the restriction keys on
-  wanted.reserve(equivalent.size());
+  std::set<ColumnId> wanted;  // the outer columns the restriction keys on
   for (const auto& [outer_id, inner_id] : equivalent) {
-    wanted.push_back(outer_id);
+    wanted.insert(outer_id);
   }
   const LogicalNodePtr base = DomainBase(join.left, wanted);
   if (base == nullptr) {
@@ -2860,19 +2885,6 @@ std::vector<KeyParts> MembershipEquivalents(const LogicalNodePtr& right,
     }
   }
   return keys;
-}
-
-// Substitution also evaluates the probe on inner keys with no matching outer row. Only a column
-// and exact widening casts are safe there; an arbitrary cast or arithmetic could newly fail.
-std::optional<ColumnId> WidenedColumn(const Expr& expr) {
-  if (const auto* column = std::get_if<ColumnExpr>(&expr.node)) {
-    return column->id;
-  }
-  if (const auto* cast = std::get_if<CastExpr>(&expr.node);
-      cast != nullptr && IsExactWidening(cast->operand->type, expr.type)) {
-    return WidenedColumn(*cast->operand);
-  }
-  return std::nullopt;
 }
 
 // Keep an enclosing probe's mark in this block when a same-type key represents its column;
