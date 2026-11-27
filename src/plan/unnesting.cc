@@ -1681,7 +1681,7 @@ arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation,
 
 // Evaluate error-prone maps only for actual bindings.
 arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlation,
-                                                   LogicalNodePtr input,
+                                                   const LogicalNodePtr& input,
                                                    const std::map<ColumnId, BoundColumn>& carried,
                                                    const Representatives& representatives,
                                                    const Equivalences& equivalences) {
@@ -1709,7 +1709,7 @@ arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlatio
   }
   const auto estimate = EstimateRows(*input);
   return Make(JoinNode{.kind = JoinKind::kSemi,
-                       .left = std::move(input),
+                       .left = input,
                        .right = domain.node,
                        .keys = std::move(keys),
                        .build = BuildSide::kRight,
@@ -2472,16 +2472,9 @@ arrow::Result<Rewritten> PartitionedBlock(const Correlation& correlation, const 
     return step.role == Role::kSets;
   });
   bool at_most_one = false;
-  const auto restrict_membership = [&] -> arrow::Status {
-    if (restricted || (!single && !correlation.join.membership.has_value()) ||
-        (correlation.join.kind == JoinKind::kAnti && !aggregate_set)) {
-      return arrow::Status::OK();
-    }
-    ARROW_ASSIGN_OR_RAISE(right, RestrictBindingInput(correlation, std::move(right), carried,
-                                                      representatives, equivalences));
-    restricted = true;
-    return arrow::Status::OK();
-  };
+  const bool needs_bindings =
+      single || (correlation.join.membership.has_value() &&
+                 (correlation.join.kind != JoinKind::kAnti || aggregate_set));
   for (const Step& step : std::ranges::reverse_view(spine.steps)) {
     switch (step.role) {
       case Role::kDropped:
@@ -2508,9 +2501,12 @@ arrow::Result<Rewritten> PartitionedBlock(const Correlation& correlation, const 
           right = Make(std::move(out));
         } else {
           ComputeNode out = std::get<ComputeNode>(*step.node);
-          if (std::ranges::any_of(
+          if (needs_bindings && !restricted &&
+              std::ranges::any_of(
                   out.exprs, [](const ExprPtr& expr) { return !SafeBeforeMembership(*expr); })) {
-            ARROW_RETURN_NOT_OK(restrict_membership());
+            ARROW_ASSIGN_OR_RAISE(right, RestrictBindingInput(correlation, right, carried,
+                                                              representatives, equivalences));
+            restricted = true;
           }
           out.input = std::move(right);
           for (ExprPtr& expr : out.exprs) {
