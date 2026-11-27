@@ -1311,8 +1311,9 @@ LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstim
 }  // namespace
 
 GroupFilterContext GroupFilterContext::ForInput(const LogicalNode& parent) const {
-  // Sort reads all its input, then emits ordered windows of the configured batch size.
-  if (std::holds_alternative<SortNode>(parent)) {
+  // A sort emits fresh windows and a global aggregate emits a single row after consuming
+  // its input. In either case, operators above it cannot observe input batch boundaries.
+  if (std::holds_alternative<SortNode>(parent) || std::holds_alternative<AggregateNode>(parent)) {
     return {};
   }
   GroupFilterContext next = *this;

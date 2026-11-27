@@ -199,6 +199,13 @@ class SharedSubPlansFilteredGroupsTest : public ::testing::Test {
     return groups;
   }
 
+  bool SharesFactScan(std::string_view sql) const {
+    const auto bound = BindSql(sql, catalog_);
+    EXPECT_TRUE(bound.ok()) << bound.status();
+    return bound.ok() && std::ranges::any_of(MaterializableSubPlans(Optimized(*bound)),
+                                             &SharedSubPlan::separate_partition_states);
+  }
+
   Catalog catalog_;
   std::shared_ptr<testing::FakeTable> packets_;
 };
@@ -239,6 +246,27 @@ TEST_F(SharedSubPlansFilteredGroupsTest, OrderedJoinSharesTwoLookupBandsWithInde
   }
 }
 
+TEST_F(SharedSubPlansFilteredGroupsTest, EachLookupValueNeedsAPossiblePartForSeparateSums) {
+  const auto lookup = std::make_shared<testing::FakeTable>(packets_->schema(), 20);
+  ASSERT_TRUE(catalog_.Register("lookup", lookup).ok());
+  const auto sql = std::format(
+      "SELECT a.n AS x,b.n AS y FROM ({}) a JOIN ({}) b "
+      "ON a.slot=b.slot ORDER BY x,y",
+      BandSum(4), BandSum(7));
+  lookup->WithParts({5, 5, 10})
+      .WithStats(0, 1, {.min = 3, .max = 5, .rows = 5})
+      .WithStats(1, 1, {.min = 8, .max = 10, .rows = 5});
+  EXPECT_EQ(Combined(sql, false).size(), 1U) << "the last part has unknown bounds";
+  lookup->WithStats(2, 1, {.null_count = 10, .rows = 10});
+  EXPECT_TRUE(Combined(sql, false).empty()) << "the gap between parts excludes 7";
+  lookup->WithStats(1, 1, {.min = 7, .max = 10, .rows = 5});
+  EXPECT_EQ(Combined(sql, false).size(), 1U) << "the two values can come from different parts";
+  lookup->WithStats(0, 1, {.min = 5, .max = 6, .rows = 5});
+  EXPECT_TRUE(Combined(sql, false).empty()) << "the first reader has no eligible part";
+  lookup->WithStats(0, 1, {.min = 5, .max = 3, .rows = 5});
+  EXPECT_EQ(Combined(sql, false).size(), 1U) << "reversed bounds cannot exclude a reader";
+}
+
 TEST_F(SharedSubPlansFilteredGroupsTest, SeparateSumsRequireBothReadersForANonemptyResult) {
   ASSERT_TRUE(
       catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 20))
@@ -260,6 +288,35 @@ TEST_F(SharedSubPlansFilteredGroupsTest, SeparateSumsRequireBothReadersForANonem
                     left, right, BandSum(8))}) {
     EXPECT_TRUE(Combined(query, false).empty()) << query;
   }
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, PricesTheFinalOrderedOutputBeforeSharingAFactScan) {
+  // Each grouped reader fixes the period, even when the lookup has no distinct-count hint.
+  ASSERT_TRUE(
+      catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 100'000))
+          .ok());
+  ASSERT_TRUE(
+      catalog_
+          .Register("copies", std::make_shared<testing::FakeTable>(packets_->schema(), 20'000'000))
+          .ok());
+  const auto pair =
+      std::format(" FROM ({}) a JOIN ({}) b ON a.slot=b.slot", BandSum(4), BandSum(7));
+  const auto expanded = pair + " JOIN copies c ON a.band_key=c.band";
+  const std::string fixed = "SELECT a.n AS x,b.n AS y";
+  // Repeated matches in the third table can overflow the final output cap even when the two
+  // producer results are tiny. A top-N of the same join still fits.
+  EXPECT_TRUE(SharesFactScan(fixed + pair + " ORDER BY x,y"));
+  EXPECT_TRUE(SharesFactScan(fixed + pair + " ORDER BY x,y LIMIT 20000000"));
+  EXPECT_FALSE(SharesFactScan(fixed + expanded + " ORDER BY x,y"));
+  EXPECT_TRUE(SharesFactScan(fixed + expanded + " ORDER BY x,y LIMIT 3"));
+  EXPECT_FALSE(SharesFactScan(fixed + expanded + " ORDER BY x,y LIMIT 20000000"));
+  const auto text = "SELECT a.n AS x,b.n AS y,c.label AS z" + expanded + " ORDER BY x,y,z";
+  EXPECT_FALSE(SharesFactScan(text));
+  EXPECT_TRUE(SharesFactScan(text + " LIMIT 3"));
+  // The payload of a string constant is known. Count it even for a bounded result.
+  const auto literal = std::format("SELECT a.n AS x,b.n AS y,'{}' AS z", std::string(4096, 'a'));
+  EXPECT_TRUE(SharesFactScan(literal + expanded + " ORDER BY x,y LIMIT 3"));
+  EXPECT_FALSE(SharesFactScan(literal + expanded + " ORDER BY x,y LIMIT 100000"));
 }
 
 TEST_F(SharedSubPlansFilteredGroupsTest, SeparateSumsNeedALargeProbeAndOneLookupEquality) {
@@ -288,6 +345,103 @@ TEST_F(SharedSubPlansFilteredGroupsTest, SeparateSumsNeedALargeProbeAndOneLookup
   EXPECT_EQ(count("packets", "SUM(p.voltage)", "d.band", "p.slot=d.slot AND p.band=d.band", ""),
             0U);
   EXPECT_EQ(count("packets", "SUM(p.voltage)", "d.band", "p.slot=d.slot", "AND d.slot>4"), 0U);
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, AConstantJoinKeyDoesNotFixItsProjectPlaceholder) {
+  ASSERT_TRUE(
+      catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 20))
+          .ok());
+  const auto bound = BindSql(std::format("SELECT a.slot AS k,a.n AS x,b.n AS y FROM ({}) a "
+                                         "JOIN ({}) b ON a.slot=b.slot ORDER BY k,x,y",
+                                         BandSum(4), BandSum(7)),
+                             catalog_);
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto pair = Optimized(*bound);
+  const auto* order = FullyOrderedJoin(pair);
+  ASSERT_NE(order, nullptr);
+  const auto table = std::make_shared<testing::FakeTable>(packets_->schema(), 20'000'000);
+  const auto next = std::to_underlying(MaxColumnId(*pair.root)) + 1;
+  const BoundColumn input_key{.id = ColumnId{next}, .name = "slot"};
+  const BoundColumn group_key{.id = ColumnId{next + 1}, .name = "slot"};
+  const ColumnId literal{next + 2};
+  const auto scan = std::make_shared<LogicalNode>(
+      ScanNode{.table = table, .table_name = "copies", .fields = {0}, .ids = {input_key.id}});
+  const auto groups = std::make_shared<LogicalNode>(
+      GroupAggregateNode{.input = scan, .keys = {input_key}, .key_ids = {group_key.id}});
+  // Only the first output is a literal; its placeholder happens to name the grouped input.
+  const auto projected = std::make_shared<LogicalNode>(
+      ProjectNode{.input = groups,
+                  .columns = {group_key, group_key},
+                  .constants = {Constant{.type = LogicalType::kBigInt, .value = Int128{1}}},
+                  .ids = {literal, group_key.id}});
+  for (const bool join_literal : {false, true}) {
+    const BoundColumn key{.index = join_literal ? 0 : 1,
+                          .id = join_literal ? literal : group_key.id};
+    auto sort = *order;
+    sort.input = std::make_shared<LogicalNode>(
+        JoinNode{.kind = JoinKind::kInner,
+                 .left = order->input,
+                 .right = projected,
+                 .keys = {JoinKey{.left = sort.keys.front().column, .right = key}}});
+    auto output = std::get<ProjectNode>(*pair.root);
+    output.input = std::make_shared<LogicalNode>(std::move(sort));
+    const LogicalPlan plan{.root = std::make_shared<LogicalNode>(std::move(output)),
+                           .output = pair.output};
+    ASSERT_FALSE(PositionMismatch(plan)) << Explain(plan);
+    EXPECT_EQ(std::ranges::any_of(MaterializableSubPlans(plan),
+                                  &SharedSubPlan::separate_partition_states),
+              !join_literal)
+        << "only joining the actual grouping key proves one match per row";
+  }
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, BoundsFanoutAcrossUnionFilterAndComputedKeys) {
+  ASSERT_TRUE(
+      catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 20))
+          .ok());
+  const auto pair = std::format(
+      "SELECT a.n AS x,b.n AS y FROM ({}) a JOIN ({}) b ON a.slot=b.slot ", BandSum(4), BandSum(7));
+  for (const std::optional<int64_t> rows : {std::optional<int64_t>{20}, std::optional<int64_t>{}}) {
+    const char* name = rows ? "small_copies" : "unknown_copies";
+    ASSERT_TRUE(
+        catalog_.Register(name, std::make_shared<testing::FakeTable>(packets_->schema(), rows))
+            .ok());
+    const auto extra = std::format(
+        "JOIN (SELECT slot+1 AS m FROM {} WHERE band>0 UNION ALL "
+        "SELECT slot+2 AS m FROM {} WHERE band<0) c ON a.slot=c.m ORDER BY x,y",
+        name, name);
+    EXPECT_EQ(SharesFactScan(pair + extra), rows.has_value());
+    EXPECT_TRUE(SharesFactScan(pair + extra + " LIMIT 10"));
+  }
+}
+
+TEST_F(SharedSubPlansFilteredGroupsTest, BoundsGroupsWithinTheEstimatorKeyLimit) {
+  ASSERT_TRUE(
+      catalog_.Register("lookup", std::make_shared<testing::FakeTable>(packets_->schema(), 20))
+          .ok());
+  constexpr int kFields = static_cast<int>(kMaxPredicateDomainKeys) + 1;
+  arrow::FieldVector fields;
+  fields.reserve(kFields);
+  for (int i = 0; i < kFields; ++i) {
+    fields.push_back(arrow::field(std::format("v{}", i), arrow::int64()));
+  }
+  const auto copies = std::make_shared<testing::FakeTable>(arrow::schema(std::move(fields)), kRows);
+  for (int i = 0; i < kFields; ++i) {
+    copies->WithStats(0, i, {.min = 1, .max = 1, .rows = kRows});
+  }
+  ASSERT_TRUE(catalog_.Register("copies", copies).ok());
+  const auto pair = std::format(
+      "SELECT a.n AS x,b.n AS y FROM ({}) a JOIN ({}) b ON a.slot=b.slot ", BandSum(4), BandSum(7));
+  for (const int count : {kFields - 1, kFields}) {
+    std::string keys = "v0";
+    for (int i = 1; i < count; ++i) {
+      keys += std::format(",v{}", i);
+    }
+    const auto query = std::format(
+        "{}JOIN (SELECT v0 FROM copies GROUP BY {}) c ON a.slot=c.v0 ORDER BY x,y", pair, keys);
+    EXPECT_EQ(SharesFactScan(query), count < kFields) << query;
+    EXPECT_TRUE(SharesFactScan(query + " LIMIT 10"));
+  }
 }
 
 TEST_F(SharedSubPlansFilteredGroupsTest, IndependentPlanRediscoversAnOverlappingExactAggregate) {

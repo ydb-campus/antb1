@@ -279,7 +279,8 @@ steps (only step 7 uses more than one thread):
    when its predicates can safely read the probe alone. The aggregate still evaluates every input
    row, and only qualifying groups reach the join. The filter stays above the join when moving it
    could hide a row from an error-producing predicate or pack a later row into a batch evaluated
-   before a limit is satisfied. Group cardinality estimates and shared-reader
+   before a limit is satisfied. A scalar aggregate consumes its input before emitting one row,
+   so a limit above it cannot observe its input batches. Group cardinality estimates and shared-reader
    key lists continue to require their own proofs of which grouping-key values can survive.
    Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
@@ -505,8 +506,16 @@ batches for its original equality. This preserves floating-point addition order 
 materializing the joined fact rows.
 
 The planner considers fact inputs with at least ten million rows and checks the combined group
-estimate against the 256 MiB materialization cap. It requires the final sort to cover all
-observable columns and a result row to depend on both readers. The executor buffers the sorted
+estimate against the 256 MiB materialization cap. If every lookup part excludes one reader's value,
+the independent join can skip the fact scan. When some split candidates exceed the exact-key cap,
+the planner retains the accepted splits and rechecks the remaining branches for exact sharing.
+
+The final sort must cover all observable columns and a result row must depend on both readers.
+The planner also checks the final projection against its own 256 MiB cap. A top-N bounds the
+rows directly. For an unlimited result, the planner requires known output widths and bounds
+the joined rows using table counts and grouping-key domains. Each left row fixes the right
+join keys, limiting the number of groups it can match. A top-N with variable-width columns
+still checks the actual string bytes at execution. The executor buffers the sorted
 result and validates the scans before publication. An empty result can mean that a join skipped
 a reader. In that case, or if the attempt fails, the original execution determines the result
 and the files to validate.

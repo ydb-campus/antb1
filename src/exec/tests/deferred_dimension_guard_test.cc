@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <arrow/api.h>
 #include <gtest/gtest.h>
@@ -77,6 +78,28 @@ TEST_F(DeferredDimensionGuardTest, RetriesWhenTheRetainedOutputExceedsTheSizeCap
   const auto result = Drain(**guarded, {});
   ASSERT_TRUE(result.ok()) << result.status();
   EXPECT_EQ((*result)->num_rows(), 1);
+}
+
+TEST_F(DeferredDimensionGuardTest, SharedGroupsDiscardAllOutputWhenTheFinalResultExceedsTheCap) {
+  const auto combined = [](const plan::LogicalPlan&,
+                           ProfileNode*) -> arrow::Result<std::unique_ptr<Operator>> {
+    // No materialized producer: only the guarded final-output buffer can reach its cap.
+    const auto batch = Payload(1024 * kKiB);
+    return std::make_unique<testing::ScriptedSource>(batch->schema(),
+                                                     std::vector<Batch>(257, Batch{.data = batch}));
+  };
+  const auto answer = Payload(1);
+  ProfileNode profile;
+  auto guarded = MakeGuardedSharedGroups(Payloads({answer}), &profile, BuildPhysicalPlan, combined);
+  ASSERT_TRUE(guarded.ok()) << guarded.status();
+  MemoryBudget budget(std::nullopt);
+  const auto result = Drain(**guarded, {.pool = &budget, .budget = &budget});
+  ASSERT_TRUE(result.ok()) << result.status();
+  ASSERT_EQ((*result)->num_rows(), 1);
+  EXPECT_TRUE((*result)->column(0)->chunk(0)->Equals(*answer->column(0)));
+  EXPECT_TRUE(std::ranges::any_of(profile.metrics(), [](const ProfileMetric& metric) {
+    return metric.name == "shared_fallbacks" && metric.value == 1;
+  }));
 }
 
 TEST_F(DeferredDimensionGuardTest, KeepsDeferredLookupAfterACombinedPlanCannotBeBuilt) {

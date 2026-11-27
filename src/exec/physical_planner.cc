@@ -1926,10 +1926,11 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
   // object, carrying its own column ids, so nothing above a consumer is rewritten and no pass ever
   // sees a DAG -- the sharing lives entirely in a shared_ptr<Table> that ScanNode already holds.
   std::vector<SharedBuild> shared;
-  bool has_split = false;
+  bool declined_split = false;
+  std::vector<plan::LogicalNodePtr> accepted_members;
   std::unordered_map<const plan::LogicalNode*, plan::LogicalNodePtr> replacements;
   std::optional<plan::SharedConsumerFilters> consumer_filters;
-  for (const plan::SharedSubPlan& group : groups) {
+  auto add_group = [&](const plan::SharedSubPlan& group) -> arrow::Status {
     if (!consumer_filters.has_value()) {
       consumer_filters.emplace(plan);
     }
@@ -1944,9 +1945,12 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
     };
     ARROW_ASSIGN_OR_RAISE(auto op, make_producer());
     if (!op) {
-      continue;
+      declined_split |= split;
+      return arrow::Status::OK();
     }
-    has_split |= split;
+    if (split) {
+      accepted_members.insert(accepted_members.end(), group.members.begin(), group.members.end());
+    }
     auto table = std::make_shared<MaterializedTable>(op->output_schema());
     for (std::size_t i = 0; i < group.members.size(); ++i) {
       const plan::LogicalNodePtr& member = group.members[i];
@@ -1983,13 +1987,34 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
                                  .first_producer = std::move(op),
                                  .make_producer = std::move(make_producer),
                                  .join_filter = join_filter});
+    return arrow::Status::OK();
+  };
+  for (const auto& group : groups) {
+    ARROW_RETURN_NOT_OK(add_group(group));
   }
 
   if (require_split) {
     // No physical split survived (e.g. its lookup exceeds the exact-key cap). Leave the guard's
     // profile untouched so the ordinary plan can use its original root and scan boundaries.
-    if (!has_split) {
+    if (accepted_members.empty()) {
       return std::unique_ptr<Operator>{};
+    }
+    if (declined_split) {
+      // The logical selection treated every candidate as covered. Keep the viable splits and
+      // rediscover exact groups, including members previously covered by a declined split.
+      std::erase_if(shared, [](const auto& build) {
+        return build.join_filter == CombinedJoinFilter::kOrdinary;
+      });
+      for (const auto& group : groups) {
+        if (!group.separate_partition_states) {
+          for (const auto& member : group.members) {
+            replacements.erase(member.get());
+          }
+        }
+      }
+      for (const auto& group : plan::MaterializableIndependentSubPlans(plan, accepted_members)) {
+        ARROW_RETURN_NOT_OK(add_group(group));
+      }
     }
     profile = profile == nullptr ? nullptr : profile->Child(0);
   }

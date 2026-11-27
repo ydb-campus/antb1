@@ -145,25 +145,29 @@ struct PeriodSums {
                     .ok());
   }
 
-  arrow::Result<plan::LogicalPlan> Plan(int right_period, bool large,
-                                        std::string_view lookup = "bands") const {
+  static std::string Branch(int period, std::string_view lookup) {
+    return std::format(
+        "SELECT e.account AS k, b.period AS p, SUM(e.amount * b.weight) AS amount "
+        "FROM events e JOIN {} b ON e.day=b.day WHERE b.period={} GROUP BY e.account,b.period",
+        lookup, period);
+  }
+
+  arrow::Result<plan::LogicalPlan> Query(std::string_view sql, bool large) const {
     events->set_claimed_rows(large ? 20'000'000 : 100);
-    const auto branch = [lookup](int value) {
-      return std::format(
-          "SELECT e.account AS k, b.period AS p, SUM(e.amount * b.weight) AS amount "
-          "FROM events e JOIN {} b ON e.day=b.day WHERE b.period={} "
-          "GROUP BY e.account,b.period",
-          lookup, value);
-    };
-    const auto parsed = sql::Parse(
-        std::format("SELECT a.k AS k, a.amount AS x, b.amount AS y FROM ({}) a JOIN ({}) b "
-                    "ON a.k=b.k ORDER BY k,x,y",
-                    branch(5), branch(right_period)));
+    const auto parsed = sql::Parse(sql);
     if (!parsed) {
       return arrow::Status::Invalid("parse failed");
     }
     ARROW_ASSIGN_OR_RAISE(auto bound, plan::Bind(*parsed, catalog, {}));
     return plan::Optimize(bound);
+  }
+
+  arrow::Result<plan::LogicalPlan> Plan(int right_period, bool large,
+                                        std::string_view lookup = "bands") const {
+    return Query(std::format("SELECT a.k AS k, a.amount AS x, b.amount AS y FROM ({}) a JOIN "
+                             "({}) b ON a.k=b.k ORDER BY k,x,y",
+                             Branch(5, lookup), Branch(right_period, lookup)),
+                 large);
   }
 };
 
@@ -226,6 +230,9 @@ TEST_F(SharedBuildsTest, OneScanKeepsEachPartitionSumNullsAndJoinMultiplicity) {
 
 TEST_F(SharedBuildsTest, EmptyJoinedPartitionsRetryWithTheOriginalScans) {
   PeriodSums fixture;
+  const auto bands = std::dynamic_pointer_cast<MemoryTable>(fixture.catalog.Find("bands"));
+  ASSERT_NE(bands, nullptr);
+  bands->set_stats(false);
   auto plan = fixture.Plan(9, true);
   ASSERT_TRUE(plan.ok()) << plan.status();
   MemoryBudget budget(std::nullopt);
@@ -234,6 +241,20 @@ TEST_F(SharedBuildsTest, EmptyJoinedPartitionsRetryWithTheOriginalScans) {
   ASSERT_TRUE(rows.ok()) << rows.status();
   EXPECT_EQ((*rows)->num_rows(), 0);
   EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 1);
+}
+
+TEST_F(SharedBuildsTest, MissingLookupPeriodAvoidsTheSharedFactScan) {
+  PeriodSums fixture;
+  auto plan = fixture.Plan(9, true);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  MemoryBudget budget(std::nullopt);
+  ProfileNode profile;
+  auto rows = RunPeriods(*plan, profile, budget);
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ((*rows)->num_rows(), 0);
+  EXPECT_TRUE(fixture.events->scanned_parts().empty());
+  EXPECT_NE(profile.name(), "SharedGroupPartitions");
+  EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 0);
 }
 
 TEST_F(SharedBuildsTest, SeparateStatesRetryWhenOnlyIndependentGroupsFit) {
@@ -260,8 +281,7 @@ TEST_F(SharedBuildsTest, SeparateStatesRetryWhenOnlyIndependentGroupsFit) {
   EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 1);
 }
 
-TEST_F(SharedBuildsTest, DeclinedLookupUsesOrdinaryPhysicalRoot) {
-  PeriodSums fixture;
+arrow::Status RegisterWideBands(PeriodSums& fixture) {
   const auto schema =
       arrow::schema({arrow::field("day", arrow::int64()), arrow::field("period", arrow::int64()),
                      arrow::field("weight", arrow::float64())});
@@ -273,18 +293,20 @@ TEST_F(SharedBuildsTest, DeclinedLookupUsesOrdinaryPhysicalRoot) {
     days.emplace_back(i);
   }
   const auto keys = testing::Int64s(days);
-  const auto weights = arrow::MakeArrayFromScalar(arrow::DoubleScalar(1.), kRows);
-  ASSERT_TRUE(weights.ok()) << weights.status();
+  ARROW_ASSIGN_OR_RAISE(auto weights, arrow::MakeArrayFromScalar(arrow::DoubleScalar(1.), kRows));
   arrow::RecordBatchVector batches;
   for (const int64_t value : {5, 7}) {
-    auto period = arrow::MakeArrayFromScalar(arrow::Int64Scalar(value), kRows);
-    ASSERT_TRUE(period.ok()) << period.status();
-    batches.push_back(arrow::RecordBatch::Make(schema, kRows, {keys, *period, *weights}));
+    ARROW_ASSIGN_OR_RAISE(auto period,
+                          arrow::MakeArrayFromScalar(arrow::Int64Scalar(value), kRows));
+    batches.push_back(arrow::RecordBatch::Make(schema, kRows, {keys, period, weights}));
   }
-  ASSERT_TRUE(
-      fixture.catalog
-          .Register("wide_bands", std::make_shared<MemoryTable>(schema, std::move(batches), true))
-          .ok());
+  return fixture.catalog.Register("wide_bands",
+                                  std::make_shared<MemoryTable>(schema, std::move(batches), true));
+}
+
+TEST_F(SharedBuildsTest, DeclinedLookupUsesOrdinaryPhysicalRoot) {
+  PeriodSums fixture;
+  ASSERT_TRUE(RegisterWideBands(fixture).ok());
   const auto plan = fixture.Plan(7, true, "wide_bands");
   ASSERT_TRUE(plan.ok()) << plan.status();
   ASSERT_TRUE(std::ranges::any_of(plan::MaterializableSubPlans(*plan),
@@ -299,6 +321,35 @@ TEST_F(SharedBuildsTest, DeclinedLookupUsesOrdinaryPhysicalRoot) {
   EXPECT_EQ((*rows)->num_rows(), 4);
   EXPECT_EQ(MetricSum(profile, "shared_rows"), 0);
   EXPECT_EQ(MetricSum(profile, "split_scan_parts"), 0);
+}
+
+TEST_F(SharedBuildsTest, DeclinedLookupKeepsExactSharingAlongsideAnAcceptedSplit) {
+  PeriodSums fixture;
+  ASSERT_TRUE(RegisterWideBands(fixture).ok());
+  // Only the two wide branches outside the union are candidates for a split. Declining that
+  // split frees the period-7 group to share with its identical copy inside the union.
+  const auto wide = PeriodSums::Branch(7, "wide_bands");
+  const auto sql = std::format(
+      "SELECT a.amount AS v,b.amount AS w,c.amount AS x,d.amount AS y,e.amount AS z "
+      "FROM ({}) a JOIN ({}) b ON a.k=b.k JOIN ({} UNION ALL {}) c ON b.k=c.k "
+      "JOIN ({}) d ON c.k=d.k JOIN ({}) e ON d.k=e.k ORDER BY v,w,x,y,z",
+      PeriodSums::Branch(5, "wide_bands"), wide, wide, PeriodSums::Branch(9, "wide_bands"),
+      PeriodSums::Branch(5, "bands"), PeriodSums::Branch(7, "bands"));
+  const auto plan = fixture.Query(sql, true);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(*plan, &profile);
+  ASSERT_TRUE(op.ok()) << op.status();
+  MemoryBudget budget(std::nullopt);
+  const auto rows = Drain(**op, ExecContext{.pool = &budget, .budget = &budget});
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ((*rows)->num_rows(), 3);
+  EXPECT_EQ(MetricSum(profile, "split_scan_parts"), 2);
+  // The narrow producer emits three groups for each period. The four wide period-7 groups
+  // must be materialized once for their two readers.
+  EXPECT_EQ(MetricSum(profile, "shared_rows"), 10);
+  EXPECT_EQ(fixture.events->scanned_parts().size(), 6U);
+  EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 0);
 }
 
 // A CTE referenced twice: the sub-plan is a grouped aggregate, which reduces, so with a table large

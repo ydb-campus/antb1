@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -107,9 +108,10 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan);
 std::vector<SharedSubPlan> MaterializableSubPlans(const LogicalPlan& plan,
                                                   bool share_filtered_groups = false);
 
-// Recompute non-overlapping exact shares for the fallback. A previously chosen partition
-// must not prevent the independent plan from selecting a different overlapping producer.
-std::vector<SharedSubPlan> MaterializableIndependentSubPlans(const LogicalPlan& plan);
+// Recompute exact shares, excluding the subtrees already used by physically accepted partitions.
+// An independent fallback has no such exclusions.
+std::vector<SharedSubPlan> MaterializableIndependentSubPlans(
+    const LogicalPlan& plan, std::span<const LogicalNodePtr> accepted_members = {});
 
 // The cap used for both the plan-time estimate and the bytes held at execution.
 inline constexpr int64_t kMaxSharedResultBytes = int64_t{256} * 1024 * 1024;

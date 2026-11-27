@@ -1129,6 +1129,33 @@ TEST(OptimizerTest, KeepsProbeBatchesForACheckedCastBeforeALimit) {
   }
 }
 
+TEST(OptimizerTest, ScalarAggregateHidesInputBatchesFromAnOuterLimit) {
+  auto catalog = MakeCatalog();
+  ASSERT_TRUE(catalog
+                  .Register("events", std::make_shared<testing::FakeTable>(
+                                          testing::AllTypesSchema(), 100'000))
+                  .ok());
+  constexpr std::string_view kGroups =
+      "WITH p AS (SELECT a.i16 AS k, a.i64 AS v FROM t AS a "
+      "WHERE (SELECT COUNT(*) FROM events AS e WHERE e.i32=a.i32)=3) ";
+  // The outer count always consumes its whole input. A separate limit inside that input
+  // can still stop before a later batch reaches a checked cast.
+  for (const auto& [input, pushed] :
+       {std::pair{"p", true},
+        std::pair{"(SELECT k FROM p WHERE CAST(v AS SMALLINT)>0 LIMIT 1) q", false}}) {
+    const auto bound =
+        BindSql(std::format("{}SELECT COUNT(*) FROM {} LIMIT 1", kGroups, input), catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimized(*bound);
+    ASSERT_NE(Find<AggregateNode>(plan.root), nullptr) << Explain(plan);
+    const auto* join = Find<JoinNode>(plan.root);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    ASSERT_EQ(join->build, BuildSide::kLeft);
+    EXPECT_EQ(std::holds_alternative<FilterNode>(*join->right), pushed) << Explain(plan);
+    EXPECT_EQ(std::holds_alternative<GroupAggregateNode>(*join->right), !pushed) << Explain(plan);
+  }
+}
+
 TEST(OptimizerTest, KeepsAggregateComparisonsInOrderAndObservesAdjacentFilters) {
   const ColumnId count_id{21};
   const auto group =
