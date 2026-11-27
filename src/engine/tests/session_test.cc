@@ -842,10 +842,9 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   ASSERT_TRUE(session->RegisterParquet("u", {path_}).ok());
   for (const char* sql : {
-           // A correlation the unnesting refuses: an outer column with no inner equivalent, which
-           // only the domain D answers (ADR 0041's SQ9).
-           "SELECT COUNT(*) FROM t WHERE AdvEngineID = "
-           "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID < t.AdvEngineID)",
+           // The binding source contains a LIMIT: computing it twice could pick different rows.
+           "SELECT COUNT(*) FROM (SELECT AdvEngineID FROM t LIMIT 3) o WHERE AdvEngineID = "
+           "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID < o.AdvEngineID)",
            // The shapes the binder itself rejects, each with its own rule.
            "SELECT COUNT(*) FROM t WHERE AdvEngineID > 0 OR AdvEngineID IN "
            "(SELECT u.AdvEngineID FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
@@ -874,6 +873,8 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
         "(SELECT COUNT(*) FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
         "SELECT COUNT(*) FROM t WHERE AdvEngineID = "
         "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
+        "SELECT COUNT(*) FROM t WHERE AdvEngineID = "
+        "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID < t.AdvEngineID)",
         "SELECT COUNT(*) FROM t WHERE AdvEngineID IN "
         "(SELECT u.AdvEngineID FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
         "SELECT COUNT(*) FROM t WHERE AdvEngineID NOT IN "

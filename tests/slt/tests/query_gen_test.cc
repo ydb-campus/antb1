@@ -2688,6 +2688,9 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
           .Minus({Feature::kLayout, Feature::kKeywordCase});
   const std::vector<GenTable> tables = JoinTables();
   const auto gen = MakeOver(tables, 71, {.supported = plain, .target_percent = 0});
+  const auto without_keyless =
+      MakeOver(tables, 71,
+               {.supported = plain.Minus({Feature::kKeylessDomainAggregate}), .target_percent = 0});
   // The kind of the column an AVG reads, by its name (qualifier and case aside).
   const auto kind_of = [&tables](std::string name) -> std::optional<ValueKind> {
     name = name.substr(name.rfind('.') + 1);
@@ -2708,10 +2711,16 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   int avg_integer = 0;
   int avg_decimal = 0;
   int keyed_domains = 0;
+  int keyless_domains = 0;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedAggregate)) {
       continue;
+    }
+    if (!q.features.Has(Feature::kKeylessDomainAggregate)) {
+      const auto previous = without_keyless.Generate(i);
+      EXPECT_EQ(q.sql, previous.sql) << i;
+      EXPECT_EQ(q.features, previous.features) << i;
     }
     ++calls;
     const std::size_t at = q.sql.find("(SELECT ");
@@ -2724,6 +2733,11 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
       ++keyed_domains;
       EXPECT_NE(block.find(" AND "), std::string::npos) << q.sql;
       EXPECT_TRUE(q.features.Has(Feature::kCompareColumns)) << q.sql;
+    }
+    if (q.features.Has(Feature::kKeylessDomainAggregate)) {
+      ++keyless_domains;
+      EXPECT_NE(block.find('<'), std::string::npos) << q.sql;
+      EXPECT_FALSE(q.features.Has(Feature::kKeyedDomainAggregate)) << q.sql;
     }
     // Either order. Subquery first when the conjunct opens with it, so what precedes is the AND or
     // the WHERE; literal first when an operator does, which the generator mirrored.
@@ -2755,6 +2769,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   EXPECT_GT(avg_integer, 0) << "avg over an integer: " << avg_integer;
   EXPECT_GT(avg_decimal, 0) << "avg over a DECIMAL: " << avg_decimal;
   EXPECT_GT(keyed_domains, 0);
+  EXPECT_GT(keyless_domains, 0);
 }
 
 // The variance family (ADR 0037's AG2): written in the select list only, over an integer or a

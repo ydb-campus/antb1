@@ -596,7 +596,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   has one row even over empty input, which its `HAVING` may reject. A positive `LIMIT` does not change existence,
   `LIMIT 0` gives FALSE, and `OFFSET n` tests whether more than n rows survive per binding (after grouping,
   `HAVING` and `DISTINCT`). Grouping and a nonzero offset require an inner equivalent of every outer column
-  the block reads, as correlated scalar aggregates do. Grouping sets containing an empty set among other sets
+  the block reads. Grouping sets containing an empty set among other sets
   remain SQ16. Under `OR`, `NOT` or `CASE`, and in the select items, `ORDER BY`, `GROUP BY` keys and
   aggregate arguments where a correlated value stands, a correlated `EXISTS` over such a block is a mark join on the
   same keys (ADR 0041's SQ8a), two-valued: TRUE where the block has a row that passes its keys and its other conjuncts,
@@ -620,11 +620,12 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   in the block's item moves above the join with it, so a binding without rows reads `0 + value`. An equality of outer
   columns stays in the subquery when an `IS NOT DISTINCT FROM` correlates one of them (for NULLs it is NULL, not
   true), and a correlated `SUM(x + c)` keeps its form, as in DuckDB (no `COUNT`, below).
-  A scalar aggregate can also compare a second enclosing column with an inner column using an inequality
-  when another column pair supplies an equality key (`=` or `IS NOT DISTINCT FROM`). Each comparison must
-  be between plain columns of the same hashable type. SQ9 groups the distinct tuples of enclosing values,
-  matches inner rows on the original predicates, and joins each aggregate back to every occurrence of its
-  tuple, including NULLs.
+  A scalar aggregate can also correlate through inequalities and through AND, OR or NOT over comparisons
+  between plain inner and enclosing columns of the same hashable type. SQ9 groups the distinct tuples of
+  enclosing values. A top-level equality conjunct (`=` or `IS NOT DISTINCT FROM`) supplies a hash key.
+  Without one, a nested loop tests the condition on each inner row for each distinct tuple. As with an
+  explicit inequality join, the estimated pair count has no cutoff and the execution memory budget applies.
+  Each aggregate joins back to every occurrence of its tuple, including NULLs.
   The enclosing input can include previously appended scalar or mark values when the bindings come from
   their left input, including through aliases in a derived table's select list. A binding source that
   needs a pending subquery's result, or contains a LIMIT, a window, or an unresolved correlated filter
@@ -650,7 +651,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   Every other correlated shape
   is exit code 4: a correlated `EXISTS` without a key or whose grouping or offset needs an outer column
   without an inner equivalent, a correlated scalar subquery with `GROUP BY`, `LIMIT` or `OFFSET` or whose outer
-  column has neither an inner equivalent nor a keyed binding domain, an `IN` or `NOT IN` conjunct in a
+  column has neither an inner equivalent nor a supported scalar binding domain, an `IN` or `NOT IN` conjunct in a
   correlated scalar subquery's `HAVING`, a compound
   with an arm that reads an enclosing block; at the subquery
   for one in `HAVING`, whose outer references would read the outer block's groups and not its rows.
@@ -687,7 +688,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   or EXISTS in a conjunct that reads the enclosing block itself: each nested subquery binds to its immediate
   enclosing block, and the outer reference stays in the containing block's correlated filter. The existing key
   and representative requirements still apply; a reference two blocks out remains unsupported. The unnesting's
-  refusals (for example, a scalar aggregate correlated only through an inequality)
+  refusals (for example, an inequality-only scalar aggregate whose binding source contains a LIMIT)
   come once the whole query is bound, after every bind error. A
   correlated `EXISTS` block binds its clauses before the unnesting checks its shape, so its own bind errors
   (including an ungrouped select column) precede an unsupported-shape error. A compound's arms all bind

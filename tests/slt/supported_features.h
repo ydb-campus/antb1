@@ -231,6 +231,8 @@ enum class Feature : std::uint8_t {
   kWindowQuantifier,      // W10a: parsed, execution and independent generator pending
   kWindowFilter,          // W10b: parsed, execution and independent generator pending
   kKeyedDomainAggregate,  // SQ9: a second outer column in a correlated aggregate inequality
+  // SQ9: a scalar aggregate whose correlation has no equality key.
+  kKeylessDomainAggregate,
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -426,6 +428,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_in";
     case Feature::kKeyedDomainAggregate:
       return "keyed_domain_aggregate";
+    case Feature::kKeylessDomainAggregate:
+      return "keyless_domain_aggregate";
     case Feature::kNestedCorrelation:
       return "nested_correlation";
     case Feature::kWindowWholePartition:
@@ -651,6 +655,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedIn,
     Feature::kNestedCorrelation,
     Feature::kKeyedDomainAggregate,
+    Feature::kKeylessDomainAggregate,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,
