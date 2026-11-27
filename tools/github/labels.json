@@ -3,7 +3,7 @@
   { "name": "github-actions", "color": "000000", "description": "GitHub Actions workflow or action updates" },
   { "name": "pixi", "color": "f7c948", "description": "pixi.toml or pixi.lock changes" },
   { "name": "agent-task", "color": "7057ff", "description": "Scoped task suitable for an AI agent" },
-  { "name": "claude", "color": "d97757", "description": "Issues: triggers @claude (author needs write)" },
+  { "name": "claude", "color": "d97757", "description": "Request Claude on an issue or a read-only review on a ready PR" },
   { "name": "codex-review", "color": "10a37f", "description": "Re-run the Codex harness audit on a PR" },
   { "name": "performance", "color": "d93f0b", "description": "Run benchmarks on a PR" },
   { "name": "nightly-failure", "color": "b60205", "description": "Opened automatically when the nightly run fails" },

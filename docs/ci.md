@@ -19,7 +19,7 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | `Agent bootstrap` | `.github/workflows/agent-bootstrap.yml` | pull requests that change `scripts/agent-setup.sh`, `pixi.toml`, `pixi.lock` or the workflow; weekly; manual | a cold `scripts/agent-setup.sh` from both pixi sources, then the tests; advisory |
 | Dependabot | `.github/dependabot.yml` | weekly (Monday) | one grouped PR that updates the pinned GitHub Actions, for releases at least 7 days old |
 | `Claude` | `.github/workflows/claude.yml` | `@claude` in issues, PR comments and reviews; issue label `claude` | advisory: Claude Code works on the issue or PR (write-access gate, no forks) |
-| `Claude review` | `.github/workflows/claude-review.yml` | pull requests opened, ready for review or reopened | advisory: one automatic Claude review per PR, inline comments |
+| `Claude review` | `.github/workflows/claude-review.yml` | a collaborator adds the `claude` label to a ready PR | advisory: read-only Claude review with inline comments |
 | `Codex harness audit` | `.github/workflows/codex-review.yml` | pull requests opened, ready for review or reopened; label `codex-review` | advisory: read-only Codex audit, one sticky comment |
 | `Copilot Setup Steps` | `.github/workflows/copilot-setup-steps.yml` | every Copilot coding-agent task; manual; changes to itself, `pixi.toml` or `pixi.lock` | prepares Copilot's environment (`default` and `lint`, dev build) |
 | `pixi.lock update` | `.github/workflows/pixi-lock-update.yml` | weekly (Monday), manual | PR `build(deps): update pixi.lock` from the antb1-bot App |
