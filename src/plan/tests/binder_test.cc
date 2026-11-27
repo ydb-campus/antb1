@@ -8849,6 +8849,21 @@ TEST(BinderTest, ComputedScalarKeysKeepThrowingGroupsUnevaluated) {
   }
 }
 
+// A row satisfying the binding key may still be excluded by another conjunct. Its derived
+// cast cannot run until the whole correlation holds.
+TEST(BinderTest, ComputedScalarKeysDeclineAnUnprotectedDerivedCast) {
+  constexpr std::string_view kSql =
+      "SELECT (SELECT MAX(i.bad) FROM (SELECT i32 AS k, CAST(i64 AS SMALLINT) AS bad FROM u) i "
+      "WHERE i.k = t.i32 % 7 AND i.k < t.i32 % 7) FROM t";
+  const auto bound = BindSql(kSql, MakeCatalog());
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto optimized = Optimize(*bound);
+  ASSERT_FALSE(optimized.ok());
+  const auto error = GetSqlError(optimized.status());
+  ASSERT_NE(error, nullptr);
+  EXPECT_EQ(error->kind(), kUnsupported);
+}
+
 // Widening an enclosing key for equality does not make its wider inner equivalent a
 // SMALLINT in other expressions. Substituting it there could change arithmetic or overflow.
 TEST(BinderTest, WidenedEqualityKeepsTheOriginalOuterTypeInOtherConjuncts) {

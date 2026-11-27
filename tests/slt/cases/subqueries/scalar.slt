@@ -601,6 +601,56 @@ INTEGER	BIGINT
 8	1
 9	1
 
+# Restrict the inner rows before evaluating the checked projection under its aliases.
+query II rowsort
+SELECT o.id, (SELECT MAX(i.bad)
+              FROM (SELECT id AS k, CAST(i64 AS SMALLINT) AS bad FROM edge) i
+              WHERE i.k = o.id % 13)
+FROM edge o WHERE o.id = 2
+----
+INTEGER	SMALLINT
+2	0
+
+# A matching row must still report the checked cast error.
+statement error out of range
+SELECT (SELECT MAX(i.bad) FROM (SELECT id, CAST(i64 AS SMALLINT) AS bad FROM edge) i
+        WHERE i.id = o.id % 13) FROM edge o WHERE o.id = 0
+
+# A preceding scalar leaves the binding rows intact.
+query III rowsort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE i.id = o.id),
+       (SELECT MAX(i.bad) FROM (SELECT id, CAST(i64 AS SMALLINT) AS bad FROM edge) i
+        WHERE i.id = o.id % 13) FROM edge o WHERE o.id = 2
+----
+INTEGER	BIGINT	SMALLINT
+2	1	0
+
+# A harmless nested EXISTS remains eligible under a computed correlation.
+query I nosort
+SELECT (SELECT COUNT(*) FROM edge i WHERE i.id = o.id % 13
+        AND EXISTS (SELECT id FROM edge t WHERE t.id = i.id))
+FROM edge o WHERE o.id = 2
+----
+BIGINT
+1
+
+# All the inner ids fit the cast. A LIMIT must still leave the unused UNION arm untouched.
+query II nosort
+SELECT o.k, (SELECT MAX(i.bad) FROM (SELECT id, CAST(id AS SMALLINT) AS bad FROM edge) i
+             WHERE i.id = o.k % 13)
+FROM (SELECT 2 AS k, 0 AS unused FROM edge UNION ALL
+      SELECT 3 AS k, CAST(i64 AS SMALLINT) AS unused FROM edge WHERE id = 0) o LIMIT 1
+----
+INTEGER	SMALLINT
+2	2
+
+# A safe derived projection below LIMIT also works with an empty outer scan.
+query I nosort
+SELECT (SELECT MAX(i.bad) FROM (SELECT id, CAST(id AS SMALLINT) AS bad FROM edge LIMIT 4) i
+        WHERE i.id = o.pm_id % 7) FROM promos o
+----
+SMALLINT
+
 # ---- uncorrelated scalar subqueries that are no aggregate (ADR 0041's SQ4a; more in values.slt) ----
 
 # Zero rows give NULL; several rows are an error.

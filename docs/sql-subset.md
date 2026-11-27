@@ -627,11 +627,12 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   representative of that type.
   An equality key can also be an expression on either or both sides when each operand reads only
   its own input and the planner can prove it safe to evaluate before matching. Examples include
-  integer addition within proven bounds, exact casts and string length. The two keys must have
-  an exact common hash type. Duplicate computed values share a group. Ordinary equality skips
-  NULL keys and `IS NOT DISTINCT FROM` matches them. If precomputing a key or grouping unbound
-  rows could introduce an evaluation error, the computed-key rewrite declines (exit 4 when no
-  existing rule applies).
+  integer addition and multiplication within proven bounds, exact casts, `strlen`, `lower` and `upper`.
+  The two keys must have an exact common hash type. Duplicate computed values share a group.
+  Ordinary equality skips NULL keys and `IS NOT DISTINCT FROM` matches them. An inner derived projection with a
+  checked expression can run after a semi join on the actual outer bindings when its input already carries
+  every correlation key. If precomputing a key or grouping unbound rows could still introduce an
+  evaluation error, the rewrite declines (exit 4 when no existing rule applies).
   A scalar aggregate can also correlate through inequalities and through AND, OR or NOT over comparisons
   between plain inner and enclosing columns of the same hashable type. SQ9 groups the distinct tuples of
   enclosing values. A top-level equality conjunct (`=` or `IS NOT DISTINCT FROM`) supplies a hash key.

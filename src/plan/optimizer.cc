@@ -1361,6 +1361,27 @@ bool CanPrecomputeScalarKey(const Expr& expr, const LogicalNodePtr& input) {
   return safety.Arithmetic(expr, input);
 }
 
+bool CanEvaluateUnboundProjection(const Expr& expr, const LogicalNodePtr& input) {
+  if (CanPrecomputeScalarKey(expr, input)) {
+    return true;
+  }
+  const auto* cast = std::get_if<CastExpr>(&expr.node);
+  if (cast == nullptr || !IsInteger(cast->operand->type) || !IsInteger(expr.type)) {
+    return false;
+  }
+  const auto* column = std::get_if<ColumnExpr>(&cast->operand->node);
+  if (column == nullptr) {
+    return false;
+  }
+  ComputeSafety safety;
+  safety.use = ComputeSafety::Use::kScalarKey;
+  const ColumnRange* range = safety.RangeFor(input, column->id);
+  const auto target = RangeOf(expr.type);
+  return range != nullptr && range->exact &&
+         (range->non_null == 0 ||
+          (range->min && *range->min >= target.min && range->max && *range->max <= target.max));
+}
+
 std::vector<Predicate> SharedConsumerFilters::ReaderPredicates(const LogicalNode* member) const {
   std::vector<Predicate> result;
   std::size_t materialized = 0;

@@ -1741,7 +1741,7 @@ arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlatio
                                                    const Representatives& representatives,
                                                    const Equivalences& equivalences) {
   LogicalNodePtr outer = correlation.join.left;
-  if (Traits(correlation.join.kind).single_match) {
+  if (Traits(correlation.join.kind).single_match || correlation.mode == Mode::kValue) {
     std::set<ColumnId> bindings;
     for (const auto& [id, inner] : carried) {
       bindings.insert(id);
@@ -1770,6 +1770,118 @@ arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlatio
                        .build = BuildSide::kRight,
                        .estimate = estimate,
                        .span = correlation.join.span});
+}
+
+// These unary operators cannot emit a row from an empty scan. Join estimates are
+// deliberately excluded: zero estimated rows is not a proof that a LEFT join may drop rows.
+bool ReadsEmptyScan(const LogicalNodePtr& input) {
+  if (const auto* scan = std::get_if<ScanNode>(input.get())) {
+    return scan->table->exact_row_count() == 0;
+  }
+  if (std::holds_alternative<ProjectNode>(*input) || std::holds_alternative<ComputeNode>(*input) ||
+      std::holds_alternative<FilterNode>(*input) || std::holds_alternative<LimitNode>(*input) ||
+      std::holds_alternative<SortNode>(*input)) {
+    return ReadsEmptyScan(InputsOf(*input).front());
+  }
+  return false;
+}
+
+// A derived table may hide a checked expression behind an ordinary column reference.
+const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input) {
+  for (const auto& child : InputsOf(*input)) {
+    if (const auto* unsafe = FirstUnsafeInnerNode(child)) {
+      return unsafe;
+    }
+  }
+  const bool safe = std::visit(
+      [](const auto& node) {
+        using Node = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<Node, ComputeNode>) {
+          return std::ranges::all_of(node.exprs, [&](const ExprPtr& expr) {
+            return CanEvaluateUnboundProjection(*expr, node.input);
+          });
+        } else if constexpr (std::is_same_v<Node, AggregateNode> ||
+                             std::is_same_v<Node, GroupAggregateNode> ||
+                             std::is_same_v<Node, GroupingSetsNode>) {
+          return std::ranges::none_of(node.aggregates, [](const AggregateCall& call) {
+            return call.kind == AggKind::kSingleValue || CanFailOnGroup(call);
+          });
+        } else if constexpr (std::is_same_v<Node, JoinNode>) {
+          const auto traits = Traits(node.kind);
+          return !traits.single_match &&
+                 std::ranges::all_of(node.residual, [](const ExprPtr& expr) {
+                   return SafeBeforeMembership(*expr);
+                 });
+        } else if constexpr (std::is_same_v<Node, DependentJoinNode>) {
+          return !Traits(node.kind).single_match;
+        } else {
+          return !std::is_same_v<Node, WindowNode>;
+        }
+      },
+      *input);
+  return safe ? nullptr : input.get();
+}
+
+bool ConsumesAllBindings(std::span<const Ancestor> above) {
+  return std::ranges::all_of(above, [](const Ancestor& step) {
+    const auto& ancestor = *step.node;
+    return std::holds_alternative<ProjectNode>(ancestor) ||
+           std::holds_alternative<ComputeNode>(ancestor) ||
+           std::holds_alternative<SortNode>(ancestor) ||
+           std::holds_alternative<AggregateNode>(ancestor) ||
+           std::holds_alternative<GroupAggregateNode>(ancestor) ||
+           std::holds_alternative<GroupingSetsNode>(ancestor);
+  });
+}
+
+// Place the exact binding restriction below the deepest checked derived projection. A
+// key must already exist there, and all original correlation conditions must be enforced
+// by the restriction before the checked expression can run.
+arrow::Result<LogicalNodePtr> GuardDerivedProjection(const Correlation& correlation,
+                                                     const LogicalNodePtr& input,
+                                                     const LogicalNode* unsafe,
+                                                     const Representatives& representatives,
+                                                     const Equivalences& equivalences) {
+  std::map<ColumnId, BoundColumn> carried;
+  for (const auto& [outer, inner] : representatives.of) {
+    carried.emplace(outer, equivalences.described.at(inner));
+  }
+  std::vector<LogicalNodePtr> path;
+  LogicalNodePtr node = input;
+  while (node != nullptr) {
+    path.push_back(node);
+    if (const auto* project = std::get_if<ProjectNode>(node.get())) {
+      for (auto& [outer, key] : carried) {
+        const auto at = std::ranges::find(project->ids, key.id);
+        if (at == project->ids.end()) {
+          return correlation.Refuse("whose derived projection cannot carry its correlation key");
+        }
+        key = project->columns.at(Narrow<std::size_t>(at - project->ids.begin()));
+      }
+      node = project->input;
+      continue;
+    }
+    const auto* compute = std::get_if<ComputeNode>(node.get());
+    if (compute == nullptr) {
+      break;
+    }
+    const auto ids = OutputIds(*compute->input);
+    if (!std::ranges::all_of(carried, [&](const auto& binding) {
+          return std::ranges::contains(ids, binding.second.id);
+        })) {
+      break;
+    }
+    if (node.get() == unsafe) {
+      ARROW_ASSIGN_OR_RAISE(node, RestrictBindingInput(correlation, compute->input, carried,
+                                                       representatives, equivalences));
+      for (const auto& layer : path | std::views::reverse) {
+        node = WithInputs(*layer, {std::move(node)});
+      }
+      return node;
+    }
+    node = compute->input;
+  }
+  return correlation.Refuse("with a computed key and a potentially failing derived input");
 }
 
 ExprPtr SubstituteBindings(const ExprPtr& expr, const std::map<ColumnId, BoundColumn>& carried) {
@@ -2061,7 +2173,10 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     const auto it = values.find(id);
     appended.insert_or_assign(id, it == values.end() ? EmptyValue() : it->second);
   }
-  const JoinBack join_back = ProveJoinBack(correlation.above, appended);
+  // An empty outer relation needs no padding. Build that side so the grouped input never opens.
+  const bool empty_outer = computed_keys && ReadsEmptyScan(join.left);
+  const JoinBack join_back =
+      empty_outer ? JoinBack::kInner : ProveJoinBack(correlation.above, appended);
   // Grouping can visit keys that no outer row reads. A newly admitted expression key must
   // not evaluate a throwing argument, residual, or aggregate for one of those groups.
   if (computed_keys) {
@@ -2185,6 +2300,15 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   };
   // Bottom-up: the kept conjuncts over the terminal, then the steps.
   bool restricted = has_domain;
+  if (const auto* unsafe = computed_keys ? FirstUnsafeInnerNode(spine.below) : nullptr) {
+    if (empty_outer || has_domain || !equivalences.kept.empty() ||
+        !ConsumesAllBindings(correlation.above)) {
+      return correlation.Refuse("with a computed key and a potentially failing derived input");
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        right, GuardDerivedProjection(correlation, right, unsafe, representatives, equivalences));
+    restricted = true;
+  }
   if (Traits(join.kind).single_match &&
       std::ranges::any_of(equivalences.kept,
                           [](const Expr* expr) { return !SafeBeforeMembership(*expr); })) {
@@ -2446,15 +2570,16 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     // An inner join, so either side may build: the aggregate it puts on the right is often far
     // larger than the outer rows that probe it (ADR 0026).
     const std::optional<int64_t> right_rows = EstimateRows(*right);
-    LogicalNodePtr out =
-        Make(JoinNode{.kind = JoinKind::kInner,
-                      .left = join.left,
-                      .right = right,
-                      .keys = std::move(keys),
-                      .residual = {},
-                      .build = ChooseBuildSide(left_rows, right_rows, correlation.build_side_ratio),
-                      .estimate = left_rows,
-                      .span = join.span});
+    LogicalNodePtr out = Make(JoinNode{
+        .kind = JoinKind::kInner,
+        .left = join.left,
+        .right = right,
+        .keys = std::move(keys),
+        .residual = {},
+        .build = empty_outer ? BuildSide::kLeft
+                             : ChooseBuildSide(left_rows, right_rows, correlation.build_side_ratio),
+        .estimate = left_rows,
+        .span = join.span});
     return Rewritten{.node = std::move(out), .right = std::move(right)};
   }
   // LEFT builds its right input: it pads that side, which only a probe of the left one can tell
@@ -3100,15 +3225,7 @@ arrow::Result<Rewritten> SingleJoin(const Correlation& correlation) {
     const auto& single = std::get<JoinNode>(*node);
     // A LIMIT can stop between input batches. A filter or join above the scalar may
     // also move below it. Only check bindings eagerly when every outer row is consumed.
-    const bool all_bindings = std::ranges::all_of(correlation.above, [](const Ancestor& step) {
-      const auto& ancestor = *step.node;
-      return std::holds_alternative<ProjectNode>(ancestor) ||
-             std::holds_alternative<ComputeNode>(ancestor) ||
-             std::holds_alternative<SortNode>(ancestor) ||
-             std::holds_alternative<AggregateNode>(ancestor) ||
-             std::holds_alternative<GroupAggregateNode>(ancestor) ||
-             std::holds_alternative<GroupingSetsNode>(ancestor);
-    });
+    const bool all_bindings = ConsumesAllBindings(correlation.above);
     if (!single.keys.empty() || EstimateRows(*single.right) == 0 || !all_bindings) {
       return Rewritten{.node = node, .right = single.right};
     }

@@ -1030,6 +1030,7 @@ constexpr unsigned kExistsMarkPercent = 90;
 constexpr unsigned kExistsBesidePercent = 25;
 constexpr unsigned kMarkFilterPercent = 35;
 constexpr unsigned kMarkResidualPercent = 30;
+constexpr uint64_t kComputedKeyStreamSalt = 0x636F6D707574654BULL;
 constexpr uint64_t kKeylessDomainStreamSalt = 0x6B65796C65737344ULL;
 constexpr uint64_t kKeyedDomainStreamSalt = 0x646F6D61696E2D44ULL;
 constexpr uint64_t kExistsMarkStreamSalt = 0x65786973742D6D6BULL;
@@ -1341,7 +1342,7 @@ class Builder {
           Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, Rng& item_value_rng,
           Rng& group_value_rng, Rng& in_mark_rng, Rng& in_form_rng, Rng& empty_value_rng,
           Rng& condition_correlated_rng, Rng& item_correlated_rng, Rng& exists_mark_rng,
-          Rng& domain_rng, Rng& keyless_domain_rng, FeatureSet allowed)
+          Rng& domain_rng, Rng& keyless_domain_rng, Rng& computed_key_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1374,6 +1375,7 @@ class Builder {
         exists_mark_rng_(exists_mark_rng),
         domain_rng_(domain_rng),
         keyless_domain_rng_(keyless_domain_rng),
+        computed_key_rng_(computed_key_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -3303,18 +3305,17 @@ class Builder {
       }
     }
     // A positive divisor gives a many-to-one key without overflow, including at signed minima.
-    Rng expr_rng = corr_rng_;
     const bool computed = !keyless && inner_key == c.inner_key &&
                           inner_key->kind == ValueKind::kInteger &&
                           allowed_.Contains({Feature::kComputedScalarKey, Feature::kArithmetic,
                                              Feature::kIntegerLiteral}) &&
-                          (agg == Agg::kMin || agg == Agg::kMax) && expr_rng.Percent(35);
+                          (agg == Agg::kMin || agg == Agg::kMax) && computed_key_rng_.Percent(35);
     const auto mod = [&] {
       Symbol("%");
       ValueNumber(7);
       used_.Add({Feature::kComputedScalarKey, Feature::kArithmetic, Feature::kIntegerLiteral});
     };
-    const bool inner_expr = computed && expr_rng.Percent(50);
+    const bool inner_expr = computed && computed_key_rng_.Percent(50);
     InnerColumn(c, *inner_key);
     if (inner_expr) {
       mod();
@@ -3327,7 +3328,7 @@ class Builder {
       CorrelatedKeyComparison();
     }
     OuterColumn(c);
-    if (computed && (!inner_expr || expr_rng.Percent(50))) {
+    if (computed && (!inner_expr || computed_key_rng_.Percent(50))) {
       mod();
     }
     if (!computed && !keyless && inner_key == c.inner_key &&
@@ -8477,6 +8478,7 @@ class Builder {
   Rng& exists_mark_rng_;           // the draws that only SQ8a's correlated EXISTS marks need
   Rng& domain_rng_;                // SQ9's additional keyed aggregate comparison
   Rng& keyless_domain_rng_;        // SQ9's inequality-only aggregate
+  Rng& computed_key_rng_;          // SQ10's computed scalar keys
   // The stream of the mark being written: in_mark_rng_ or in_form_rng_ (PlaceMark).
   Rng* mark_rng_ = nullptr;
   // What InForm drew for the mark being written; std::nullopt while InMark writes one.
@@ -8728,12 +8730,13 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng exists_mark_rng(Mix(seed ^ kExistsMarkStreamSalt));
   Rng domain_rng(Mix(seed ^ kKeyedDomainStreamSalt));
   Rng keyless_domain_rng(Mix(seed ^ kKeylessDomainStreamSalt));
+  Rng computed_key_rng(Mix(seed ^ kComputedKeyStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
                having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
                empty_value_rng, condition_correlated_rng, item_correlated_rng, exists_mark_rng,
-               domain_rng, keyless_domain_rng, options.supported)
+               domain_rng, keyless_domain_rng, computed_key_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -8778,6 +8781,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng exists_mark_rng(Mix(state ^ kExistsMarkStreamSalt));
   Rng domain_rng(Mix(state ^ kKeyedDomainStreamSalt));
   Rng keyless_domain_rng(Mix(state ^ kKeylessDomainStreamSalt));
+  Rng computed_key_rng(Mix(state ^ kComputedKeyStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   Rng window_rng(Mix(state ^ 0x77696E646F772D32ULL));
@@ -8805,7 +8809,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
               having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
               empty_value_rng, condition_correlated_rng, item_correlated_rng, exists_mark_rng,
-              domain_rng, keyless_domain_rng, allowed)
+              domain_rng, keyless_domain_rng, computed_key_rng, allowed)
           .Build()
           .value_or(GeneratedQuery{});
   q.index = index;
