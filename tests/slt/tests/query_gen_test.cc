@@ -2707,6 +2707,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   int avg = 0;
   int avg_integer = 0;
   int avg_decimal = 0;
+  int keyed_domains = 0;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedAggregate)) {
@@ -2719,6 +2720,11 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     const std::string block = q.sql.substr(at, q.sql.find(')', q.sql.find(" WHERE ", at)) - at);
     EXPECT_EQ(block.find("GROUP BY"), std::string::npos) << q.sql;
     EXPECT_NE(block.find(" WHERE "), std::string::npos) << q.sql;
+    if (q.features.Has(Feature::kKeyedDomainAggregate)) {
+      ++keyed_domains;
+      EXPECT_NE(block.find(" AND "), std::string::npos) << q.sql;
+      EXPECT_TRUE(q.features.Has(Feature::kCompareColumns)) << q.sql;
+    }
     // Either order. Subquery first when the conjunct opens with it, so what precedes is the AND or
     // the WHERE; literal first when an operator does, which the generator mirrored.
     const std::string before = q.sql.substr(0, at);
@@ -2748,6 +2754,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   EXPECT_GT(avg, 0) << "avg: " << avg;
   EXPECT_GT(avg_integer, 0) << "avg over an integer: " << avg_integer;
   EXPECT_GT(avg_decimal, 0) << "avg over a DECIMAL: " << avg_decimal;
+  EXPECT_GT(keyed_domains, 0);
 }
 
 // The variance family (ADR 0037's AG2): written in the select list only, over an integer or a

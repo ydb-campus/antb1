@@ -620,6 +620,15 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   in the block's item moves above the join with it, so a binding without rows reads `0 + value`. An equality of outer
   columns stays in the subquery when an `IS NOT DISTINCT FROM` correlates one of them (for NULLs it is NULL, not
   true), and a correlated `SUM(x + c)` keeps its form, as in DuckDB (no `COUNT`, below).
+  A scalar aggregate can also compare a second enclosing column with an inner column using an inequality
+  when another column pair supplies an equality key (`=` or `IS NOT DISTINCT FROM`). Each comparison must
+  be between plain columns of the same hashable type. SQ9 groups the distinct tuples of enclosing values,
+  matches inner rows on the original predicates, and joins each aggregate back to every occurrence of its
+  tuple, including NULLs.
+  The enclosing input can include previously appended scalar or mark values when the bindings come from
+  their left input, including through aliases in a derived table's select list. A binding source that
+  needs a pending subquery's result, or contains a LIMIT, a window, or an unresolved correlated filter
+  is unsupported.
   Correlated `IN` and `NOT IN` as conjuncts of `WHERE` or an inner `ON` use the same keyed decorrelation
   (SQ8c). `IN` is a semi join on the correlation and membership comparison. `NOT IN` rejects an outer row when
   a surviving inner row matches its probe or either membership value is NULL. For equality-only correlations,
@@ -641,7 +650,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   Every other correlated shape
   is exit code 4: a correlated `EXISTS` without a key or whose grouping or offset needs an outer column
   without an inner equivalent, a correlated scalar subquery with `GROUP BY`, `LIMIT` or `OFFSET` or whose outer
-  column has no inner equivalent, an `IN` or `NOT IN` conjunct in a correlated scalar subquery's `HAVING`, a compound
+  column has neither an inner equivalent nor a keyed binding domain, an `IN` or `NOT IN` conjunct in a
+  correlated scalar subquery's `HAVING`, a compound
   with an arm that reads an enclosing block; at the subquery
   for one in `HAVING`, whose outer references would read the outer block's groups and not its rows.
   An `IN`/`NOT IN` conjunct whose probe reads only the enclosing block and whose set is independent is answered:
@@ -677,7 +687,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   or EXISTS in a conjunct that reads the enclosing block itself: each nested subquery binds to its immediate
   enclosing block, and the outer reference stays in the containing block's correlated filter. The existing key
   and representative requirements still apply; a reference two blocks out remains unsupported. The unnesting's
-  refusals (an outer column without an inner equivalent, such as a correlation of two types or a non-equality one)
+  refusals (for example, a scalar aggregate correlated only through an inequality)
   come once the whole query is bound, after every bind error. A
   correlated `EXISTS` block binds its clauses before the unnesting checks its shape, so its own bind errors
   (including an ungrouped select column) precede an unsupported-shape error. A compound's arms all bind

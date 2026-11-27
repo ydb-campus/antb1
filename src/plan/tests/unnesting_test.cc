@@ -838,6 +838,72 @@ Unnested UnnestedOf(std::string_view sql) {
   return unnested;
 }
 
+TEST(UnnestingTest, KeyedDomainDeduplicatesFullBindingsAndRetainsEqualitySemantics) {
+  for (const std::string_view op : {"=", "IS NOT DISTINCT FROM"}) {
+    const auto plan = UnnestedOf(std::string("SELECT t.i16, (SELECT COUNT(*) FROM u WHERE u.i16 ") +
+                                 std::string(op) + " t.i16 AND u.i32 > t.i32) FROM t");
+    EXPECT_NE(plan.text.find("GroupAggregate keys=[\"t.i16\", \"t.i32\"]\n"), std::string::npos)
+        << plan.text;
+    EXPECT_NE(plan.text.find(std::string("keys=[\"u.i16\" ") + std::string(op) + " \"t.i16\"]"),
+              std::string::npos)
+        << plan.text;
+    EXPECT_NE(plan.text.find("keys=[\"t.i16\" IS NOT DISTINCT FROM \"t.i16\", "
+                             "\"t.i32\" IS NOT DISTINCT FROM \"t.i32\"]"),
+              std::string::npos)
+        << plan.text;
+    EXPECT_EQ(plan.join_backs, std::vector{JoinBack::kLeft});
+  }
+}
+
+TEST(UnnestingTest, KeyedDomainRequiresARepeatableBindingSourceAndAnEqualityAnchor) {
+  const auto unchanged = [](const LogicalNodePtr& root) { return root; };
+  for (const std::string_view query :
+       {"SELECT (SELECT MIN(u.i16) FROM u WHERE u.i32 > t.i32) FROM t",
+        "SELECT (SELECT MIN(u.i16) FROM u WHERE u.i16 = o.i16 AND u.i32 > o.i32) "
+        "FROM (SELECT i16, i32 FROM t LIMIT 3) o",
+        "SELECT (SELECT MIN(u.i16) FROM u WHERE u.i16 = t.i16 AND u.i32 > t.i32) FROM t "
+        "WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16)",
+        "SELECT (SELECT COUNT(*) FROM u WHERE u.i16 = o.k AND u.i32 <= o.cutoff) "
+        "FROM (SELECT t.i16 AS k, (SELECT MAX(u.i32) FROM u WHERE u.i16 = t.i16) + 1 AS cutoff "
+        "FROM t) o",
+        "SELECT i16 FROM t WHERE EXISTS (SELECT COUNT(*) FROM u WHERE u.i16 = t.i16 "
+        "AND u.i32 < t.i32 HAVING COUNT(*) > 0)",
+        "SELECT i32 FROM t WHERE t.i32 IN (SELECT MAX(u.i32) FROM u WHERE u.i16 = t.i16 "
+        "AND u.i32 <= t.i32)"}) {
+    EXPECT_NE(RefusalOf(query, unchanged).find("no inner equivalent"), std::string::npos) << query;
+  }
+  const auto fast = UnnestedOf("SELECT (SELECT MIN(u.i32) FROM u WHERE u.i16 = t.i16) FROM t");
+  EXPECT_EQ(fast.text.find("Join INNER"), std::string::npos) << fast.text;
+  EXPECT_NE(fast.text.find("keys=[\"t.i16\" = \"u.i16\"]"), std::string::npos) << fast.text;
+}
+
+TEST(UnnestingTest, StackedKeyedAggregatesCloneTheOuterScanOncePerDomain) {
+  std::string sql = "SELECT i16";
+  for (int n = 1; n <= 4; ++n) {
+    sql += ", (SELECT COUNT(*) FROM u WHERE u.i16 = t.i16 AND u.i32 < t.i32 AND u.i64 > " +
+           std::to_string(n) + ")";
+    const auto plan = UnnestedOf(sql + " FROM t");
+    const std::string_view scan = "Scan table=t ";
+    int scans = 0;
+    for (auto pos = plan.text.find(scan); pos != std::string::npos;
+         pos = plan.text.find(scan, pos + scan.size())) {
+      ++scans;
+    }
+    EXPECT_EQ(scans, n + 1) << plan.text;
+  }
+}
+
+TEST(UnnestingTest, ProjectedKeyedDomainDoesNotCloneTheEarlierScalar) {
+  const auto plan = UnnestedOf(
+      "SELECT o.n, (SELECT COUNT(*) FROM u WHERE u.i16 = o.k AND u.i32 <= o.cutoff) "
+      "FROM (SELECT t.i16 AS k, t.i32 AS cutoff, "
+      "(SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16) AS n FROM t) o");
+  const std::string_view scan = "Scan table=ok ";
+  const auto first = plan.text.find(scan);
+  ASSERT_NE(first, std::string::npos) << plan.text;
+  EXPECT_EQ(plan.text.find(scan, first + scan.size()), std::string::npos) << plan.text;
+}
+
 // Decision 20's proof decides the join back (ADR 0041's SQ6): INNER only where the comparison
 // rejects the subquery's empty value. COUNT's 0 passes `= 0` and fails `> 0`; a strict combination
 // of MAX keeps its NULL. The proof folds no constants, so `COUNT(*) + 1 > 1`, which rejects the 1
