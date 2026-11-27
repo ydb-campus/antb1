@@ -1835,6 +1835,92 @@ std::string NameOfCall(const AggregateCall& call, const Spine& spine) {
                      call.kind == AggKind::kCountDistinct ? "DISTINCT " : "", call.arg->name);
 }
 
+arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& spine);
+
+// A repeated key reads the same cast, including when two inner columns constrain one outer key.
+ExprPtr WidenKeyOperand(const ExprPtr& operand, LogicalType type, ComputeNode& casts,
+                        ColumnId& last_id) {
+  const ExprPtr cast = WidenTo(operand, type);
+  const auto existing =
+      std::ranges::find_if(casts.exprs, [&](const ExprPtr& e) { return SameExpr(*e, *cast); });
+  const auto index = Narrow<std::size_t>(existing - casts.exprs.begin());
+  if (existing == casts.exprs.end()) {
+    last_id = ColumnId{std::to_underlying(last_id) + 1};
+    casts.exprs.push_back(cast);
+    casts.ids.push_back(last_id);
+  }
+  return ColumnValue(BoundColumn{.id = casts.ids.at(index), .name = cast->name, .type = type});
+}
+
+// SQ10: turn a mixed-width equality into one between columns of its exact common type.
+// Only the equality reads the new columns. An aggregate argument or residual that reads
+// the original outer column still needs a representative of its own type.
+arrow::Result<Rewritten> WidenScalarKeys(const Correlation& correlation, Spine spine,
+                                         const arrow::Status& missing_representative) {
+  const auto inner_ids = OutputIds(*spine.below);
+  DependentJoinNode join = correlation.join;
+  ComputeNode left{.input = join.left, .span = join.span};
+  ComputeNode right{.input = spine.below, .span = join.span};
+  ComputeNode predicates = *spine.computed;
+  ARROW_ASSIGN_OR_RAISE(const auto conjuncts, ConjunctsOf(correlation, spine));
+  for (const ExprPtr* defined : conjuncts) {
+    const auto pair = AsKey(**defined, correlation.outer);
+    if (!pair || pair->inner_type == pair->outer_type ||
+        !IsExactWidening(pair->inner_type, pair->key_type) ||
+        !IsExactWidening(pair->outer_type, pair->key_type) ||
+        !std::ranges::contains(inner_ids, pair->inner.id)) {
+      continue;
+    }
+    const LogicalType type = pair->key_type;
+    Expr changed = **defined;
+    auto& keyed = std::get<PredicateExpr>(changed.node);
+    for (std::size_t i = 0; i < keyed.operands.size(); ++i) {
+      ExprPtr& value = keyed.operands[i];
+      if (value->type != type) {
+        const bool outer = correlation.outer.contains(std::get<ColumnExpr>(value->node).id);
+        value = WidenKeyOperand(value, type, outer ? left : right, correlation.last_id);
+        BoundColumn& column = (i == 0 ? keyed.predicate.column : keyed.predicate.other).value();
+        column.type = type;
+        column.name = value->name;
+      }
+    }
+    const auto index = Narrow<std::size_t>(defined - spine.computed->exprs.data());
+    predicates.exprs.at(index) = std::make_shared<const Expr>(std::move(changed));
+  }
+  if (left.ids.empty() && right.ids.empty()) {
+    return missing_representative;
+  }
+  if (!left.ids.empty()) {
+    join.left = Make(std::move(left));
+  }
+  if (!right.ids.empty()) {
+    spine.below = Make(std::move(right));
+  }
+  predicates.input = spine.below;
+  FilterNode filter = *spine.filter;
+  filter.input = Make(std::move(predicates));
+  spine.computed = &std::get<ComputeNode>(*filter.input);
+  join.right = Make(std::move(filter));
+  spine.filter = &std::get<FilterNode>(*join.right);
+  for (Step& step : std::ranges::reverse_view(spine.steps)) {
+    auto inputs = InputsOf(*step.node);
+    inputs.front() = join.right;
+    step.node = WithInputs(*step.node, std::move(inputs));
+    join.right = step.node;
+  }
+  const auto outer = OutputIds(*join.left);
+  const Correlation widened{.join = join,
+                            .mode = Mode::kValue,
+                            .outer = {outer.begin(), outer.end()},
+                            .last_id = correlation.last_id,
+                            .build_side_ratio = correlation.build_side_ratio,
+                            .above = correlation.above,
+                            .report = correlation.report};
+  // Every eligible mixed equality now has one type, so a further missing representative
+  // returns its original refusal without another rewrite.
+  return ValueJoin(widened, spine);
+}
+
 // Value mode's rewrite (ADR 0023's Path 2; the formalization's Lemmas 4.14 and 4.2): each outer
 // column is replaced by its representative, so the correlated conjuncts read inner columns only and
 // stay below the aggregation; an equality that became c = c is dropped. The static aggregate groups
@@ -1864,9 +1950,12 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   ARROW_RETURN_NOT_OK(CheckStatic(correlation, spine, values));
   ARROW_ASSIGN_OR_RAISE(Equivalences equivalences, EquivalencesOf(correlation, spine));
   LogicalNodePtr right = spine.below;
-  ARROW_ASSIGN_OR_RAISE(const Representatives representatives,
-                        RepresentativesOf(correlation, spine, equivalences,
-                                          correlation.mode == Mode::kValue ? &right : nullptr));
+  auto resolved = RepresentativesOf(correlation, spine, equivalences,
+                                    correlation.mode == Mode::kValue ? &right : nullptr);
+  if (!resolved.ok() && correlation.mode == Mode::kValue) {
+    return WidenScalarKeys(correlation, spine, resolved.status());
+  }
+  ARROW_ASSIGN_OR_RAISE(const Representatives representatives, std::move(resolved));
   const bool has_domain = right != spine.below;
   // Decision 20's proof, over the values the subquery appends: INNER only where the reader of each
   // value rejects its empty value, LEFT otherwise (decision 21).

@@ -1510,18 +1510,14 @@ SMALLINT
 5
 6
 
-# ---- DuckDB only until SQ10 gets a PR (ADR 0041: a correlation that needs a cast or reads only the outer side) ----
+# ---- SQ10: COUNT over a widened key, including an empty inner table ----
 
-# An INTEGER inner key against a BIGINT and a SMALLINT outer one (the second over the empty promos), an outer key that
-# is an expression, and a conjunct that reads only the outer row.
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM drivers d WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = d.dv_id) = 0
 ----
 BIGINT
 8
 
-onlyif duckdb
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM promos p WHERE p.pm_id = c.ct_id) = 0 ORDER BY 1
 ----
@@ -1533,6 +1529,7 @@ SMALLINT
 5
 6
 
+# Computed equality operands and outer-only conditions are later SQ10 rules.
 onlyif duckdb
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id + 0) = 0 ORDER BY 1

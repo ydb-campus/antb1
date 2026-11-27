@@ -620,6 +620,11 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   in the block's item moves above the join with it, so a binding without rows reads `0 + value`. An equality of outer
   columns stays in the subquery when an `IS NOT DISTINCT FROM` correlates one of them (for NULLs it is NULL, not
   true), and a correlated `SUM(x + c)` keeps its form, as in DuckDB (no `COUNT`, below).
+  For a scalar aggregate keyed by `=` or `IS NOT DISTINCT FROM`, plain integer and DECIMAL columns
+  can have different types when one hash-key type represents both exactly (ADR 0041, SQ10).
+  Each side widens to that type before grouping and joining. This also works for a NULL-equal key.
+  A separate expression that reads the enclosing column at its original width still needs a
+  representative of that type.
   A scalar aggregate can also correlate through inequalities and through AND, OR or NOT over comparisons
   between plain inner and enclosing columns of the same hashable type. SQ9 groups the distinct tuples of
   enclosing values. A top-level equality conjunct (`=` or `IS NOT DISTINCT FROM`) supplies a hash key.

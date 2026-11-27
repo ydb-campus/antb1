@@ -2405,17 +2405,14 @@ SMALLINT
 2
 3
 
-# ---- DuckDB only until the general domain join gets a PR (ADR 0023: a correlation of two types exits 4) ----
-
-# A value keys a correlated block as an inner equivalent only where it is the outer column's type: an INTEGER value
-# against the SMALLINT ct_id, and an expression over a value, have none.
-onlyif duckdb
+# The INTEGER value from the inner block can represent the SMALLINT enclosing key after widening.
 query I nosort
 SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_id) FROM zones) = c.ct_id) ORDER BY ct_id
 ----
 SMALLINT
 1
 
+# A computed equality operand is a separate SQ10 rule.
 onlyif duckdb
 query I nosort
 SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) + 0 = c.ct_id) ORDER BY ct_id

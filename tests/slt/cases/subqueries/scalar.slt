@@ -369,16 +369,74 @@ SELECT COUNT(*) FROM riders WHERE 0 = (SELECT CASE WHEN SUM(tr_fare) > 0 THEN 1 
 BIGINT
 4
 
-# ---- DuckDB only until the general domain join gets a PR (ADR 0023: a correlation of two types exits 4) ----
+# ---- SQ10: scalar aggregate equality keys with an exact common type ----
 
-# Only an equality of one type feeds an equivalence class, so the INTEGER tr_driver is no inner equivalent of the
-# BIGINT dv_id.
-onlyif duckdb
+# The BIGINT driver outside the INTEGER range must not alias a matching trip.
 query I nosort
 SELECT COUNT(*) FROM drivers WHERE 450 < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = dv_id)
 ----
 BIGINT
 13
+
+# The larger driver ID shares its low 32 bits with a matching INTEGER key.
+query II nosort
+SELECT d.dv_id, (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = d.dv_id) FROM drivers d WHERE d.dv_id > 2147483647
+----
+BIGINT	BIGINT
+4294968296	0
+
+# Widen the outer INTEGER. Duplicate bindings each receive their count or empty aggregate value.
+query III rowsort
+SELECT n, m, COUNT(*) FROM (SELECT (SELECT COUNT(*) FROM drivers d WHERE t.tr_driver = d.dv_id) AS n, (SELECT MIN(d.dv_id) FROM drivers d WHERE d.dv_id = t.tr_driver) AS m FROM trips t WHERE t.tr_driver IS NULL OR t.tr_driver IN (1000, 4552)) s GROUP BY n, m
+----
+BIGINT	BIGINT	BIGINT
+0	NULL	133
+1	1000	29
+
+# Differently scaled decimals, including fractional values that would round to a match and NULLs.
+query DII rowsort
+SELECT t.tf_rate, (SELECT COUNT(*) FROM trips i WHERE i.tr_rate = t.tf_rate), (SELECT COUNT(*) FROM trips i WHERE t.tf_rate IS NOT DISTINCT FROM i.tr_rate) FROM tariffs t
+----
+DECIMAL(5,3)	BIGINT	BIGINT
+0.875	0	0
+1.000	348	348
+1.250	350	350
+1.500	348	348
+1.750	350	350
+2.000	345	345
+2.125	0	0
+2.500	342	342
+NULL	0	231
+
+# One widened outer key constrains two different inner columns.
+query II rowsort
+SELECT c.ct_id, (SELECT COUNT(*) FROM trips t WHERE t.tr_dropoff = c.ct_id AND t.tr_pickup = c.ct_id) FROM cities c
+----
+SMALLINT	BIGINT
+1	2
+2	2
+3	2
+4	1
+5	1
+6	2
+
+# The single empty grouping set is a static aggregate too. HAVING can drop its row.
+query II rowsort
+SELECT o.id, (SELECT COUNT(*) FROM edge i WHERE i.id IS NOT DISTINCT FROM o.i16 GROUP BY () HAVING COUNT(*) > 0) FROM edge o
+----
+INTEGER	BIGINT
+0	NULL
+1	NULL
+10	NULL
+11	1
+2	1
+3	NULL
+4	1
+5	NULL
+6	NULL
+7	NULL
+8	NULL
+9	NULL
 
 # ---- uncorrelated scalar subqueries that are no aggregate (ADR 0041's SQ4a; more in values.slt) ----
 
