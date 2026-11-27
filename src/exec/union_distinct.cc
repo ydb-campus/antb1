@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -141,6 +142,7 @@ UnionDistinct::UnionDistinct(const ExecContext& ctx)
       output_(arrow::stl::allocator<std::shared_ptr<arrow::RecordBatch>>(ctx.pool)) {}
 
 arrow::Status UnionDistinct::Append(const std::shared_ptr<arrow::RecordBatch>& rows) {
+  const auto limit = ctx_.budget == nullptr ? std::nullopt : ctx_.budget->limit();
   for (int64_t start = 0; start < rows->num_rows();) {
     if (lanes_.empty()) {
       // Observe actual distinct rows before paying to repartition. A union running inside an
@@ -157,9 +159,9 @@ arrow::Status UnionDistinct::Append(const std::shared_ptr<arrow::RecordBatch>& r
     // Route retains a hash, an order and a rank for every candidate, even duplicates.
     // Leave the other half of the available space for input, directory growth and compaction.
     int64_t window = kWindowRows;
-    if (ctx_.budget != nullptr && ctx_.budget->limit().has_value()) {
-      constexpr int64_t kRouteBytes = sizeof(std::uint64_t) + 2 * sizeof(std::uint32_t);
-      const auto available = *ctx_.budget->limit() - ctx_.budget->bytes_allocated();
+    if (limit.has_value()) {
+      constexpr int64_t kRouteBytes = sizeof(std::uint64_t) + (2 * sizeof(std::uint32_t));
+      const auto available = *limit - ctx_.budget->bytes_allocated();
       window = std::clamp<int64_t>(available / (2 * kRouteBytes), 1, kWindowRows);
       if (pending_rows_ >= window) {
         ARROW_RETURN_NOT_OK(Flush());
