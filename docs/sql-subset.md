@@ -1501,6 +1501,10 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     adjusts scan lookahead. The narrow target requests one outstanding part per worker and the wide target
     requests four. Memory pressure may reduce the actual number of outstanding parts.
   - `part_time` (the part tasks' time, summed);
+  - `DeferredDimensionJoin` shows a guarded plan that fetches dimension attributes after joining grouped
+    branches on an integer key. Its final `HashBuild` reports `dimension_check`, the time spent verifying the keys.
+    `dimension_verified` counts completed runs of the guarded plan. `dimension_fallbacks` counts retries
+    with the original plan, which appears as a second input when executed.
   - on the query's root, `shared` is time spent preparing shared sub-plans and `shared_rows` is
     the number of rows retained when sharing succeeds. If a shared result exceeds the 256 MiB cap,
     the query budget refuses a reservation, or preparation fails, antb1 releases the shared results

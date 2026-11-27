@@ -1004,6 +1004,10 @@ class Resolver {
 
   // One overload of Visit per node type: a node type without one fails to compile.
   Resolved Walk(const LogicalNodePtr& node) {
+    if (node == nullptr) {
+      Fail("plan node without an input");
+      return {};
+    }
     return std::visit([&](const auto& n) { return Visit(node, n); }, *node);
   }
 
@@ -1154,6 +1158,10 @@ class Resolver {
     bool changed = input.node != compute.input;
     out.input = input.node;
     for (ExprPtr& expr : out.exprs) {
+      if (expr == nullptr) {
+        Fail("Compute without an expression");
+        continue;
+      }
       ExprPtr resolved = MapColumns(expr, [&](const ColumnExpr& column) {
         ColumnExpr leaf = column;
         Resolve("Compute", leaf.index, leaf.id, input.ids);
@@ -1354,6 +1362,10 @@ class Resolver {
     std::vector<ColumnId> both = left.ids;
     both.insert(both.end(), right.ids.begin(), right.ids.end());
     for (ExprPtr& conjunct : out.residual) {
+      if (conjunct == nullptr) {
+        Fail("Join without its residual expression");
+        continue;
+      }
       if (conjunct->type != LogicalType::kBoolean) {
         Fail(std::format("Join: a residual of type {}", ToString(conjunct->type)));
       }
