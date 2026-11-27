@@ -863,6 +863,9 @@ TEST(UnnestingTest, KeyedDomainRequiresARepeatableBindingSourceAndAnEqualityAnch
         "FROM (SELECT i16, i32 FROM t LIMIT 3) o",
         "SELECT (SELECT MIN(u.i16) FROM u WHERE u.i16 = t.i16 AND u.i32 > t.i32) FROM t "
         "WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16)",
+        "SELECT (SELECT COUNT(*) FROM u WHERE u.i16 = o.k AND u.i32 <= o.cutoff) "
+        "FROM (SELECT t.i16 AS k, (SELECT MAX(u.i32) FROM u WHERE u.i16 = t.i16) + 1 AS cutoff "
+        "FROM t) o",
         "SELECT i16 FROM t WHERE EXISTS (SELECT COUNT(*) FROM u WHERE u.i16 = t.i16 "
         "AND u.i32 < t.i32 HAVING COUNT(*) > 0)",
         "SELECT i32 FROM t WHERE t.i32 IN (SELECT MAX(u.i32) FROM u WHERE u.i16 = t.i16 "
@@ -888,6 +891,17 @@ TEST(UnnestingTest, StackedKeyedAggregatesCloneTheOuterScanOncePerDomain) {
     }
     EXPECT_EQ(scans, n + 1) << plan.text;
   }
+}
+
+TEST(UnnestingTest, ProjectedKeyedDomainDoesNotCloneTheEarlierScalar) {
+  const auto plan = UnnestedOf(
+      "SELECT o.n, (SELECT COUNT(*) FROM u WHERE u.i16 = o.k AND u.i32 <= o.cutoff) "
+      "FROM (SELECT t.i16 AS k, t.i32 AS cutoff, "
+      "(SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16) AS n FROM t) o");
+  const std::string_view scan = "Scan table=ok ";
+  const auto first = plan.text.find(scan);
+  ASSERT_NE(first, std::string::npos) << plan.text;
+  EXPECT_EQ(plan.text.find(scan, first + scan.size()), std::string::npos) << plan.text;
 }
 
 // Decision 20's proof decides the join back (ADR 0041's SQ6): INNER only where the comparison

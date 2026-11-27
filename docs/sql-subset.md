@@ -626,7 +626,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   matches inner rows on the original predicates, and joins each aggregate back to every occurrence of its
   tuple, including NULLs.
   The enclosing input can include previously appended scalar or mark values when the bindings come from
-  their left input. A binding source containing a LIMIT, a window, or an unresolved correlated filter
+  their left input, including through aliases in a derived table's select list. A binding source that
+  needs a pending subquery's result, or contains a LIMIT, a window, or an unresolved correlated filter
   is unsupported.
   Correlated `IN` and `NOT IN` as conjuncts of `WHERE` or an inner `ON` use the same keyed decorrelation
   (SQ8c). `IN` is a semi join on the correlation and membership comparison. `NOT IN` rejects an outer row when

@@ -1412,7 +1412,7 @@ struct Representatives {
 // therefore use the same binding source without recursively copying the pending dependent joins.
 // Keep filters, computed keys and padded rows: evaluating aggregates for extra bindings can raise
 // errors even though the final join would discard them.
-LogicalNodePtr ExactBindingSource(LogicalNodePtr node, const std::vector<ColumnId>& bindings) {
+LogicalNodePtr ExactBindingSource(LogicalNodePtr node, std::set<ColumnId> bindings) {
   while (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
     const JoinKindTraits traits = Traits(dependent->kind);
     if (!traits.one_row && !traits.appends_mark) {
@@ -1421,13 +1421,49 @@ LogicalNodePtr ExactBindingSource(LogicalNodePtr node, const std::vector<ColumnI
     node = dependent->left;
   }
   const std::vector<ColumnId> outputs = OutputIds(*node);
-  if (FirstDependentJoin(node) != nullptr || !FreeVariables(*node).empty() || UnsafeToClone(node) ||
-      !std::ranges::all_of(bindings, [&outputs](ColumnId id) {
+  if (!std::ranges::all_of(bindings, [&outputs](ColumnId id) {
         return std::ranges::find(outputs, id) != outputs.end();
       })) {
     return nullptr;
   }
-  return node;
+  if (FirstDependentJoin(node) == nullptr) {
+    return !FreeVariables(*node).empty() || UnsafeToClone(node) ? nullptr : node;
+  }
+  // A derived table can project both the binding columns and an earlier subquery's result.
+  // Rebuild only the columns the domain reads, keeping the projection's output ids and aliases.
+  if (const auto* project = std::get_if<ProjectNode>(node.get())) {
+    ProjectNode kept{.span = project->span};
+    std::set<ColumnId> reads;
+    for (std::size_t i = 0; i < project->ids.size(); ++i) {
+      if (bindings.contains(project->ids[i])) {
+        kept.ids.push_back(project->ids[i]);
+        kept.columns.push_back(project->columns.at(i));
+        if (!project->constants.empty()) {
+          kept.constants.push_back(project->constants.at(i));
+        }
+        if (kept.columns.back().id != kNoColumnId) {
+          reads.insert(kept.columns.back().id);
+        }
+      }
+    }
+    kept.input = ExactBindingSource(project->input, std::move(reads));
+    return kept.input == nullptr || kept.ids.empty() ? kept.input : Make(std::move(kept));
+  }
+  if (const auto* compute = std::get_if<ComputeNode>(node.get())) {
+    ComputeNode kept{.span = compute->span};
+    std::vector<ColumnId> reads;
+    for (std::size_t i = 0; i < compute->ids.size(); ++i) {
+      if (bindings.erase(compute->ids[i]) != 0) {
+        kept.ids.push_back(compute->ids[i]);
+        kept.exprs.push_back(compute->exprs.at(i));
+        CollectColumnIds(*kept.exprs.back(), reads);
+      }
+    }
+    bindings.insert(reads.begin(), reads.end());
+    kept.input = ExactBindingSource(compute->input, std::move(bindings));
+    return kept.input == nullptr || kept.ids.empty() ? kept.input : Make(std::move(kept));
+  }
+  return nullptr;
 }
 
 // SQ9's keyed terminal. D has one row per complete outer binding. The attachment enforces
@@ -1438,7 +1474,8 @@ arrow::Result<Representatives> KeyedDomain(const Correlation& correlation, const
     return correlation.Refuse("with an outer column that has no inner equivalent");
   };
   const std::vector<ColumnId> bindings = FreeVariables(*correlation.join.right);
-  const LogicalNodePtr source = ExactBindingSource(correlation.join.left, bindings);
+  const LogicalNodePtr source =
+      ExactBindingSource(correlation.join.left, {bindings.begin(), bindings.end()});
   if (source == nullptr || !FreeVariables(*input).empty()) {
     return refuse();
   }
