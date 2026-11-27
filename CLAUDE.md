@@ -59,7 +59,7 @@ task) and never block, except the Stop hook below.
 
 ## In GitHub Actions
 
-When Claude runs from a workflow (an `@claude` mention or an automatic PR review), hooks are disabled, only an
+When Claude runs from a workflow (an `@claude` mention or a label-requested PR review), hooks are disabled, only an
 explicit list of tools is allowed, and every "Ask a human first" path is denied (ask rules become denials without a
 human to answer). Run `pixi run test` and `pixi run lint` yourself. If the change needs a protected path (workflows,
 `pixi.toml`, presets, `cmake/`, AGENTS.md, gate configs, the ClickBench and TPC-derived ratchets), stop and hand

@@ -28,9 +28,9 @@ Accepted
 - AI reviews are advisory. They comment, never approve, and never count toward the required human approval. The
   repository settings do not let GitHub Actions approve pull requests. No AI workflow is a required check.
 - AI integrations on GitHub, set up as described in [docs/agents.md](../agents.md):
-  - Claude: `@claude` on issues and PRs (`.github/workflows/claude.yml`) and one automatic review per PR from a
-    prompt that applies the Code Review Rules (`.github/workflows/claude-review.yml`), both through the Claude
-    GitHub App and a Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN`);
+  - Claude responds to `@claude` on issues and PRs (`.github/workflows/claude.yml`). Applying the `claude`
+    label to a ready PR requests a read-only review under the Code Review Rules (`.github/workflows/claude-review.yml`).
+    Both workflows use the Claude GitHub App and the `CLAUDE_CODE_OAUTH_TOKEN` subscription token.
   - Codex: native review on request (`@codex review`, automatic reviews off) and a harness audit per PR
     (`.github/workflows/codex-review.yml`) that runs a pinned Codex CLI read-only with a spend-capped project key
     (`OPENAI_API_KEY`) and posts one sticky comment;
@@ -39,7 +39,7 @@ Accepted
   - cloud sandboxes (Claude Code on the web, Codex cloud, Copilot) install the same locked environments
     (`default` and `lint`), after which every task works without network access.
 - Defense in depth against prompt injection and secret misuse: `@claude` requires write access for both the sender
-  and the issue or PR author and refuses fork PRs; the automatic reviews run only on same-repository, non-draft PRs;
+  and the issue or PR author and refuses fork PRs; the review workflows run only on same-repository, non-draft PRs;
   in GitHub Actions, Claude runs with hooks disabled and only named `pixi run` tasks plus read-only `git` and `gh`;
   the Codex audit takes its prompt and AGENTS.md from the base commit, does not load the PR's AGENTS.md as
   instructions and has no write token (a separate job posts its comment); every AI job's workflow token is read-only.
@@ -55,8 +55,8 @@ Accepted
 - One file to keep up to date; tool-specific files stay small.
 - Agents that follow AGENTS.md produce changes that pass the same gates as human changes.
 - The "Ask a human first" list slows down changes to CI and the toolchain, which is intended.
-- Every PR gets up to two automatic AI reviews (Claude review, Codex audit) plus on-request ones; each costs money
-  or subscription quota, so none of them re-runs on every push.
+- The Codex harness audit runs automatically on eligible PRs. Collaborators control Claude subscription usage by
+  requesting individual reviews.
 - Anyone with write access can still read the repository secrets from a same-repository PR run by changing a
   workflow. CODEOWNERS review on `.github/`, the spend cap and quick rotation (docs/agents.md) limit the damage.
 - The Claude subscription token expires after about a year and must be renewed by hand; an `ANTHROPIC_API_KEY`

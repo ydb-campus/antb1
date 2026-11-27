@@ -11,7 +11,7 @@ hardening is described in [docs/ci.md](ci.md).
 | Agent | Where it runs | Reads | Setup |
 | --- | --- | --- | --- |
 | Claude Code | your terminal; cloud sessions on claude.ai/code | CLAUDE.md, which imports AGENTS.md | [Claude Code cloud environment](#claude-code-cloud-environment) |
-| Claude in GitHub Actions | `@claude` on issues and PRs; one automatic review per PR | the same | [Claude GitHub App and token](#claude-github-app-and-token) |
+| Claude in GitHub Actions | `@claude` on issues and PRs; read-only PR review on the `claude` label | the same | [Claude GitHub App and token](#claude-github-app-and-token) |
 | Codex | Codex CLI; ChatGPT Codex cloud tasks; `@codex review` on PRs | AGENTS.md | [Codex](#codex) |
 | Codex harness audit | GitHub Actions, one audit per PR | base-commit prompt and AGENTS.md | [Codex harness audit and API key](#codex-harness-audit-and-api-key) |
 | Copilot | coding agent and code review on github.com | `.github/copilot-instructions.md`, AGENTS.md | [Copilot](#copilot) |
@@ -25,7 +25,7 @@ merge. They follow the workflow security rules in [docs/ci.md](ci.md).
 | Workflow | Triggers | What it does | Secret or variable |
 | --- | --- | --- | --- |
 | `Claude` ([claude.yml](../.github/workflows/claude.yml)) | `@claude` in an issue comment, PR comment, review or review comment; an issue opened with `@claude`; the issue label `claude` | Claude Code answers or works on the issue or PR, runs allowed tasks, pushes a branch and keeps one reply comment up to date | `CLAUDE_CODE_OAUTH_TOKEN` |
-| `Claude review` ([claude-review.yml](../.github/workflows/claude-review.yml)) | PR opened, ready for review or reopened (same repository, not a draft, no bots except Copilot) | Claude applies the AGENTS.md Code Review Rules from the base branch to the diff: inline comments for P0/P1 problems and one summary comment per run (the action's progress comment, updated even when the run fails); the job summary and the log list denied tool calls | `CLAUDE_CODE_OAUTH_TOKEN` |
+| `Claude review` ([claude-review.yml](../.github/workflows/claude-review.yml)) | a collaborator applies the `claude` label to a ready, same-repository PR (including Copilot PRs) | Claude applies the AGENTS.md Code Review Rules from the base branch to the diff: inline comments for P0/P1 problems and one summary comment per run (the action's progress comment, updated even when the run fails); the job summary and the log list denied tool calls | `CLAUDE_CODE_OAUTH_TOKEN` |
 | `Codex harness audit` ([codex-review.yml](../.github/workflows/codex-review.yml)) | PR opened, ready for review or reopened (same repository, not a draft, no bots); the label `codex-review` | Codex CLI 0.155.1, read-only and without sudo, checks the diff against the harness rules and posts one sticky comment | `OPENAI_API_KEY` |
 | `Copilot Setup Steps` ([copilot-setup-steps.yml](../.github/workflows/copilot-setup-steps.yml)) | before every Copilot coding-agent task; manual; PRs and pushes that change it, `pixi.toml` or `pixi.lock` | installs the locked `default` and `lint` environments and builds `build/dev` | none |
 | `pixi.lock update` ([pixi-lock-update.yml](../.github/workflows/pixi-lock-update.yml)) | Mondays 05:00 UTC; manual | `pixi update` with pixi 0.81.0, then a PR `build(deps): update pixi.lock` from antb1-bot | `BOT_CLIENT_ID` (variable), `BOT_PRIVATE_KEY` (environment `automation`) |
@@ -36,10 +36,9 @@ a separate job with only `pull-requests: write` posts its comment. The lock upda
 
 ## How AI reviews work
 
-- Three AI reviewers can comment on a PR: Claude (an automatic review once per PR), Codex (the automatic harness
-  audit once per PR, and a full review on `@codex review`) and Copilot (only when requested). None of them runs
-  again on every push.
-- All of them apply the AGENTS.md "Code Review Rules": concrete, high-confidence problems with a failure scenario, no
+- Codex runs the automatic harness audit on eligible PRs. To request a read-only Claude review, apply the
+  `claude` label after the PR is ready for review. Remove and reapply it for a fresh review.
+- Claude, Codex and Copilot apply the AGENTS.md "Code Review Rules": concrete, high-confidence problems with a failure scenario, no
   formatting comments, no ClickBench data values and nothing derived from TPC-H or TPC-DS.
 - They are advisory and never approve. Claude and Codex post comments, Copilot's reviews are comment reviews, and
   the repository does not let GitHub Actions approve pull requests. Merging still needs `CI OK`, `PR title` and one
@@ -99,7 +98,7 @@ Each collaborator then completes the [per-person prerequisites](#per-person-prer
 5. Both Claude workflows work only once they are on `main`: before that (and on the PR that adds them) the token
    exchange fails with `workflow_not_found_on_default_branch`.
 
-One subscription serves all members' `@claude` requests and the automatic reviews. If its rate limits or policy
+One subscription serves all members' Claude requests, including labeled PR reviews. If its rate limits or policy
 become a problem, switch to API billing:
 
 1. Create an API key in the Anthropic Console, in a workspace with a spend limit.
@@ -245,15 +244,14 @@ Copilot needs organization seats and policy; skip this section if the organizati
 4. Keep the defaults that make a human the gate: a maintainer approves workflow runs on Copilot's PRs before CI
    runs, and the Actions setting "Allow GitHub Actions to create and approve pull requests" stays off
    (`tools/github/apply-settings.sh` enforces it).
-5. Copilot code review is on request only (add Copilot as a reviewer). Automatic Copilot review stays off, so a PR
-   does not get three automatic reviews.
+5. Keep automatic Copilot review off. Request a review by adding Copilot as a reviewer.
 6. The repository requires every action to be pinned to a full commit SHA. After the first Copilot task, check that
    its setup-steps run was not blocked by that setting. If it was, a repository admin turns the setting off; the
    lint checks (`pixi run lint`: R010, R015, zizmor) still enforce pinning for this repository's workflows.
 
 To give Copilot a task, assign an issue to Copilot (the `agent-task` issue form fits) or ask it from Copilot Chat.
-It works on a `copilot/...` branch, opens a draft PR and asks for your review when done. Claude review runs when
-the PR is marked ready for review (the Codex audit skips bot PRs); like every PR, it needs CI and one human approval.
+It works on a `copilot/...` branch, opens a draft PR and asks for your review when done. Once the PR is ready, a
+collaborator can apply the `claude` label to request a review. Every PR needs CI and one human approval.
 
 ## Bot App antb1-bot
 
