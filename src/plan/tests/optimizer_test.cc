@@ -21,6 +21,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/shared_sub_plans.h"
 
+#include "../compute_safety.h"
 #include "plan_test_util.h"
 
 namespace antb1::plan {
@@ -2314,6 +2315,215 @@ TEST(OptimizerTest, TheSemiJoinReductionReplaysAWidenedOuterKeyBelowAStack) {
   EXPECT_EQ(domain->ids.front(), restriction->keys.front().right.id);
   EXPECT_TRUE(std::holds_alternative<ScanNode>(*domain->input)) << Explain(plan);
   EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+}
+
+// Exercise the scalar rewrite through binding, including which combinations must report
+// an unsupported correlation before an expression can run on an unmatched row.
+void CheckScalarRewrite(const Catalog& catalog, std::string_view sql, bool accepted) {
+  SCOPED_TRACE(sql);
+  const auto bound = BindSql(sql, catalog);
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto plan = Optimize(*bound);
+  if (accepted) {
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt);
+    EXPECT_EQ(Explain(*plan).find("DependentJoin"), std::string::npos);
+  } else {
+    ASSERT_FALSE(plan.ok()) << Explain(*plan);
+    const auto error = GetSqlError(plan.status());
+    ASSERT_NE(error, nullptr) << plan.status();
+    EXPECT_EQ(error->kind(), SqlErrorDetail::Kind::kUnsupported);
+  }
+}
+
+TEST(OptimizerTest, ComputedScalarKeysRequireSafeSideLocalOperands) {
+  const auto catalog = MakeCatalog();
+  struct Example {
+    std::string_view key;
+    bool accepted;
+  };
+  for (const auto& [key, accepted] : {
+           Example{"lower(u.s) = upper(t.s)", true},
+           Example{"strlen(upper(u.s)) = t.i64", true},
+           Example{"strlen(substring(u.s, 1, 2)) = t.i64", false},
+           Example{"u.i32 // 3 = t.i32", true},
+           Example{"u.i32 % u.i16 = t.i32", false},
+           Example{"(u.i32 + 1) % 3 = t.i32", false},
+           Example{"COALESCE(u.i32, 0) = t.i32", true},
+           Example{"COALESCE(u.i32, CAST(u.i64 AS INTEGER)) = t.i32", false},
+           Example{"CASE WHEN u.i32 > 0 AND u.i16 < 3 THEN u.i32 END = t.i32", true},
+           Example{"CASE WHEN CAST(u.i64 AS SMALLINT) > u.i16 OR u.i16 < 3 THEN u.i32 END = t.i32",
+                   false},
+           Example{"CASE WHEN u.i32 > 0 THEN u.i32 ELSE u.i32 + 1 END = t.i32", false},
+           Example{"CASE WHEN u.i32 > 0 THEN CAST(u.i64 AS INTEGER) ELSE u.i32 END = t.i32", false},
+           Example{"CASE WHEN u.i32 > 0 THEN u.i16 ELSE u.i64 END = t.i64", true},
+           Example{"u.i32 % 7 = t.d", false},
+           Example{"u.i32 % 7 = t.i16 + u.i16", false},
+           Example{"u.i32 = 3 AND u.i32 % 7 = t.i32", true},
+           Example{"u.i32 % 7 = u.i16 AND u.i32 % 3 = t.i32", true},
+           Example{"CAST(u.i16 AS BIGINT) + t.i16 = t.i32 % 7", false},
+       }) {
+    CheckScalarRewrite(catalog, std::format("SELECT (SELECT COUNT(*) FROM u WHERE {}) FROM t", key),
+                       accepted);
+  }
+}
+
+TEST(OptimizerTest, ComputedScalarProductsCheckBothExtremesOfTheInputRange) {
+  struct Example {
+    PartStats stats;
+    bool accepted;
+  };
+  // Both signs matter: a negative factor makes the minimum determine the upper bound.
+  for (const auto& [stats, accepted] : {
+           Example{{.min = -1'073'741'823, .max = 1'073'741'824, .rows = 2}, true},
+           Example{{.min = -1'073'741'824, .max = 0, .rows = 2}, false},
+           Example{{.min = 0, .max = 1'073'741'825, .rows = 2}, false},
+           Example{{.null_count = 2, .rows = 2}, true},
+           Example{{.rows = 2}, false},
+       }) {
+    auto catalog = MakeCatalog();
+    auto bounds = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 2);
+    bounds->WithStats(0, /*field=*/1, stats);
+    ASSERT_TRUE(catalog.Register("bounds", std::move(bounds)).ok());
+    CheckScalarRewrite(catalog,
+                       "SELECT (SELECT COUNT(*) FROM bounds b WHERE b.i32 * -2 = t.i32) FROM t",
+                       accepted);
+  }
+}
+
+TEST(OptimizerTest, ComputedScalarProjectionUsesExactNarrowingBounds) {
+  struct Example {
+    PartStats stats;
+    bool fits;
+  };
+  // LIMIT leaves some bindings unread. A cast below the inner projection may run on all
+  // rows only when every part fits, including the exact SMALLINT boundaries.
+  for (const auto& [stats, fits] : {
+           Example{{.min = -32768, .max = 32767, .rows = 2}, true},
+           Example{{.min = -32769, .max = 0, .rows = 2}, false},
+           Example{{.min = 0, .max = 32768, .rows = 2}, false},
+           Example{{.null_count = 2, .rows = 2}, true},
+           Example{{.rows = 2}, false},
+       }) {
+    auto catalog = MakeCatalog();
+    auto bounds = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 4);
+    bounds->WithParts({2, 2})
+        .WithStats(0, /*field=*/2, {.min = 10, .max = 20, .rows = 2})
+        .WithStats(1, /*field=*/2, stats);
+    ASSERT_TRUE(catalog.Register("bounds", std::move(bounds)).ok());
+    CheckScalarRewrite(
+        catalog,
+        "SELECT (SELECT MAX(i.v) FROM (SELECT i32 AS k, CAST(i64 AS SMALLINT) AS v FROM bounds) i "
+        "WHERE i.k = t.i32 % 13) FROM t LIMIT 1",
+        fits);
+  }
+}
+
+TEST(OptimizerTest, CheckedScalarProjectionsRequireAllMatchingBindings) {
+  const auto catalog = MakeCatalog();
+  struct Example {
+    std::string_view inner;
+    std::string_view outer;
+    bool accepted;
+  };
+  constexpr std::string_view kChecked = "SELECT i32 AS k, CAST(i64 AS SMALLINT) AS v FROM u";
+  // A restriction can pass through aliases but cannot move below an inner LIMIT or GROUP BY,
+  // nor use a key that the checked projection itself must first compute.
+  for (const auto& [inner, outer, accepted] : {
+           Example{kChecked, "t", true},
+           Example{kChecked, "(SELECT i32 FROM t LIMIT 5) t", false},
+           Example{"SELECT i32 AS k, CAST(i64 AS SMALLINT) AS v FROM u LIMIT 5", "t", false},
+           Example{"SELECT i32 % 7 AS k, CAST(i64 AS SMALLINT) AS v FROM u", "t", false},
+           Example{"SELECT i32 AS k, MAX(i64) AS v FROM u GROUP BY i32", "t", true},
+           Example{"SELECT i32 AS k, AVG(dt) AS v FROM u GROUP BY i32", "t", false},
+           Example{"SELECT i32 AS k, SUM(h) AS v FROM u GROUP BY i32", "t", false},
+       }) {
+    CheckScalarRewrite(catalog,
+                       std::format("SELECT (SELECT MAX(i.v) FROM ({}) i WHERE i.k = t.i32 % 7) "
+                                   "FROM {}",
+                                   inner, outer),
+                       accepted);
+  }
+}
+
+TEST(OptimizerTest, ScalarProjectionOnlyInfersNarrowingFromTheSourceColumn) {
+  auto catalog = MakeCatalog();
+  auto bounds = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 2);
+  bounds->WithStats(0, /*field=*/2, {.null_count = 2, .rows = 2});
+  ASSERT_TRUE(catalog.Register("bounds", std::move(bounds)).ok());
+  for (const auto& [value, accepted] : {
+           std::pair{"CAST(i64 AS SMALLINT)", true},
+           std::pair{"CAST(COALESCE(i64, 40000) AS SMALLINT)", false},
+           std::pair{"CAST(d AS SMALLINT)", false},
+           std::pair{"CAST(i64 AS DECIMAL(3,1))", false},
+       }) {
+    CheckScalarRewrite(catalog,
+                       std::format("SELECT (SELECT MAX(i.v) FROM "
+                                   "(SELECT i32 AS k, {} AS v FROM bounds) i "
+                                   "WHERE i.k = t.i32 % 7) FROM t LIMIT 1",
+                                   value),
+                       accepted);
+  }
+}
+
+// An earlier scalar or mark join preserves the outer column's values. A later checked cast
+// can still rely on its exact footer bounds. An ordinary join may carry the bounded column
+// from either input, including a nullable right side.
+TEST(OptimizerTest, ScalarProjectionFollowsTheBoundedColumnThroughJoins) {
+  const auto scan = [](const BoundColumn& column, int value) {
+    auto table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 1);
+    table->WithStats(0, /*field=*/1, {.min = value, .max = value, .rows = 1});
+    return Node(ScanNode{.table = std::move(table),
+                         .table_name = column.qualifier,
+                         .fields = {1},
+                         .ids = {column.id}});
+  };
+  const BoundColumn lhs = FieldOf(1, 1);
+  const BoundColumn rhs = FieldOf(11, 1);
+  const auto fits = [](const BoundColumn& column, const LogicalNodePtr& input) {
+    return CanEvaluateUnboundProjection(
+        Expr{.node = CastExpr{.operand = Ref(column)}, .type = LogicalType::kSmallInt}, input);
+  };
+  for (const auto kind : {JoinKind::kOneRow, JoinKind::kSingle, JoinKind::kMark, JoinKind::kInner,
+                          JoinKind::kLeft, JoinKind::kFull}) {
+    SCOPED_TRACE(ToString(kind));
+    JoinNode join{.kind = kind,
+                  .left = scan(lhs, kind == JoinKind::kFull ? 40000 : 3),
+                  .right = scan(rhs, 40000)};
+    if (!Traits(kind).one_row) {
+      join.keys.push_back(JoinKey{.left = lhs, .right = rhs});
+    }
+    if (Traits(kind).appends_mark) {
+      join.mark = ColumnId{20};
+    }
+    const auto input = Node(join);
+    EXPECT_EQ(fits(lhs, input), kind != JoinKind::kFull);
+    if (kind == JoinKind::kInner || kind == JoinKind::kLeft) {
+      EXPECT_FALSE(fits(rhs, input));
+      join.right = scan(rhs, 3);
+      EXPECT_TRUE(fits(rhs, Node(std::move(join))));
+    }
+  }
+}
+
+TEST(OptimizerTest, ComputedScalarCountsBuildAnEmptyOuterInputThroughSortAndLimit) {
+  for (const int rows : {0, 100}) {
+    auto catalog = MakeCatalog();
+    auto outer = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), rows);
+    ASSERT_TRUE(catalog.Register("bindings", std::move(outer)).ok());
+    const auto bound = BindSql(
+        "SELECT (SELECT COUNT(*) FROM u WHERE u.i32 = o.k % 7) "
+        "FROM (SELECT i32 AS k FROM bindings WHERE i16 > 0 ORDER BY i32 LIMIT 5) o",
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimize(*bound);
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    const auto* join = Find<JoinNode>(plan->root);
+    ASSERT_NE(join, nullptr) << Explain(*plan);
+    EXPECT_EQ(join->kind, rows == 0 ? JoinKind::kInner : JoinKind::kLeft) << Explain(*plan);
+    EXPECT_EQ(join->build, rows == 0 ? BuildSide::kLeft : BuildSide::kRight) << Explain(*plan);
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt);
+  }
 }
 
 TEST(OptimizerTest, TheSemiJoinReductionReplaysAComputedBindingBelowAStack) {
