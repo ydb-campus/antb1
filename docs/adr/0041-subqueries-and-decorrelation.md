@@ -394,8 +394,8 @@ substitution, with no D, where both inputs read outer columns (SQ10), and with D
   - The join back is NULL-equal (`JoinKey::null_equal`, ADR 0037's OJ5a), since D may hold NULL.
 - Its cost is known. The outer side's relations are computed twice, since one build feeds one probe pipeline
   (ADR 0022). A keyless D × leaf has |D| × |leaf| pairs: ADR 0040 measured 9,000,000 pairs at 749 ms on one Debug
-  thread. Relational division's product of D with the middle block is inherent to it. Whether a keyless D is refused
-  above some size is an open decision.
+  thread. Relational division's product of D with the middle block is inherent to it. The keyless product uses ADR
+  0040's size policy, as decided in the phase 10 update below.
 
 ### Static aggregates and the consumer proof
 
@@ -649,8 +649,6 @@ enclosing HAVING or select list, DuckDB answers it, which antb1 does from SQ13 o
 
 Questions the maintainer has not ruled on. Each is decided by a dated update before the item it concerns:
 
-- **A size guard for a keyless D (SQ9).** The design discussion proposed refusing a keyless D over large inputs, which
-  would leave relational division at scale refused; ADR 0040 rejected output-size guards for cross products.
 - **When this ADR is accepted**, after SQ8 or after phase 10, and whether ADR 0037's closing items wait for phase 10.
 - **Left builds** as guards for the budget gate: a mark built on its left input, and a LEFT join back built on the
   outer side, for which `ProbeDropsUnmatchedRows` already holds.
@@ -1257,6 +1255,13 @@ substitution finds no inner equivalent. It preserves filters and outer-join padd
 Stacked scalar subqueries reading the same outer columns each clone the source once. A pending correlated
 filter in the binding source still requires left-first unnesting. The keyless product and its size policy
 remain open.
+
+Update (2026-11-27, SQ9 keyless scalar aggregates). Use [ADR 0040's cross-product policy](0040-nested-loop-joins.md#no-size-guard)
+for the keyless domain. The planner accepts the product regardless of its estimated pair count. The nested
+loop evaluates up to |D| × |inner| pairs in batches under the existing execution memory budget. Repeated outer
+bindings contribute only once to |D|. Scalar aggregate predicates over plain inner and outer columns can use
+inequalities and boolean combinations. Only a top-level equality conjunct supplies a hash key. Outer references
+in aggregate arguments without a representative, and bindings needed across query blocks, remain open.
 
 ## Consequences
 

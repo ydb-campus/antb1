@@ -2771,20 +2771,33 @@ TEST(OptimizerTest, Path2KeepsAnEqualityOverAnOuterColumnKeyedNullEqual) {
   EXPECT_TRUE(std::holds_alternative<ScanNode>(*equal_grouped->input)) << Explain(equal);
 }
 
-// Without an inner equivalent for every outer column the substitution cannot run.
-TEST(OptimizerTest, Path2RefusesAnOuterColumnWithoutAnInnerEquivalent) {
-  const auto status =
-      Optimize(PlanOver(Node(DependentJoinNode{
-                   .kind = JoinKind::kOneRow,
-                   .left = FourFields(1),
-                   .right = ScalarBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kLt)},
-                                        AggKind::kSum, 50),
-                   .span = {}})))
-          .status();
-  ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
-  EXPECT_EQ(status.message(),
-            "a correlated scalar subquery with an outer column that has no inner equivalent is "
-            "not supported");
+// Large estimates do not refuse the product. Its residual reads both inputs and the join
+// back to the grouped result identifies the original binding, including NULL.
+TEST(OptimizerTest, ScalarDomainResolvesKeylessResidualAgainstBothInputs) {
+  const LogicalPlan plan =
+      Path2Plan({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kLt)}, 1'000'000, 1'000'000);
+  const auto* join = JoinUnder(plan);
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  ASSERT_EQ(join->keys.size(), 1U);
+  EXPECT_TRUE(join->keys.front().null_equal);
+  const auto* product = RestrictionUnder(plan);
+  ASSERT_NE(product, nullptr) << Explain(plan);
+  EXPECT_EQ(product->kind, JoinKind::kInner);
+  EXPECT_TRUE(product->keys.empty());
+  EXPECT_EQ(product->residual.size(), 1U);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+TEST(OptimizerTest, KeylessScalarDomainBuildsAKnownEmptyInnerInput) {
+  for (const std::optional<int64_t> rows :
+       {std::optional<int64_t>{0}, std::optional<int64_t>{1}, std::optional<int64_t>{}}) {
+    const LogicalPlan plan =
+        Path2Plan({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kLt)}, 7'488, rows);
+    const auto* product = RestrictionUnder(plan);
+    ASSERT_NE(product, nullptr) << Explain(plan);
+    EXPECT_EQ(product->build, rows == 0 ? BuildSide::kLeft : BuildSide::kRight) << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  }
 }
 
 // A plan with no dependent join is unaffected: the pass is an identity and the other rules run.

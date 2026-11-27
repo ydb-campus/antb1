@@ -1030,6 +1030,7 @@ constexpr unsigned kExistsMarkPercent = 90;
 constexpr unsigned kExistsBesidePercent = 25;
 constexpr unsigned kMarkFilterPercent = 35;
 constexpr unsigned kMarkResidualPercent = 30;
+constexpr uint64_t kKeylessDomainStreamSalt = 0x6B65796C65737344ULL;
 constexpr uint64_t kKeyedDomainStreamSalt = 0x646F6D61696E2D44ULL;
 constexpr uint64_t kExistsMarkStreamSalt = 0x65786973742D6D6BULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
@@ -1298,6 +1299,7 @@ struct Binding {
 struct CorrelatedCandidate {
   const Binding* outer = nullptr;        // the FROM item the subquery reads out to
   const GenColumn* outer_key = nullptr;  // of `outer`
+  int64_t binding_bound = 0;             // distinct outer key values, including a possible NULL
   const GenTable* inner = nullptr;       // the block's only table, always named, never by path
   const GenColumn* inner_key = nullptr;  // of `inner`, of the same type as `outer_key`
 };
@@ -1339,7 +1341,7 @@ class Builder {
           Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, Rng& item_value_rng,
           Rng& group_value_rng, Rng& in_mark_rng, Rng& in_form_rng, Rng& empty_value_rng,
           Rng& condition_correlated_rng, Rng& item_correlated_rng, Rng& exists_mark_rng,
-          Rng& domain_rng, FeatureSet allowed)
+          Rng& domain_rng, Rng& keyless_domain_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1371,6 +1373,7 @@ class Builder {
         item_correlated_rng_(item_correlated_rng),
         exists_mark_rng_(exists_mark_rng),
         domain_rng_(domain_rng),
+        keyless_domain_rng_(keyless_domain_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -3280,10 +3283,20 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
     Keyword("WHERE");
     InnerColumn(c, *c.inner_key);
-    CorrelatedKeyComparison();
+    const bool keyless = allowed_.Has(Feature::kKeylessDomainAggregate) &&
+                         allowed_.Has(Feature::kCompareColumns) &&
+                         SaturatingProduct(c.binding_bound, c.inner->rows) <= kMaxJoinRows &&
+                         keyless_domain_rng_.Percent(25);
+    if (keyless) {
+      used_.Add(Feature::kKeylessDomainAggregate);
+      used_.Add(Feature::kCompareColumns);
+      Symbol("<");
+    } else {
+      CorrelatedKeyComparison();
+    }
     OuterColumn(c);
-    if (allowed_.Has(Feature::kKeyedDomainAggregate) && allowed_.Has(Feature::kWhereAnd) &&
-        domain_rng_.Percent(35)) {
+    if (!keyless && allowed_.Has(Feature::kKeyedDomainAggregate) &&
+        allowed_.Has(Feature::kWhereAnd) && domain_rng_.Percent(35)) {
       auto pairs = ResidualPairs(c);
       std::erase_if(pairs, [&c](const auto& pair) { return pair.second == c.outer_key; });
       if (!pairs.empty()) {
@@ -7276,8 +7289,15 @@ class Builder {
               (outer_key.precision != inner_key.precision || outer_key.scale != inner_key.scale)) {
             continue;  // one DECIMAL type on both ends, not merely one ValueKind
           }
+          const GenKeyStats& stats = as_child ? edge.child_stats : edge.parent_stats;
+          // A join can pad this binding even when its base column has no NULL.
+          const bool may_have_null = stats.non_null < own.rows || from_->bindings.size() > 1;
           out.push_back(CorrelatedCandidate{
-              .outer = &b, .outer_key = &outer_key, .inner = &other, .inner_key = &inner_key});
+              .outer = &b,
+              .outer_key = &outer_key,
+              .binding_bound = SaturatingSum(stats.distinct, may_have_null ? 1 : 0),
+              .inner = &other,
+              .inner_key = &inner_key});
         }
       }
     }
@@ -8399,7 +8419,8 @@ class Builder {
   Rng& condition_correlated_rng_;  // the draws that only SQ5a's correlated values need
   Rng& item_correlated_rng_;       // the draws that only SQ5b's correlated values need
   Rng& exists_mark_rng_;           // the draws that only SQ8a's correlated EXISTS marks need
-  Rng& domain_rng_;                // the additional comparison of SQ9's keyed aggregate
+  Rng& domain_rng_;                // SQ9's additional keyed aggregate comparison
+  Rng& keyless_domain_rng_;        // SQ9's inequality-only aggregate
   // The stream of the mark being written: in_mark_rng_ or in_form_rng_ (PlaceMark).
   Rng* mark_rng_ = nullptr;
   // What InForm drew for the mark being written; std::nullopt while InMark writes one.
@@ -8650,12 +8671,13 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng item_correlated_rng(Mix(seed ^ kItemCorrelatedStreamSalt));
   Rng exists_mark_rng(Mix(seed ^ kExistsMarkStreamSalt));
   Rng domain_rng(Mix(seed ^ kKeyedDomainStreamSalt));
+  Rng keyless_domain_rng(Mix(seed ^ kKeylessDomainStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
                having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
                empty_value_rng, condition_correlated_rng, item_correlated_rng, exists_mark_rng,
-               domain_rng, options.supported)
+               domain_rng, keyless_domain_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -8699,6 +8721,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng item_correlated_rng(Mix(state ^ kItemCorrelatedStreamSalt));
   Rng exists_mark_rng(Mix(state ^ kExistsMarkStreamSalt));
   Rng domain_rng(Mix(state ^ kKeyedDomainStreamSalt));
+  Rng keyless_domain_rng(Mix(state ^ kKeylessDomainStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   Rng window_rng(Mix(state ^ 0x77696E646F772D32ULL));
@@ -8726,7 +8749,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
               having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
               empty_value_rng, condition_correlated_rng, item_correlated_rng, exists_mark_rng,
-              domain_rng, allowed)
+              domain_rng, keyless_domain_rng, allowed)
           .Build()
           .value_or(GeneratedQuery{});
   q.index = index;

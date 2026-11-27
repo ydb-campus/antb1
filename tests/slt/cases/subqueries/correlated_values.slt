@@ -1414,8 +1414,7 @@ WHERE c.ct_id > 100 ORDER BY 1
 ----
 SMALLINT	BIGINT
 
-# A bind error after an item whose subquery the unnesting refuses (a non-equality correlation): the unnesting runs
-# after all binding, so both engines report the bind error.
+# A missing ORDER BY column remains a bind error when a select item has a keyless scalar aggregate.
 statement error nope
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city < c.ct_id) AS n FROM cities c ORDER BY nope
 

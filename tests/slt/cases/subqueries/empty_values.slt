@@ -1554,9 +1554,7 @@ SMALLINT
 5
 6
 
-# ---- DuckDB only until SQ9 gets a PR (ADR 0041: a correlation that is no equality, or under the aggregate) ----
-
-onlyif duckdb
+# A keyless SQ9 aggregate returns zero for a binding with no passing row.
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city > c.ct_id) = 0 ORDER BY 1
 ----
@@ -1566,6 +1564,7 @@ SMALLINT
 5
 6
 
+# An outer column in the aggregate argument still needs the general SQ9 domain.
 onlyif duckdb
 query I nosort
 SELECT c.ct_id FROM cities c

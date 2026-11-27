@@ -98,7 +98,8 @@ std::optional<KeyParts> ComparedColumns(const Expr& expr, const std::set<ColumnI
     return std::nullopt;
   }
   const bool null_equal = predicate->predicate.kind == Predicate::Kind::kIsNotDistinct;
-  if (!null_equal && predicate->predicate.kind != Predicate::Kind::kCompareColumns) {
+  if (!null_equal && predicate->predicate.kind != Predicate::Kind::kIsDistinct &&
+      predicate->predicate.kind != Predicate::Kind::kCompareColumns) {
     return std::nullopt;
   }
   const auto* a = std::get_if<ColumnExpr>(&predicate->operands[0]->node);
@@ -1466,10 +1467,31 @@ LogicalNodePtr ExactBindingSource(LogicalNodePtr node, std::set<ColumnId> bindin
   return nullptr;
 }
 
-// SQ9's keyed terminal. D has one row per complete outer binding. The attachment enforces
-// the original equalities; the remaining comparisons read D below the scalar aggregate.
-arrow::Result<Representatives> KeyedDomain(const Correlation& correlation, const Spine& spine,
-                                           Equivalences& equivalences, LogicalNodePtr& input) {
+// A boolean combination stays one residual: an equality inside OR or NOT cannot key the join.
+// Collect every outer column it reads so a NULL in one comparison can still pass another.
+bool CollectDomainColumns(const Expr& expr, const std::set<ColumnId>& outer_ids,
+                          const std::vector<ColumnId>& inner_ids,
+                          std::map<ColumnId, BoundColumn>& columns) {
+  if (const auto* boolean = std::get_if<BoolExpr>(&expr.node)) {
+    return std::ranges::all_of(boolean->args, [&](const ExprPtr& arg) {
+      return CollectDomainColumns(*arg, outer_ids, inner_ids, columns);
+    });
+  }
+  const auto pair = ComparedColumns(expr, outer_ids);
+  if (!pair.has_value() || pair->inner_type != pair->outer_type ||
+      std::ranges::find(inner_ids, pair->inner.id) == inner_ids.end()) {
+    return false;
+  }
+  columns.emplace(
+      pair->outer.id,
+      BoundColumn{.id = pair->outer.id, .name = pair->outer_name, .type = pair->outer_type});
+  return true;
+}
+
+// SQ9's second terminal. D has one row per complete binding. Without an equality anchor
+// the existing nested-loop join evaluates the correlation before emitting each passing pair.
+arrow::Result<Representatives> ScalarDomain(const Correlation& correlation, const Spine& spine,
+                                            Equivalences& equivalences, LogicalNodePtr& input) {
   const auto refuse = [&correlation] {
     return correlation.Refuse("with an outer column that has no inner equivalent");
   };
@@ -1482,28 +1504,24 @@ arrow::Result<Representatives> KeyedDomain(const Correlation& correlation, const
   const std::vector<ColumnId> inner = OutputIds(*input);
   std::map<ColumnId, BoundColumn> columns;
   std::vector<JoinKey> anchors;
-  std::vector<const Expr*> residual;
+  std::vector<ExprPtr> residual;
   ARROW_ASSIGN_OR_RAISE(const auto conjuncts, ConjunctsOf(correlation, spine));
   for (const ExprPtr* conjunct : conjuncts) {
-    const auto pair = ComparedColumns(**conjunct, correlation.outer);
-    if (!pair.has_value() || pair->inner_type != pair->outer_type ||
-        std::ranges::find(inner, pair->inner.id) == inner.end()) {
+    if (!CollectDomainColumns(**conjunct, correlation.outer, inner, columns)) {
       return refuse();
     }
-    BoundColumn outer{.id = pair->outer.id, .name = pair->outer_name, .type = pair->outer_type};
-    columns.emplace(outer.id, outer);
-    if (IsEquality(**conjunct)) {
+    if (const auto pair = AsKey(**conjunct, correlation.outer); pair.has_value()) {
       anchors.push_back(JoinKey{
           .left =
               BoundColumn{.id = pair->inner.id, .name = pair->inner_name, .type = pair->inner_type},
-          .right = std::move(outer),
+          .right =
+              BoundColumn{.id = pair->outer.id, .name = pair->outer_name, .type = pair->outer_type},
           .null_equal = pair->null_equal});
     } else {
-      residual.push_back(conjunct->get());
+      residual.push_back(*conjunct);
     }
   }
-  if (anchors.empty() ||
-      !std::ranges::all_of(bindings, [&columns](ColumnId id) { return columns.contains(id); })) {
+  if (!std::ranges::all_of(bindings, [&columns](ColumnId id) { return columns.contains(id); })) {
     return refuse();
   }
   const ClonedInput clone = CloneInput(source, correlation.last_id);
@@ -1524,13 +1542,33 @@ arrow::Result<Representatives> KeyedDomain(const Correlation& correlation, const
   for (JoinKey& key : anchors) {
     key.right.id = out.of.at(key.right.id);
   }
+  equivalences.kept.clear();
+  if (anchors.empty()) {
+    for (ExprPtr& expr : residual) {
+      expr = MapColumns(expr, [&out](ColumnExpr column) {
+        if (const auto it = out.of.find(column.id); it != out.of.end()) {
+          column.id = it->second;
+        }
+        return column;
+      });
+    }
+  } else {
+    // Preserve the keyed plan: its remaining conjuncts run above the hash join.
+    for (const ExprPtr& expr : residual) {
+      equivalences.kept.push_back(expr.get());
+    }
+    residual.clear();
+  }
+  // An empty inner build short-circuits the nested loop before it opens the binding domain.
+  const BuildSide build =
+      anchors.empty() && EstimateRows(*input) == 0 ? BuildSide::kLeft : BuildSide::kRight;
   input = Make(JoinNode{.kind = JoinKind::kInner,
                         .left = std::move(input),
                         .right = Make(std::move(domain)),
                         .keys = std::move(anchors),
-                        .build = BuildSide::kRight,
+                        .residual = std::move(residual),
+                        .build = build,
                         .span = correlation.join.span});
-  equivalences.kept = std::move(residual);
   return out;
 }
 
@@ -1568,7 +1606,7 @@ arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation,
     }
     if (found == kNoColumnId) {
       if (domain_input != nullptr) {
-        return KeyedDomain(correlation, spine, equivalences, *domain_input);
+        return ScalarDomain(correlation, spine, equivalences, *domain_input);
       }
       return correlation.Refuse("with an outer column that has no inner equivalent");
     }

@@ -579,7 +579,7 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
     - a NULL-equal join back (`JoinKey::null_equal`, ADR 0022's OJ5a update), since D may hold NULL.
 
     The rules under Execution hold: there is no shared build, so the outer side's relations are computed twice.
-    Whether a keyless D is refused above some size is an open decision of ADR 0041.
+    ADR 0041's SQ9 decision applies ADR 0040's cross-product policy to a keyless D.
   - **The shapes the Consequences deferred,** by the items that answer them:
     - the general domain join: SQ9;
     - mark joins: SQ7 for uncorrelated IN, NOT IN, `= ANY` and `<> ALL` under OR, NOT or CASE, SQ8 for correlated

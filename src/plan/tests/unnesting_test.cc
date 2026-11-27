@@ -855,10 +855,10 @@ TEST(UnnestingTest, KeyedDomainDeduplicatesFullBindingsAndRetainsEqualitySemanti
   }
 }
 
-TEST(UnnestingTest, KeyedDomainRequiresARepeatableBindingSourceAndAnEqualityAnchor) {
+TEST(UnnestingTest, ScalarDomainRequiresARepeatableSourceAndAScalarConsumer) {
   const auto unchanged = [](const LogicalNodePtr& root) { return root; };
   for (const std::string_view query :
-       {"SELECT (SELECT MIN(u.i16) FROM u WHERE u.i32 > t.i32) FROM t",
+       {"SELECT (SELECT MIN(u.i16) FROM u WHERE u.i32 > o.i32) FROM (SELECT i32 FROM t LIMIT 3) o",
         "SELECT (SELECT MIN(u.i16) FROM u WHERE u.i16 = o.i16 AND u.i32 > o.i32) "
         "FROM (SELECT i16, i32 FROM t LIMIT 3) o",
         "SELECT (SELECT MIN(u.i16) FROM u WHERE u.i16 = t.i16 AND u.i32 > t.i32) FROM t "
@@ -877,19 +877,21 @@ TEST(UnnestingTest, KeyedDomainRequiresARepeatableBindingSourceAndAnEqualityAnch
   EXPECT_NE(fast.text.find("keys=[\"t.i16\" = \"u.i16\"]"), std::string::npos) << fast.text;
 }
 
-TEST(UnnestingTest, StackedKeyedAggregatesCloneTheOuterScanOncePerDomain) {
-  std::string sql = "SELECT i16";
-  for (int n = 1; n <= 4; ++n) {
-    sql += ", (SELECT COUNT(*) FROM u WHERE u.i16 = t.i16 AND u.i32 < t.i32 AND u.i64 > " +
-           std::to_string(n) + ")";
-    const auto plan = UnnestedOf(sql + " FROM t");
-    const std::string_view scan = "Scan table=t ";
-    int scans = 0;
-    for (auto pos = plan.text.find(scan); pos != std::string::npos;
-         pos = plan.text.find(scan, pos + scan.size())) {
-      ++scans;
+TEST(UnnestingTest, StackedDomainAggregatesCloneTheOuterScanOncePerDomain) {
+  for (const std::string_view anchor : {"u.i16 = t.i16 AND ", ""}) {
+    std::string sql = "SELECT i16";
+    for (int n = 1; n <= 4; ++n) {
+      sql += ", (SELECT COUNT(*) FROM u WHERE " + std::string(anchor) +
+             "u.i32 < t.i32 AND u.i64 > " + std::to_string(n) + ")";
+      const auto plan = UnnestedOf(sql + " FROM t");
+      const std::string_view scan = "Scan table=t ";
+      int scans = 0;
+      for (auto pos = plan.text.find(scan); pos != std::string::npos;
+           pos = plan.text.find(scan, pos + scan.size())) {
+        ++scans;
+      }
+      EXPECT_EQ(scans, n + 1) << plan.text;
     }
-    EXPECT_EQ(scans, n + 1) << plan.text;
   }
 }
 

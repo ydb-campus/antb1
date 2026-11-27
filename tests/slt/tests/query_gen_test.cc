@@ -2688,6 +2688,9 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
           .Minus({Feature::kLayout, Feature::kKeywordCase});
   const std::vector<GenTable> tables = JoinTables();
   const auto gen = MakeOver(tables, 71, {.supported = plain, .target_percent = 0});
+  const auto without_keyless =
+      MakeOver(tables, 71,
+               {.supported = plain.Minus({Feature::kKeylessDomainAggregate}), .target_percent = 0});
   // The kind of the column an AVG reads, by its name (qualifier and case aside).
   const auto kind_of = [&tables](std::string name) -> std::optional<ValueKind> {
     name = name.substr(name.rfind('.') + 1);
@@ -2708,10 +2711,16 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   int avg_integer = 0;
   int avg_decimal = 0;
   int keyed_domains = 0;
+  int keyless_domains = 0;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedAggregate)) {
       continue;
+    }
+    if (!q.features.Has(Feature::kKeylessDomainAggregate)) {
+      const auto previous = without_keyless.Generate(i);
+      EXPECT_EQ(q.sql, previous.sql) << i;
+      EXPECT_EQ(q.features, previous.features) << i;
     }
     ++calls;
     const std::size_t at = q.sql.find("(SELECT ");
@@ -2724,6 +2733,11 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
       ++keyed_domains;
       EXPECT_NE(block.find(" AND "), std::string::npos) << q.sql;
       EXPECT_TRUE(q.features.Has(Feature::kCompareColumns)) << q.sql;
+    }
+    if (q.features.Has(Feature::kKeylessDomainAggregate)) {
+      ++keyless_domains;
+      EXPECT_NE(block.find('<'), std::string::npos) << q.sql;
+      EXPECT_FALSE(q.features.Has(Feature::kKeyedDomainAggregate)) << q.sql;
     }
     // Either order. Subquery first when the conjunct opens with it, so what precedes is the AND or
     // the WHERE; literal first when an operator does, which the generator mirrored.
@@ -2755,6 +2769,44 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   EXPECT_GT(avg_integer, 0) << "avg over an integer: " << avg_integer;
   EXPECT_GT(avg_decimal, 0) << "avg over a DECIMAL: " << avg_decimal;
   EXPECT_GT(keyed_domains, 0);
+  EXPECT_GT(keyless_domains, 0);
+}
+
+// Both ends have 1,000 rows. Nine distinct values plus NULL fit the 10,000-pair
+// budget. One more value on either side rules out that orientation of the correlation.
+TEST(QueryGenerator, KeylessAggregateBoundsDistinctBindingsTimesInnerRows) {
+  const auto generator = [](int64_t child_distinct, int64_t parent_distinct) {
+    auto tables = Tables();
+    for (GenTable& table : tables) {
+      table.rows = 1000;
+    }
+    tables.front().refs = {GenRef{.columns = {"i"},
+                                  .table = "big",
+                                  .ref_columns = {"i"},
+                                  .stats = Stats(900, child_distinct, 100),
+                                  .ref_stats = Stats(900, parent_distinct, 100)}};
+    return MakeOver(std::move(tables), 12,
+                    {.supported = kSupportedFeatures.Minus({Feature::kCommaJoin, Feature::kJoinOn}),
+                     .target_percent = 0});
+  };
+  const auto child_only = generator(9, 10);
+  const auto parent_only = generator(10, 9);
+  int child_cases = 0;
+  int parent_cases = 0;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto child = child_only.Generate(i);
+    if (child.features.Has(Feature::kKeylessDomainAggregate)) {
+      EXPECT_EQ(child.table, "small") << child.sql;
+      ++child_cases;
+    }
+    const auto parent = parent_only.Generate(i);
+    if (parent.features.Has(Feature::kKeylessDomainAggregate)) {
+      EXPECT_EQ(parent.table, "big") << parent.sql;
+      ++parent_cases;
+    }
+  }
+  EXPECT_GT(child_cases, 0);
+  EXPECT_GT(parent_cases, 0);
 }
 
 // The variance family (ADR 0037's AG2): written in the select list only, over an integer or a
