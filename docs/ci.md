@@ -20,14 +20,16 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | Dependabot | `.github/dependabot.yml` | weekly (Monday) | one grouped PR that updates the pinned GitHub Actions, for releases at least 7 days old |
 | `Claude` | `.github/workflows/claude.yml` | `@claude` in issues, PR comments and reviews; issue label `claude` | advisory: Claude Code works on the issue or PR (write-access gate, no forks) |
 | `Claude review` | `.github/workflows/claude-review.yml` | a collaborator adds the `claude` label to a ready PR | advisory: read-only Claude review with inline comments |
+| `Grok review` | `.github/workflows/grok-review.yml` | pull requests opened, ready for review or reopened | advisory: one Grok review of the diff, one sticky comment |
 | `Codex harness audit` | `.github/workflows/codex-review.yml` | pull requests opened, ready for review or reopened; label `codex-review` | advisory: read-only Codex audit, one sticky comment |
 | `Copilot Setup Steps` | `.github/workflows/copilot-setup-steps.yml` | every Copilot coding-agent task; manual; changes to itself, `pixi.toml` or `pixi.lock` | prepares Copilot's environment (`default` and `lint`, dev build) |
 | `pixi.lock update` | `.github/workflows/pixi-lock-update.yml` | weekly (Monday), manual | PR `build(deps): update pixi.lock` from the antb1-bot App |
 | `Benchmarks` | `.github/workflows/bench.yml` | pushes to `main` that touch `src/`, `bench/`, `tools/fixturegen/`, `cmake/`, `CMakeLists.txt`, `CMakePresets.json`, `pixi.toml`, `pixi.lock`, the static and bench scripts or `bench.yml`; pull requests labeled `performance`; manual | micro benchmarks and ClickBench timings on the standalone static build; publishes the micro series from `main` to `gh-pages` (`dev/bench-static`); advisory, never gating ([benchmarks.md](benchmarks.md)) |
 
-The AI and bot workflows (Claude, Claude review, Codex harness audit, Copilot Setup Steps, pixi.lock update) and
-`Benchmarks` are advisory: they are not required checks and not part of `CI OK`, and their failures never block a
-merge. The AI workflows' setup, secrets and security model are described in [docs/agents.md](agents.md).
+The AI and bot workflows (Claude, Claude review, Grok review, Codex harness audit, Copilot Setup Steps,
+pixi.lock update) and `Benchmarks` are advisory: they are not required checks and not part of `CI OK`, and their
+failures never block a merge. The AI workflows' setup, secrets and security model are described in
+[docs/agents.md](agents.md).
 
 ## Required checks
 
@@ -81,6 +83,8 @@ Advisory jobs (not required):
 | --- | --- | --- | --- |
 | `claude (@claude)` | `Claude` | ubuntu-24.04 | Claude Code with named `pixi run` tasks and read-only `git`/`gh` only; 60 min |
 | `claude-review (AGENTS.md review rules)` | `Claude review` | ubuntu-24.04 | Claude Code with one review prompt, read-only `git`/`gh` and no file edits; fails when Claude did not post its summary (advisory, not in `CI OK`); 30 min |
+| `grok-review (AGENTS.md review rules)` | `Grok review` | ubuntu-24.04 | Grok 4.7 over the base commit's rules and the diff; 30 min |
+| `grok-review comment` | `Grok review` | ubuntu-slim | posts the review as one sticky comment |
 | `codex-audit (harness checklist)` | `Codex harness audit` | ubuntu-24.04 | Codex CLI 0.155.1, `:read-only` profile, no sudo; 30 min |
 | `codex-audit comment` | `Codex harness audit` | ubuntu-slim | posts the audit as one sticky comment |
 | `copilot-setup-steps` | `Copilot Setup Steps` | ubuntu-24.04 | `pixi install --locked -e lint`, then `pixi run --frozen -e default build` |

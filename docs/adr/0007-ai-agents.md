@@ -34,6 +34,9 @@ Accepted
   - Codex: native review on request (`@codex review`, automatic reviews off) and a harness audit per PR
     (`.github/workflows/codex-review.yml`) that runs a pinned Codex CLI read-only with a spend-capped project key
     (`OPENAI_API_KEY`) and posts one sticky comment;
+  - Grok: one review per pull request (`.github/workflows/grok-review.yml`). The prompt, the review script and
+    AGENTS.md come from the base commit; the diff goes to `grok-4.7` with `XAI_API_KEY`, and one sticky comment
+    is posted. The key is billed per token and does not draw on an X Subscription pool;
   - Copilot: `.github/copilot-instructions.md` and `.github/workflows/copilot-setup-steps.yml`, which prepares
     the same pixi environments for the coding agent;
   - cloud sandboxes (Claude Code on the web, Codex cloud, Copilot) install the same locked environments
@@ -41,8 +44,9 @@ Accepted
 - Defense in depth against prompt injection and secret misuse: `@claude` requires write access for both the sender
   and the issue or PR author and refuses fork PRs; the review workflows run only on same-repository, non-draft PRs;
   in GitHub Actions, Claude runs with hooks disabled and only named `pixi run` tasks plus read-only `git` and `gh`;
-  the Codex audit takes its prompt and AGENTS.md from the base commit, does not load the PR's AGENTS.md as
-  instructions and has no write token (a separate job posts its comment); every AI job's workflow token is read-only.
+  the Codex audit and the Grok review take their prompts and AGENTS.md from the base commit, do not load the PR's
+  AGENTS.md as instructions and have no write token (a separate job posts each comment); every AI job's workflow
+  token is read-only.
 - Every PR discloses AI assistance in its template and names the accountable human.
 - `pixi run lint` keeps the agent-facing files honest: commands in the docs must exist, links must resolve, and
   AGENTS.md must stay within its size limits and contain the Code Review Rules.
@@ -55,8 +59,8 @@ Accepted
 - One file to keep up to date; tool-specific files stay small.
 - Agents that follow AGENTS.md produce changes that pass the same gates as human changes.
 - The "Ask a human first" list slows down changes to CI and the toolchain, which is intended.
-- The Codex harness audit runs automatically on eligible PRs. Collaborators control Claude subscription usage by
-  requesting individual reviews.
+- The Codex harness audit and the Grok review run automatically on eligible PRs. Collaborators control Claude
+  subscription usage by requesting individual reviews. The Grok review spends the xAI API key, not that subscription.
 - Anyone with write access can still read the repository secrets from a same-repository PR run by changing a
   workflow. CODEOWNERS review on `.github/`, the spend cap and quick rotation (docs/agents.md) limit the damage.
 - The Claude subscription token expires after about a year and must be renewed by hand; an `ANTHROPIC_API_KEY`

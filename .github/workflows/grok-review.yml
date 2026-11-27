@@ -1,0 +1,97 @@
+# Advisory Grok review, once per pull request (opened, ready for review, reopened), never on every push and never a
+# required check. A later push does not request another review.
+# The prompt (.github/grok/review-prompt.md), the review script (.github/scripts/grok_review.py) and the review
+# rules (AGENTS.md) come from the BASE commit, so a PR cannot rewrite its own instructions or the program that
+# sees the API key. A base without the prompt skips the review. The model sees the file list and the patch, not a
+# checkout it can edit.
+# Same-repo, non-draft PRs only (Copilot's PRs included). The review job's token is read-only. Only the post job can
+# write, and it only updates one sticky comment.
+# Inert until the XAI_API_KEY secret exists. That key is billed per token and does not draw on an X Subscription pool
+# (docs/agents.md).
+name: Grok review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+permissions: {}
+
+jobs:
+  review:
+    name: grok-review (AGENTS.md review rules)
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.pull_request.user.type != 'Bot' || github.event.pull_request.user.login == 'Copilot')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      # Job level: a run that the condition above skips never cancels a review in progress.
+      group: grok-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read # checkout of the pull request, to read the base commit and the diff
+    outputs:
+      message: ${{ steps.grok.outputs.message }}
+    steps:
+      - id: key
+        name: Check that the XAI_API_KEY secret exists
+        env:
+          HAS_KEY: ${{ secrets.XAI_API_KEY != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
+        run: |
+          if [ "$HAS_KEY" = true ]; then
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice::the XAI_API_KEY secret is not set, so the Grok review is skipped (docs/agents.md)"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          fi
+      - if: steps.key.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the base commit (prompt, AGENTS.md) and the merge base for `git diff BASE...HEAD`
+          persist-credentials: false
+      - id: material
+        name: Prompt, rules and diff from the base commit
+        if: steps.key.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ! git cat-file -e "$BASE_SHA:.github/grok/review-prompt.md" 2>/dev/null; then
+            echo "::notice::the base commit has no .github/grok/review-prompt.md, so the Grok review is skipped"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git show "$BASE_SHA:.github/grok/review-prompt.md" >"$RUNNER_TEMP/grok-prompt.md"
+          git show "$BASE_SHA:.github/scripts/grok_review.py" >"$RUNNER_TEMP/grok_review.py"
+          git show "$BASE_SHA:AGENTS.md" >"$RUNNER_TEMP/grok-agents.md"
+          git diff --name-only "$BASE_SHA...$HEAD_SHA" >"$RUNNER_TEMP/grok-names.txt"
+          git diff --no-color --find-renames "$BASE_SHA...$HEAD_SHA" >"$RUNNER_TEMP/grok.diff"
+          echo "run=true" >>"$GITHUB_OUTPUT"
+      - id: grok
+        name: Ask Grok to review the diff
+        if: steps.material.outputs.run == 'true'
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }} # zizmor: ignore[secrets-outside-env]
+          GROK_PROMPT_FILE: ${{ runner.temp }}/grok-prompt.md
+          GROK_RULES_FILE: ${{ runner.temp }}/grok-agents.md
+          GROK_NAMES_FILE: ${{ runner.temp }}/grok-names.txt
+          GROK_DIFF_FILE: ${{ runner.temp }}/grok.diff
+        run: python3 -I "$RUNNER_TEMP/grok_review.py"
+
+  post:
+    name: grok-review comment
+    needs: review
+    if: needs.review.outputs.message != ''
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    concurrency:
+      group: grok-review-comment-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      pull-requests: write # create or update the one sticky review comment
+    steps:
+      - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: grok-review
+          message: ${{ needs.review.outputs.message }}
