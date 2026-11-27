@@ -1879,9 +1879,8 @@ arrow::Result<Rewritten> WidenScalarKeys(const Correlation& correlation, Spine s
       if (value->type != type) {
         const bool outer = correlation.outer.contains(std::get<ColumnExpr>(value->node).id);
         value = WidenKeyOperand(value, type, outer ? left : right, correlation.last_id);
-        BoundColumn& column = (i == 0 ? keyed.predicate.column : keyed.predicate.other).value();
-        column.type = type;
-        column.name = value->name;
+        auto& column = i == 0 ? keyed.predicate.column : keyed.predicate.other;
+        column = BoundColumn{.index = Narrow<int>(i), .name = value->name, .type = type};
       }
     }
     const auto index = Narrow<std::size_t>(defined - spine.computed->exprs.data());
