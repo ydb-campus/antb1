@@ -33,6 +33,12 @@
 #include "pool_vector.h"
 
 namespace antb1::exec {
+
+bool LacksValues(const arrow::ArrayData& data) {
+  return (data.type->id() == arrow::Type::BOOL || data.type->byte_width() > 0) &&
+         data.buffers.size() > 1 && data.buffers[1] == nullptr;
+}
+
 namespace {
 
 // Arrow exposes both metadata vectors with the standard allocator. Reserve their heap bytes
@@ -56,13 +62,6 @@ struct UniqueColumn {
   MemoryReservation buffer_memory;
   arrow::ArrayData data;
 };
-
-// A fixed-width column with no values buffer, which the Arrow format allows when it has no rows or
-// only NULLs.
-bool LacksValues(const arrow::ArrayData& data) {
-  return (data.type->id() == arrow::Type::BOOL || data.type->byte_width() > 0) &&
-         data.buffers.size() > 1 && data.buffers[1] == nullptr;
-}
 
 // `keys` with every such column replaced by NULLs over a zeroed values buffer: arrow's Grouper
 // reads a fixed-width column's values even where every row is NULL.

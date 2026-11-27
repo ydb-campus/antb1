@@ -90,11 +90,12 @@ class PartSink : public Operator {
 // run ahead on ExecContext::executor, at most 2 * threads of them at a time. With a row cap (a
 // LIMIT above it needs at most limit + offset rows), each part stops after that many selected rows.
 // Batches keep their selections; batches without selected rows are dropped. Its parts are done
-// once it has handed on the last part's batches.
+// once it has handed on the last part's batches. A DISTINCT intersection may supply its key
+// columns to discard repeats within each part before its rows reach the shared membership table.
 class PartUnionOperator final : public PartSink {
  public:
   PartUnionOperator(PartPipeline pipeline, int64_t num_parts, std::shared_ptr<arrow::Schema> schema,
-                    std::optional<int64_t> row_cap);
+                    std::optional<int64_t> row_cap, std::vector<int> distinct_columns = {});
   ~PartUnionOperator() override;
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
@@ -105,13 +106,17 @@ class PartUnionOperator final : public PartSink {
   arrow::Status Close() override;
 
  private:
-  using PartBatches = std::shared_ptr<std::vector<Batch>>;
+  struct PartBatches {
+    std::vector<Batch> batches;
+    std::optional<int64_t> distinct_rows_removed;
+  };
 
   std::shared_ptr<const PartPipeline> pipeline_;
   int64_t num_parts_;
   std::shared_ptr<arrow::Schema> schema_;
   std::optional<int64_t> row_cap_;
-  PartBatches current_;
+  std::vector<int> distinct_columns_;
+  std::optional<PartBatches> current_;
   std::size_t next_ = 0;  // the next batch of current_
   bool ended_ = false;    // every part's batches were handed on
   std::unique_ptr<PartScheduler<PartBatches>> scheduler_;

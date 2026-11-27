@@ -37,6 +37,18 @@ arrow::Result<std::unique_ptr<arrow::Buffer>> Hashes(const arrow::compute::ExecB
       keys, std::span(buffer->mutable_data_as<std::uint64_t>(), Narrow<std::size_t>(keys.length))));
   return buffer;
 }
+arrow::Result<arrow::compute::ExecBatch> NormalizedKeys(const arrow::RecordBatch& rows,
+                                                        arrow::MemoryPool* pool) {
+  arrow::compute::ExecBatch keys(rows);
+  for (auto& key : keys.values) {
+    if (key.type()->id() == arrow::Type::DOUBLE) {
+      ARROW_ASSIGN_OR_RAISE(auto normalized, NormalizeDoubleKey(key.make_array(), pool));
+      key = normalized;
+    }
+  }
+  return keys;
+}
+
 }  // namespace
 
 // Index a union's retained rows by hash. Equal hashes still compare the complete row.
@@ -233,19 +245,23 @@ Batch UnionDistinct::Next() {
 std::size_t UnionDistinct::Lane(std::uint64_t hash) const {
   return (hash >> 32U) & (lanes_.size() - 1);
 }
-arrow::Status UnionDistinct::ConsumeSerial(const std::shared_ptr<arrow::RecordBatch>& rows) {
-  ARROW_ASSIGN_OR_RAISE(auto keys, Keys(*rows));
-  if (serial_ == nullptr) {
-    ARROW_ASSIGN_OR_RAISE(serial_, MakeKeyTable(keys.GetTypes(), &kernels_, {}, ctx_.budget));
+arrow::Result<KeyIds> ConsumeDistinctKeys(const arrow::RecordBatch& rows,
+                                          std::unique_ptr<KeyTable>& table,
+                                          arrow::compute::ExecContext& kernels,
+                                          MemoryBudget* budget) {
+  ARROW_ASSIGN_OR_RAISE(auto keys, NormalizedKeys(rows, kernels.memory_pool()));
+  if (table == nullptr) {
+    ARROW_ASSIGN_OR_RAISE(table, MakeKeyTable(keys.GetTypes(), &kernels, {}, budget));
   }
-  ARROW_ASSIGN_OR_RAISE(const auto ids, serial_->Consume(keys));
+  return table->Consume(keys);
+}
+
+arrow::Result<std::shared_ptr<arrow::UInt32Array>> FirstDistinctRows(const KeyIds& ids,
+                                                                     arrow::MemoryPool* pool) {
   const auto added = ids.after - ids.before;
-  if (added == 0) {
-    return arrow::Status::OK();
-  }
-  arrow::UInt32Builder selected(ctx_.pool);
+  arrow::UInt32Builder selected(pool);
   ARROW_RETURN_NOT_OK(selected.Reserve(added));
-  ARROW_ASSIGN_OR_RAISE(auto seen, arrow::AllocateEmptyBitmap(added, ctx_.pool));
+  ARROW_ASSIGN_OR_RAISE(auto seen, arrow::AllocateEmptyBitmap(added, pool));
   for (std::uint32_t row = 0; row < ids.ids.size(); ++row) {
     const auto id = ids.ids[row];
     if (id >= ids.before && !arrow::bit_util::GetBit(seen->data(), id - ids.before)) {
@@ -253,7 +269,18 @@ arrow::Status UnionDistinct::ConsumeSerial(const std::shared_ptr<arrow::RecordBa
       selected.UnsafeAppend(row);
     }
   }
-  ARROW_ASSIGN_OR_RAISE(const auto positions, selected.Finish());
+  std::shared_ptr<arrow::UInt32Array> positions;
+  ARROW_RETURN_NOT_OK(selected.Finish(&positions));
+  return positions;
+}
+
+arrow::Status UnionDistinct::ConsumeSerial(const std::shared_ptr<arrow::RecordBatch>& rows) {
+  ARROW_ASSIGN_OR_RAISE(const auto ids, ConsumeDistinctKeys(*rows, serial_, kernels_, ctx_.budget));
+  const auto added = ids.after - ids.before;
+  if (added == 0) {
+    return arrow::Status::OK();
+  }
+  ARROW_ASSIGN_OR_RAISE(const auto positions, FirstDistinctRows(ids, ctx_.pool));
   ARROW_ASSIGN_OR_RAISE(
       const auto taken,
       arrow::compute::Take(rows, positions, arrow::compute::TakeOptions::NoBoundsCheck(),
@@ -273,7 +300,7 @@ arrow::Status UnionDistinct::SeedLanes() {
     lanes_.emplace_back(ctx_.pool);
   }
   for (std::size_t batch = 0; batch < output_.size(); ++batch) {
-    ARROW_ASSIGN_OR_RAISE(const auto keys, Keys(*output_[batch]));
+    ARROW_ASSIGN_OR_RAISE(const auto keys, NormalizedKeys(*output_[batch], ctx_.pool));
     ARROW_ASSIGN_OR_RAISE(const auto hashes, Hashes(keys, ctx_.pool));
     const auto count_rows = Narrow<std::uint32_t>(keys.length);
     for (std::uint32_t row = 0; row < count_rows; ++row) {
@@ -287,19 +314,8 @@ arrow::Status UnionDistinct::SeedLanes() {
   return arrow::Status::OK();
 }
 
-arrow::Result<arrow::compute::ExecBatch> UnionDistinct::Keys(const arrow::RecordBatch& rows) const {
-  arrow::compute::ExecBatch keys(rows);
-  for (auto& key : keys.values) {
-    if (key.type()->id() == arrow::Type::DOUBLE) {
-      ARROW_ASSIGN_OR_RAISE(auto normalized, NormalizeDoubleKey(key.make_array(), ctx_.pool));
-      key = normalized;
-    }
-  }
-  return keys;
-}
-
 arrow::Status UnionDistinct::Route(Piece& piece) {
-  ARROW_ASSIGN_OR_RAISE(const auto keys, Keys(*piece.rows));
+  ARROW_ASSIGN_OR_RAISE(const auto keys, NormalizedKeys(*piece.rows, ctx_.pool));
   ARROW_ASSIGN_OR_RAISE(piece.hashes, Hashes(keys, ctx_.pool));
   const auto hashes =
       std::span(piece.hashes->data_as<std::uint64_t>(), Narrow<std::size_t>(keys.length));

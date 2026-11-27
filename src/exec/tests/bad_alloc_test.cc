@@ -46,6 +46,7 @@
 #include "../key_table.h"
 #include "../part_scheduler.h"
 #include "../partition_lanes.h"
+#include "../slice.h"
 #include "../window.h"
 #include "exec_test_util.h"
 
@@ -1192,6 +1193,39 @@ TEST_F(JoinTableBadAllocTest, AOneRowPrepareThatRunsOutOfMemoryHoldsNothing) {
 // ---- a GROUP BY's key table ----
 
 class KeyTableBadAllocTest : public testing::ExecTest {};
+
+// A part slices its key batch and selection mask before building the local hash table. Every
+// allocation for these slices can fail: the worker can then pass on the original input.
+TEST_F(KeyTableBadAllocTest, SlicingAKeyOrSelectionSurvivesEveryHeapFailure) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto keys = arrow::RecordBatch::Make(schema, 4, {Int64s({0, 1, std::nullopt, 3})});
+  const auto selection = testing::Bools({true, false, true, true});
+  const auto expected = keys->Slice(1, 2);
+  const auto expected_selection = selection->Slice(1, 2);
+  Sweep([&](std::int64_t skip) {
+    std::optional<arrow::Result<Batch>> slice;
+    bool fired = false;
+    {
+      const FailAllocations fail(skip);
+      slice.emplace(KeyTableNoBadAlloc([&] -> arrow::Result<Batch> {
+        ARROW_ASSIGN_OR_RAISE(auto batch, SliceBatch(keys, 1, 2));
+        ARROW_ASSIGN_OR_RAISE(auto mask, SliceColumn(*selection, 1, 2));
+        return Batch{.data = std::move(batch),
+                     .selection = std::static_pointer_cast<arrow::BooleanArray>(std::move(mask))};
+      }));
+      fired = fail.failed() > 0;
+    }
+    if (fired) {
+      EXPECT_TRUE(slice->status().IsOutOfMemory()) << slice->status();
+    } else if (slice->ok()) {
+      EXPECT_TRUE((**slice).data->Equals(*expected));
+      EXPECT_TRUE((**slice).selection->Equals(*expected_selection));
+    } else {
+      ADD_FAILURE() << slice->status();
+    }
+    return fired;
+  });
+}
 
 TEST_F(KeyTableBadAllocTest, StoredOutputCanRetryEveryFailedHeapAllocation) {
   // The integer backend emits its stored keys; DOUBLE must emit the original negative zero.

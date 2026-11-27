@@ -25,6 +25,10 @@ class ExecContext;
 
 namespace antb1::exec {
 
+// A fixed-width column with no values buffer, which the Arrow format allows when it has no rows or
+// only NULLs.
+bool LacksValues(const arrow::ArrayData& data);
+
 // The group ids a KeyTable gave the rows of one call, and the groups the call added.
 struct KeyIds {
   std::shared_ptr<arrow::Buffer> owner;  // holds `ids`
