@@ -154,17 +154,30 @@ arrow::Status UnionDistinct::Append(const std::shared_ptr<arrow::RecordBatch>& r
       }
       ARROW_RETURN_NOT_OK(SeedLanes());
     }
+    // Route retains a hash, an order and a rank for every candidate, even duplicates.
+    // Leave the other half of the available space for input, directory growth and compaction.
+    int64_t window = kWindowRows;
+    if (ctx_.budget != nullptr && ctx_.budget->limit().has_value()) {
+      constexpr int64_t kRouteBytes = sizeof(std::uint64_t) + 2 * sizeof(std::uint32_t);
+      const auto available = *ctx_.budget->limit() - ctx_.budget->bytes_allocated();
+      window = std::clamp<int64_t>(available / (2 * kRouteBytes), 1, kWindowRows);
+      if (pending_rows_ >= window) {
+        ARROW_RETURN_NOT_OK(Flush());
+        continue;
+      }
+    }
     if (pending_.empty() || pending_.back().length == kTileRows ||
         pending_.back().fragments.size() >= 64) {
       pending_.emplace_back();
     }
     auto& piece = pending_.back();
-    const auto count = std::min(kTileRows - piece.length, rows->num_rows() - start);
+    const auto count =
+        std::min({kTileRows - piece.length, rows->num_rows() - start, window - pending_rows_});
     piece.fragments.push_back(rows->Slice(start, count));
     start += count;
     piece.length += count;
     pending_rows_ += count;
-    if (pending_rows_ >= kWindowRows || pending_.size() >= 64 ||
+    if (pending_rows_ >= window || pending_.size() >= 64 ||
         (ctx_.budget != nullptr && ctx_.budget->under_pressure())) {
       ARROW_RETURN_NOT_OK(Flush());
     }
