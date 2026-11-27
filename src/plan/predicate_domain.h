@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <variant>
 
 #include "antb1/common/narrow.h"
 #include "antb1/plan/logical_plan.h"
@@ -14,6 +15,13 @@ namespace antb1::plan {
 inline bool ReadsSlot(const BoundColumn& column, std::span<const ColumnId> ids) {
   const auto slot = TryNarrow<std::size_t>(column.index);
   return slot && *slot < ids.size() && column.id != kNoColumnId && ids[*slot] == column.id;
+}
+
+// The binder also permits a DOUBLE literal on a DECIMAL column. Every possible decimal
+// converts to DOUBLE for this comparison (ADR 0021, rule 11).
+inline bool ComparesDecimalInDouble(const BoundColumn& column, const Constant& value) {
+  return column.type == LogicalType::kDecimal && value.type == LogicalType::kDouble &&
+         std::holds_alternative<double>(value.value);
 }
 
 struct PredicateDomainKey {

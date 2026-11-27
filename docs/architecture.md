@@ -274,6 +274,13 @@ steps (only step 7 uses more than one thread):
    scan columns needed for the final grouping, counting only the offset for a string. The
    choice applies at every thread count to preserve the probe and accumulation order. A
    finite memory limit keeps the previous build side for an OOM retry.
+   A comparison against a completed aggregate such as a decimal sum or an integer count can also
+   run on the grouped probe of a residual-free inner join. The planner moves the filter as a whole
+   when its predicates can safely read the probe alone. The aggregate still evaluates every input
+   row, and only qualifying groups reach the join. The filter stays above the join when moving it
+   could hide a row from an error-producing predicate or pack a later row into a batch evaluated
+   before a limit is satisfied. Group cardinality estimates and shared-reader
+   key lists continue to require their own proofs of which grouping-key values can survive.
    Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
@@ -293,9 +300,10 @@ steps (only step 7 uses more than one thread):
    nested loop, [ADR 0040](adr/0040-nested-loop-joins.md)), made once per
    pipeline before the factory of its parts, and a probe of the other, in that input's part pipeline or over it; a
    malformed join (keys of two types, say) is `Invalid`.
-   For an inner join without a residual, a filter consisting of integer or DATE equalities on
-   the probe’s grouping keys can run on the completed groups before the join gathers build columns.
-   The build still runs first, and the aggregate evaluates the same input rows.
+   When planning an inner join without a residual, the physical planner can also place a filter
+   directly on completed probe groups. It checks the resolved column positions before moving
+   grouping-key equalities or comparisons on aggregate results. The build still runs first, so an
+   empty build can skip the probe.
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
    error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns. The part
    pipelines run on the session's thread pool (`--threads`, `engine::SessionOptions::threads`), and so do the batches

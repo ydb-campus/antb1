@@ -33,6 +33,7 @@
 #include "antb1/plan/deferred_dimension_join.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/optimizer.h"
 #include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
@@ -163,57 +164,20 @@ const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node,
   return nullptr;
 }
 
-// Filter completed groups before gathering the matching build rows. Keep the build untouched:
-// an empty build must still skip the probe, and every group the probe evaluates may still fail.
-// A residual must see all the original matches. Move the entire conjunction to preserve the
-// evaluation order of any other predicates.
-plan::LogicalNodePtr FilterGroupedProbe(const plan::FilterNode& filter) {
-  const auto* join = std::get_if<plan::JoinNode>(filter.input.get());
-  if (join == nullptr || join->kind != plan::JoinKind::kInner || !join->residual.empty() ||
-      filter.predicates.empty()) {
-    return nullptr;
-  }
-  const bool build_left = join->build == plan::BuildSide::kLeft;
-  const auto& probe = build_left ? join->right : join->left;
-  const auto* group = std::get_if<plan::GroupAggregateNode>(probe.get());
-  if (group == nullptr || group->key_ids.empty() || join->left == nullptr) {
-    return nullptr;
-  }
-  const std::size_t offset = build_left ? plan::OutputIds(*join->left).size() : 0;
-  std::vector<plan::Predicate> predicates = filter.predicates;
-  for (plan::Predicate& predicate : predicates) {
-    if (!plan::IsIntegerOrDateEquality(predicate) || !predicate.column.has_value() ||
-        predicate.column->id == plan::kNoColumnId) {
-      return nullptr;
-    }
-    // The join outputs its left columns first. Verify the resolved slot and its id before
-    // rebasing it onto the probe, including for callers that supply their own physical input.
-    const auto slot = TryNarrow<std::size_t>(predicate.column->index);
-    if (!slot.has_value() || *slot < offset || *slot - offset >= group->key_ids.size() ||
-        group->key_ids[*slot - offset] != predicate.column->id) {
-      return nullptr;
-    }
-    predicate.column->index = Narrow<int>(*slot - offset);
-  }
-  plan::JoinNode out = *join;
-  (build_left ? out.right : out.left) = std::make_shared<const plan::LogicalNode>(
-      plan::FilterNode{.input = probe, .predicates = std::move(predicates), .span = filter.span});
-  return std::make_shared<const plan::LogicalNode>(std::move(out));
-}
-
 // Resolve the existing semi/anti fallback before a consumer asks PipelineScan about its input.
 // Otherwise that consumer sees a left-building sink, chooses a serial implementation, and only
 // later discovers that Build turned the join into a streaming right build. Resolve children first:
 // a child falling back can restore the probe pipeline of its parent too. Shared producers are
 // normalized separately from the substituted consumer tree, after sharing has chosen its scans.
-plan::LogicalNodePtr PreparePhysicalJoins(const plan::LogicalNodePtr& node) {
+plan::LogicalNodePtr PreparePhysicalJoins(const plan::LogicalNodePtr& node,
+                                          plan::GroupFilterContext context = {}) {
   if (node == nullptr) {
     return node;
   }
   std::vector<plan::LogicalNodePtr> inputs = plan::InputsOf(*node);
   bool changed = false;
   for (auto& input : inputs) {
-    auto normalized = PreparePhysicalJoins(input);
+    auto normalized = PreparePhysicalJoins(input, context.ForInput(*node));
     changed = changed || normalized != input;
     input = std::move(normalized);
   }
@@ -226,8 +190,10 @@ plan::LogicalNodePtr PreparePhysicalJoins(const plan::LogicalNodePtr& node) {
     right.build = plan::BuildSide::kRight;
     return std::make_shared<const plan::LogicalNode>(std::move(right));
   }
-  if (const auto* filter = std::get_if<plan::FilterNode>(current.get())) {
-    if (auto pushed = FilterGroupedProbe(*filter)) {
+  // Downstream filters can inspect masked rows, and a LIMIT can expose batch boundaries.
+  if (const auto* filter = std::get_if<plan::FilterNode>(current.get());
+      filter != nullptr && context.CanMove()) {
+    if (auto pushed = plan::FilterGroupedProbe(*filter, plan::GroupedProbeFilterMode::kPhysical)) {
       return pushed;
     }
   }
