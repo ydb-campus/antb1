@@ -2922,6 +2922,7 @@ arrow::Result<Rewritten> SingleJoin(const Correlation& correlation) {
     ARROW_ASSIGN_OR_RAISE(const auto bindings,
                           ScalarDomain(correlation, *spine, equivalences, values, single.right));
     std::vector<JoinKey> keys;
+    keys.reserve(bindings.of.size());
     for (const auto& [outer, binding] : bindings.of) {
       keys.push_back(JoinKey{.left = equivalences.described.at(outer),
                              .right = equivalences.described.at(binding),
