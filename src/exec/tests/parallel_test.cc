@@ -971,10 +971,8 @@ void CheckDistinctUnion(arrow::internal::Executor* executor) {
 void CheckDistinctUnionWindow(arrow::internal::Executor* executor) {
   constexpr int64_t kDistinct = 32'768;
   const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
-  std::vector<std::optional<int64_t>> keys;
-  for (int64_t key = 0; key < kDistinct; ++key) {
-    keys.emplace_back(key);
-  }
+  std::vector<std::optional<int64_t>> keys(kDistinct);
+  std::ranges::iota(keys, int64_t{0});
   const auto prefix = arrow::RecordBatch::Make(schema, kDistinct, {Int64s(keys)});
   const auto repeated = arrow::RecordBatch::Make(
       schema, kDistinct, {Int64s(std::vector<std::optional<int64_t>>(kDistinct, 1))});
