@@ -271,7 +271,7 @@ class Scope {
   // The column at `where`, which must be in range.
   [[nodiscard]] const BindingColumn& column(ColumnLocation where) const;
 
-  // Whether column `id` is a binding's column stored as FLOAT (false for a computed column).
+  // Whether the binding defining `id` here or in an enclosing scope stores it as FLOAT.
   [[nodiscard]] bool StoredAsFloat(ColumnId id) const;
 
   // Where in this block the subquery stands whose block binds now (its binder sets it first). An

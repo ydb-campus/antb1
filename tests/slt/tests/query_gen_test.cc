@@ -2635,9 +2635,10 @@ TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
 // What it writes: both polarities, a qualified key on each side, the inner table named and never
 // the outer binding's name, and an optional non-equality over the same pair.
 TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
-  const FeatureSet plain = Union(kSupportedFeatures, {Feature::kCorrelatedExists})
-                               .Minus({Feature::kLayout, Feature::kKeywordCase,
-                                       Feature::kCorrelatedIn, Feature::kNestedCorrelation});
+  const FeatureSet plain =
+      Union(kSupportedFeatures, {Feature::kCorrelatedExists})
+          .Minus({Feature::kLayout, Feature::kKeywordCase, Feature::kCorrelatedIn,
+                  Feature::kNestedCorrelation, Feature::kMiddleEqualityExists});
   const auto gen = MakeOver(JoinTables(), 71, {.supported = plain, .target_percent = 0});
   int exists = 0;
   int negated = 0;
@@ -6051,6 +6052,53 @@ TEST(QueryGenerator, NestedCorrelationsHaveThreeQueryBlocks) {
     EXPECT_FALSE(blocks.back()->query->where.empty());
   }
   EXPECT_GT(nested, 10);
+}
+
+TEST(QueryGenerator, MiddleEqualityExistsReachesPastTheMiddleTable) {
+  const auto features =
+      kSupportedFeatures.Minus({Feature::kLayout, Feature::kKeywordCase, Feature::kIdentifierCase,
+                                Feature::kQuotedIdentifier});
+  const auto gen = MakeOver(JoinTables(), 71, {.supported = features, .target_percent = 0});
+  const auto control = MakeOver(
+      JoinTables(), 71,
+      {.supported = features.Minus({Feature::kMiddleEqualityExists}), .target_percent = 0});
+  int positive = 0;
+  int negative = 0;
+  for (uint64_t i = 0; i < 4000; ++i) {
+    const auto q = gen.Generate(i);
+    const auto plain = control.Generate(i);
+    if (!q.features.Has(Feature::kMiddleEqualityExists)) {
+      EXPECT_EQ(q.sql, plain.sql);
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    EXPECT_FALSE(plain.features.Has(Feature::kMiddleEqualityExists));
+    EXPECT_TRUE(q.features.Has(Feature::kCorrelatedExists));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    std::vector<const sql::SubqueryExpr*> blocks;
+    DeepSubqueries(*parsed, blocks);
+    ASSERT_EQ(blocks.size(), 2U);
+    const auto& middle = *blocks.front()->query;
+    const auto& inner = *blocks.back()->query;
+    ASSERT_FALSE(middle.where.empty());
+    ASSERT_FALSE(inner.where.empty());
+    // The repeated equality must use the same outer name in both blocks. A comparison to
+    // the middle binding instead would exercise the existing one-level rule.
+    EXPECT_EQ(sql::ToSql(inner.where.front()), sql::ToSql(middle.where.front()));
+    ASSERT_EQ(middle.from.size(), 1U);
+    ASSERT_EQ(inner.from.size(), 1U);
+    ASSERT_NE(inner.from.front().table(), nullptr);
+    ASSERT_NE(middle.from.front().table(), nullptr);
+    EXPECT_EQ(inner.from.front().table()->name, middle.from.front().table()->name);
+    if (q.sql.contains("AND NOT EXISTS(SELECT * FROM ")) {
+      ++negative;
+    } else {
+      ++positive;
+    }
+  }
+  EXPECT_GT(positive, 0);
+  EXPECT_GT(negative, 0);
 }
 
 TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
