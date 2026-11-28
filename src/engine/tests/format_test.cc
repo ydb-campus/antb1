@@ -531,5 +531,110 @@ TEST(FormatPhysicalPlanTest, DrawsTheLeftInputBeforeTheRight) {
   EXPECT_EQ(root->children()[1]->name(), "HashBuild");
 }
 
+// The side is the build= token after the join kind, including a kind that contains a space. A
+// residual that quotes the other side's token must not cancel it: this join builds on the left, so
+// its HashBuild is printed first.
+TEST(FormatPhysicalPlanTest, AResidualDoesNotDecideTheBuildSide) {
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("HashJoin");
+  root->set_detail(
+      "Join NULL-AWARE ANTI build=left keys=[u.k = t.k] residual=[(x = 'build=right')]");
+  exec::ProfileNode& probe = *root->Child(0);
+  probe.set_name("Scan");
+  probe.set_detail("Scan table=t source=memory columns=[k]");
+  exec::ProfileNode& build = *root->Child(1);
+  build.set_name("HashBuild");
+  build.set_detail(
+      "Join NULL-AWARE ANTI build=left keys=[u.k = t.k] residual=[(x = 'build=right')]");
+  exec::ProfileNode& left = *build.Child(0);
+  left.set_name("Scan");
+  left.set_detail("Scan table=u source=memory columns=[k]");
+  EXPECT_EQ(FormatPhysicalPlan("Output: c:BIGINT", *root),
+            "Output: c:BIGINT\n"
+            "HashJoin Join NULL-AWARE ANTI build=left keys=[u.k = t.k] residual=[(x = "
+            "'build=right')]\n"
+            "├─HashBuild Join NULL-AWARE ANTI build=left keys=[u.k = t.k] residual=[(x = "
+            "'build=right')]\n"
+            "│ └─Scan table=u source=memory columns=[k]\n"
+            "└─Scan table=t source=memory columns=[k]\n");
+}
+
+// Two joins in one part pipeline. The consumer holds both HashBuilds, outermost first, and each
+// join claims the build at the front of that queue. The outer join builds on the left and the
+// inner one on the right, so the text order is not the profile order.
+TEST(FormatPhysicalPlanTest, DrawsStackedPipelineBuildsUnderTheirJoins) {
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("PartAggregate");
+  root->set_detail("Aggregate COUNT(*)");
+  exec::ProfileNode& outer = *root->Child(0);
+  outer.set_name("HashJoin");
+  outer.set_detail("Join INNER build=left keys=[u.k = t.k]");
+  outer.set_per_part(true);
+  exec::ProfileNode& inner = *outer.Child(0);
+  inner.set_name("HashJoin");
+  inner.set_detail("Join INNER build=right keys=[t.k = v.k]");
+  inner.set_per_part(true);
+  exec::ProfileNode& probe = *inner.Child(0);
+  probe.set_name("Scan");
+  probe.set_detail("Scan table=t source=memory columns=[k]");
+  probe.set_per_part(true);
+  exec::ProfileNode& outer_build = *root->Child(1);
+  outer_build.set_name("HashBuild");
+  outer_build.set_detail("Join INNER build=left keys=[u.k = t.k]");
+  exec::ProfileNode& left = *outer_build.Child(0);
+  left.set_name("Scan");
+  left.set_detail("Scan table=u source=memory columns=[k]");
+  exec::ProfileNode& inner_build = *root->Child(2);
+  inner_build.set_name("HashBuild");
+  inner_build.set_detail("Join INNER build=right keys=[t.k = v.k]");
+  exec::ProfileNode& right = *inner_build.Child(0);
+  right.set_name("Scan");
+  right.set_detail("Scan table=v source=memory columns=[k]");
+  EXPECT_EQ(FormatPhysicalPlan("Output: c:BIGINT", *root),
+            "Output: c:BIGINT\n"
+            "PartAggregate Aggregate COUNT(*)\n"
+            "└─HashJoin Join INNER build=left keys=[u.k = t.k]\n"
+            "  ├─HashBuild Join INNER build=left keys=[u.k = t.k]\n"
+            "  │ └─Scan table=u source=memory columns=[k]\n"
+            "  └─HashJoin Join INNER build=right keys=[t.k = v.k]\n"
+            "    ├─Scan table=t source=memory columns=[k]\n"
+            "    └─HashBuild Join INNER build=right keys=[t.k = v.k]\n"
+            "      └─Scan table=v source=memory columns=[k]\n");
+  EXPECT_EQ(root->children().size(), 3U);
+  EXPECT_EQ(root->children()[0]->name(), "HashJoin");
+  EXPECT_EQ(root->children()[1]->name(), "HashBuild");
+  EXPECT_EQ(root->children()[2]->name(), "HashBuild");
+}
+
+// A join claims only the build at the front of the queue, and only when its detail matches. A
+// build the joins do not claim stays a later child of the consumer that prepared it.
+TEST(FormatPhysicalPlanTest, AnUnclaimedPipelineBuildStaysOnTheConsumer) {
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("PartAggregate");
+  root->set_detail("Aggregate COUNT(*)");
+  exec::ProfileNode& join = *root->Child(0);
+  join.set_name("HashJoin");
+  join.set_detail("Join INNER build=right keys=[t.k = u.k]");
+  join.set_per_part(true);
+  exec::ProfileNode& probe = *join.Child(0);
+  probe.set_name("Scan");
+  probe.set_detail("Scan table=t source=memory columns=[k]");
+  probe.set_per_part(true);
+  exec::ProfileNode& other = *root->Child(1);
+  other.set_name("HashBuild");
+  other.set_detail("Join INNER build=left keys=[v.k = t.k]");
+  exec::ProfileNode& dimension = *other.Child(0);
+  dimension.set_name("Scan");
+  dimension.set_detail("Scan table=v source=memory columns=[k]");
+  EXPECT_EQ(FormatPhysicalPlan("Output: c:BIGINT", *root),
+            "Output: c:BIGINT\n"
+            "PartAggregate Aggregate COUNT(*)\n"
+            "├─HashJoin Join INNER build=right keys=[t.k = u.k]\n"
+            "│ └─Scan table=t source=memory columns=[k]\n"
+            "└─HashBuild Join INNER build=left keys=[v.k = t.k]\n"
+            "  └─Scan table=v source=memory columns=[k]\n");
+  EXPECT_EQ(root->children()[1]->name(), "HashBuild");
+}
+
 }  // namespace
 }  // namespace antb1::engine

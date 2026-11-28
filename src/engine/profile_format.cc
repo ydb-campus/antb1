@@ -138,6 +138,34 @@ void SplitBuilds(const exec::ProfileNode& node, std::vector<const exec::ProfileN
   }
 }
 
+// `detail` is ExplainNode of a join: "Join <KIND> build=<side> keys=[...]". KIND may contain a
+// space (NULL-AWARE ANTI). The side is that one token, not a later copy of the same text inside a
+// residual or a quoted name.
+enum class PrintedSide { kUnknown, kLeft, kRight };
+
+PrintedSide JoinBuildSide(std::string_view detail) {
+  constexpr std::string_view kJoin = "Join ";
+  constexpr std::string_view kBuild = " build=";
+  if (!detail.starts_with(kJoin)) {
+    return PrintedSide::kUnknown;
+  }
+  const std::size_t at = detail.find(kBuild);
+  if (at == std::string_view::npos || at <= kJoin.size()) {
+    return PrintedSide::kUnknown;
+  }
+  const std::string_view side = detail.substr(at + kBuild.size());
+  const auto token = [](std::string_view side, std::string_view name) {
+    return side.starts_with(name) && (side.size() == name.size() || side[name.size()] == ' ');
+  };
+  if (token(side, "left")) {
+    return PrintedSide::kLeft;
+  }
+  if (token(side, "right")) {
+    return PrintedSide::kRight;
+  }
+  return PrintedSide::kUnknown;
+}
+
 // The left input of a join is printed before the right one, as a logical plan prints them. The
 // probe is the other side from the build, so a build=left join's HashBuild moves in front of it.
 void OrderJoinSides(Drawn& drawn) {
@@ -145,11 +173,11 @@ void OrderJoinSides(Drawn& drawn) {
     return;
   }
   const std::string_view detail = drawn.node->detail();
-  const bool build_left = detail.find("build=left") != std::string_view::npos;
-  const bool build_right = detail.find("build=right") != std::string_view::npos;
-  if (build_left == build_right) {
+  const PrintedSide side = JoinBuildSide(detail);
+  if (side == PrintedSide::kUnknown) {
     return;
   }
+  const bool build_left = side == PrintedSide::kLeft;
   std::size_t build = drawn.children.size();
   for (std::size_t i = 0; i < drawn.children.size(); ++i) {
     const exec::ProfileNode& child = *drawn.children[i].node;
@@ -159,7 +187,7 @@ void OrderJoinSides(Drawn& drawn) {
     }
   }
   if (build == drawn.children.size() || (build_left && build == 0) ||
-      (build_right && build + 1 == drawn.children.size())) {
+      (!build_left && build + 1 == drawn.children.size())) {
     return;
   }
   Drawn taken = std::move(drawn.children[build]);

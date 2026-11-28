@@ -434,6 +434,25 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# Two joins in one part pipeline. The planner prepares both HashBuilds on the aggregate, outermost
+# first, and the text claims each one onto its HashJoin. zones and riders are the left inputs, so
+# each HashBuild is printed before the trips probe.
+antb1_add_cli_golden(
+  explain_physical_stacked
+  ARGS
+    explain
+    --physical
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM zones, riders, trips WHERE tr_pickup = zn_id AND tr_rider = rd_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
 # --physical and --analyze are the same plan, so they cannot both be asked for. The message is
 # pinned, not just the exit code: a usage error for another reason would also exit 2.
 antb1_add_cli_golden(
@@ -1651,7 +1670,7 @@ antb1_add_cli_golden(
 antb1_add_cli_golden(
   explain_analyze_between
   STDOUT_REGEX
-    "Filter RegionID >= 100 AND RegionID <= 200  [[][^]]*[]]\n.*Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID[]], 2 pushed predicates  [[]rows=[0-9]+ "
+    "Filter RegionID >= 100 AND RegionID <= 200  [[][^]]*[]]\n[^\n]*└─Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID[]], 2 pushed predicates  [[]rows=[0-9]+ "
   ARGS explain --analyze --threads 4 -c "SELECT COUNT(*) FROM t WHERE RegionID BETWEEN 100 AND 200" --table "${_split}"
 )
 set(_n "[0-9]+")
