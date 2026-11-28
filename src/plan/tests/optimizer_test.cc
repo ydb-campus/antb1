@@ -2605,16 +2605,21 @@ TEST(OptimizerTest, RestrictsLargeScalarGroupsOnlyForSelectiveOuterGuards) {
   auto catalog = MakeCatalog();
   constexpr int64_t kRows = 8000;
   auto table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), kRows);
-  table->WithStats(0, 0, {.min = 1, .max = 50, .rows = kRows})
-      .WithStats(0, 1, {.min = 1, .max = kRows, .rows = kRows})
-      .WithStats(0, 3, {.min = 1, .max = 60000, .rows = kRows});
+  constexpr int64_t kPart = kRows / 2;
+  table->WithParts({kPart, kPart});
+  for (int part = 0; part < 2; ++part) {
+    table->WithStats(part, 0, {.min = 1, .max = 50, .rows = kPart})
+        .WithStats(part, 1, {.min = part * kPart + 1, .max = (part + 1) * kPart, .rows = kPart})
+        .WithStats(part, 3, {.min = 1, .max = 60000, .rows = kPart})
+        .WithStats(part, 7, {.min = 1, .max = kRows, .rows = kPart});
+  }
   ASSERT_TRUE(catalog.Register("r", std::move(table)).ok());
   for (const auto& [key, guard, restrict] :
        {std::tuple{"i32", "o.i16 = 1", true},
         std::tuple{"i32", "o.i16 = 1 AND o.i64 IS NULL", true},
         std::tuple{"i32", "o.i16 > 0", false}, std::tuple{"i32", "o.u16 = 1", false},
-        std::tuple{"u16", "o.i16 = 1", false}, std::tuple{"i32", "o.i64 = 1", false},
-        std::tuple{"i32", "o.i16 = 1 OR o.i16 = 2", true},
+        std::tuple{"u16", "o.i16 = 1", false}, std::tuple{"dt", "o.i16 = 1", false},
+        std::tuple{"i32", "o.i64 = 1", false}, std::tuple{"i32", "o.i16 = 1 OR o.i16 = 2", true},
         std::tuple{"i32", "o.i16 = 1 OR o.i64 IS NULL", false},
         std::tuple{"i16", "o.i32 = 1", false}}) {
     SCOPED_TRACE(std::format("key={}, guard={}", key, guard));

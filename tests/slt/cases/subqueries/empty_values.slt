@@ -1667,6 +1667,14 @@ SELECT COUNT(*) FROM fleet f WHERE
 BIGINT
 312
 
+# A skewed guard enables more bindings than the optional prefilter can hold.
+query I nosort
+SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-3.parquet' o WHERE
+  (SELECT MAX(i.fl_available) FROM fleet i WHERE i.fl_row = o.SendTiming AND o.HTTPError = 0) IS NULL
+----
+BIGINT
+1053
+
 # SUM of these two stored decimals exceeds 38 digits only when their group is enabled.
 query I nosort
 SELECT COUNT(*) FROM edge o WHERE

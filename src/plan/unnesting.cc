@@ -1756,17 +1756,35 @@ LogicalNodePtr FilterScalarBindings(LogicalNodePtr input, const ExprPtr& conditi
                          .span = span});
 }
 
-// A range wider than the population can contain mostly gaps and one very frequent value.
-// Its width is not evidence for adding an extra hash build. Prefer a recorded distinct count
-// in that case, keeping the existing plan when the footer has none.
+// A range wider than its population can contain mostly gaps and one very frequent value.
+bool RangeFitsRows(const std::optional<Int128>& min, const std::optional<Int128>& max,
+                   int64_t rows) {
+  Int128 width = 0;
+  return min && max && !__builtin_sub_overflow(*max, *min, &width) && width >= 0 && width < rows;
+}
+
 std::optional<int64_t> CompactDomain(const Table& table, int field, const ColumnRange& range) {
-  if (range.exact && range.min && range.max) {
-    Int128 width = 0;
-    if (!__builtin_sub_overflow(*range.max, *range.min, &width) && width < range.non_null) {
-      return ColumnDomain(table, field, range);
+  return range.exact && RangeFitsRows(range.min, range.max, range.non_null)
+             ? ColumnDomain(table, field, range)
+             : ColumnDomain(table, field, ColumnRange{});
+}
+
+// A global range can look dense simply because every part spans the same wide interval.
+// Require a dense range within each part as well before speculatively re-reading a large
+// outer table. A recorded distinct count can establish the group count directly.
+bool ManyScalarGroups(const Table& table, int field, bool speculative) {
+  if (speculative) {
+    for (int64_t part = 0; part < table.num_parts(); ++part) {
+      const auto stats = table.part_stats(part, field);
+      if (!stats || stats->null_count < 0 ||
+          (stats->rows > stats->null_count &&
+           !RangeFitsRows(stats->min, stats->max, stats->rows - stats->null_count))) {
+        return ColumnDomain(table, field, ColumnRange{}).value_or(0) >= kMinRestrictionRows;
+      }
     }
   }
-  return ColumnDomain(table, field, ColumnRange{});
+  return CompactDomain(table, field, ColumnRangeOf(table, field)).value_or(0) >=
+         kMinRestrictionRows;
 }
 
 // Estimate a simple guard on the outer scan using the join planner's footer statistics.
@@ -1830,9 +1848,7 @@ bool RestrictSelectiveBindings(const LogicalNodePtr& outer, const Expr& conditio
     return false;
   }
   const int field = grouped_scan->fields.at(Narrow<std::size_t>(key - grouped_scan->ids.begin()));
-  const auto groups =
-      CompactDomain(*grouped_scan->table, field, ColumnRangeOf(*grouped_scan->table, field));
-  return groups.value_or(0) >= kMinRestrictionRows;
+  return ManyScalarGroups(*grouped_scan->table, field, *rows > kMaxPrefilterRows);
 }
 
 // A bounded set is enough for an optional prefilter. Above the limit a NULL in the

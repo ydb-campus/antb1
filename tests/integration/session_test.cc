@@ -127,8 +127,8 @@ TEST(Session, SkewedOuterScalarGuardsFitTheOrdinaryGroupBudget) {
   for (const auto& [guard, disabled] :
        {std::pair{"ParamCurrencyID", 506}, std::pair{"HTTPError", 489}}) {
     SCOPED_TRACE(guard);
-    // Both guards enable over 9,400 of 10,000 rows. For HTTPError the min/max range
-    // predicts fewer than 20, so only the runtime bound keeps this build small.
+    // Both guards enable over 9,400 rows. The group key spans almost its whole domain
+    // in each part, so its table-wide range is weak evidence of distinct groups.
     const auto count = Count(
         *session, std::format("SELECT COUNT(*) FROM t o WHERE (SELECT MAX(i.CounterID) FROM t i "
                               "WHERE i.SendTiming=o.SendTiming AND o.{}=0) IS NULL",
