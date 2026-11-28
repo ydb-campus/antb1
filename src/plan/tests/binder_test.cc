@@ -9492,6 +9492,93 @@ TEST(BinderTest, ProjectedInputCorrelationRejectsExistsAboveGrouping) {
   }
 }
 
+TEST(BinderTest, TwoCorrelatedJoinInputsKeepHiddenBindingKeys) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view op : {"JOIN", "LEFT JOIN", "FULL JOIN"}) {
+    const std::string sql = std::format(
+        "SELECT t.i32 FROM t WHERE EXISTS "
+        "(SELECT 1 FROM (SELECT u.i16 FROM u WHERE u.i32=t.i32) a {} "
+        "(SELECT u.i16 FROM u WHERE u.i32 IS NOT DISTINCT FROM t.i32) b ON a.i16=b.i16)",
+        op);
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    EXPECT_EQ(PositionMismatch(*bound), std::nullopt);
+    const auto optimized = Optimize(*bound);
+    ASSERT_TRUE(optimized.ok()) << optimized.status();
+    EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+    EXPECT_TRUE(FreeVariables(*optimized->root).empty());
+    const std::string explain = Explain(*optimized);
+    EXPECT_FALSE(explain.contains("DependentJoin"));
+    EXPECT_TRUE(explain.contains("IS NOT DISTINCT FROM")) << explain;
+  }
+}
+
+TEST(BinderTest, TwoCorrelatedJoinInputsRequireTheSameRepresentableBinding) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view key : {"t.i32", "t.i64"}) {
+    const std::string sql = std::format(
+        "SELECT t.i32 FROM t WHERE EXISTS "
+        "(SELECT 1 FROM (SELECT u.i16 FROM u WHERE u.i32=t.i32) a FULL JOIN "
+        "(SELECT u.i16 FROM u WHERE u.i64={}) b ON a.i16=b.i16)",
+        key);
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto optimized = Optimize(*bound);
+    ASSERT_FALSE(optimized.ok());
+    const auto detail = GetSqlError(optimized.status());
+    ASSERT_NE(detail, nullptr) << optimized.status();
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_EQ(SpanText(sql, optimized.status()), "EXISTS");
+    EXPECT_TRUE(optimized.status().message().contains("same plain binding keys"));
+  }
+}
+
+TEST(BinderTest, TwoCorrelatedJoinInputsDeclineAnEnclosingOnReference) {
+  constexpr std::string_view kSql =
+      "SELECT t.i32 FROM t WHERE EXISTS "
+      "(SELECT 1 FROM (SELECT u.i16 FROM u WHERE u.i32=t.i32) a JOIN "
+      "(SELECT u.i16 FROM u WHERE u.i32=t.i32) b ON a.i16=b.i16 AND a.i16=t.i16)";
+  const auto bound = BindSql(kSql, MakeCatalog());
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  const auto optimized = Optimize(*bound);
+  ASSERT_FALSE(optimized.ok());
+  const auto detail = GetSqlError(optimized.status());
+  ASSERT_NE(detail, nullptr) << optimized.status();
+  EXPECT_EQ(detail->kind(), kUnsupported);
+  EXPECT_EQ(SpanText(kSql, optimized.status()), "EXISTS");
+  EXPECT_TRUE(optimized.status().message().contains("additional filter"));
+}
+
+TEST(BinderTest, TwoCorrelatedJoinInputsDeclineASingleCorrelatedArm) {
+  constexpr std::string_view kSql =
+      "SELECT t.i32 FROM t WHERE EXISTS "
+      "(SELECT 1 FROM (SELECT u.i16 FROM u WHERE u.i32=t.i32) a FULL JOIN "
+      "(SELECT u.i16 FROM u) b ON a.i16=b.i16)";
+  const auto bound = BindSql(kSql, MakeCatalog());
+  ASSERT_FALSE(bound.ok());
+  const auto detail = GetSqlError(bound.status());
+  ASSERT_NE(detail, nullptr) << bound.status();
+  EXPECT_EQ(detail->kind(), kUnsupported);
+  EXPECT_EQ(SpanText(kSql, bound.status()), "EXISTS");
+  EXPECT_TRUE(bound.status().message().contains("just one correlated input"));
+}
+
+TEST(BinderTest, TwoCorrelatedJoinInputsKeepEarlierAliasesInLateralScope) {
+  constexpr std::string_view kSql =
+      "SELECT t.i32 FROM t WHERE EXISTS "
+      "(SELECT 1 FROM (SELECT u.i32 FROM u WHERE u.i32=t.i32) t CROSS JOIN "
+      "(SELECT u.i16 FROM u WHERE u.i32=t.i32) b)";
+  const auto bound = BindSql(kSql, MakeCatalog());
+  ASSERT_FALSE(bound.ok());
+  const auto detail = GetSqlError(bound.status());
+  ASSERT_NE(detail, nullptr) << bound.status();
+  EXPECT_EQ(detail->kind(), kUnsupported);
+  EXPECT_EQ(SpanText(kSql, bound.status()), "t.i32");
+  EXPECT_TRUE(bound.status().message().contains("a lateral qualified column"));
+}
+
 TEST(BinderTest, MixedMembershipHashesItemsSuppliedByCorrelationKeys) {
   const Catalog catalog = MakeCatalog();
   for (const std::string_view op : {"IN", "NOT IN"}) {

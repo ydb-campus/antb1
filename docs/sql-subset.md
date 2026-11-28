@@ -737,6 +737,11 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   can correlate through column equalities, including `IS NOT DISTINCT FROM`. The enclosing subquery
   projects columns or literals without its own filter, grouping, ordering or row limit. The correlation
   key stays available even when it is omitted from the projection, and aliases keep their written scope.
+  Two such inputs can also be joined with CROSS, INNER, LEFT or FULL JOIN inside a plain EXISTS or membership
+  subquery. Each input must supply the same enclosing columns through plain equalities of matching types.
+  Ordinary equality filters out NULL keys on its own input. The join compares the resulting binding keys
+  NULL-equal in addition to its written ON. The ON can compare local columns, and the planner must prove
+  the inputs and predicates safe on unbound rows. For FULL JOIN, a padded row uses the surviving input's key.
   The inner plan must be safe to evaluate for middle rows whose key no outer row binds. A checked
   expression that could fail on such a row gives exit code 4. This check also covers the rewritten
   membership set, including its filters and eager projections, and sibling predicates over middle and inner rows.

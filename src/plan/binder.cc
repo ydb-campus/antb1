@@ -3181,10 +3181,12 @@ class Binder {
   Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids,
          const BindOptions& options, const Scope* outer = nullptr,
          const BindBlockFn* bind_block = nullptr, bool outer_encloses = false,
-         const SubqueryContext* exists = nullptr, Visibility outer_visible = {})
+         const SubqueryContext* exists = nullptr, Visibility outer_visible = {},
+         const Scope* preceding_scope = nullptr)
       : stmt_(stmt),
         scope_(std::move(bindings), outer, outer_visible),
         outer_encloses_(outer_encloses),
+        preceding_scope_(preceding_scope),
         membership_(exists != nullptr && exists->membership ? exists : nullptr),
         exists_(exists != nullptr && !exists->membership ? exists : nullptr),
         ids_(ids),
@@ -4297,7 +4299,7 @@ class Binder {
     // An outer reference. ADR 0023 answers one only in a WHERE conjunct of its own block (an inner
     // join's ON counts as WHERE, rule 10). SQ10 can express a more distant equality key
     // through the enclosing block if that block requires the same value.
-    if (!outer_encloses_) {
+    if (!outer_encloses_ || outer->scope == preceding_scope_) {
       // A derived table or a CTE: the name is in a sibling or declaring scope, so this is a
       // lateral reference, which ADR 0022 refuses and no PR of ADR 0023 answers.
       return Scope::CorrelationError(ref, Scope::Refusal::kLateral);
@@ -4308,7 +4310,8 @@ class Binder {
     if (!WhereClause(clause_) && !membership_item) {
       return Scope::CorrelationError(ref, Scope::Refusal::kClause);
     }
-    if (outer->distance > 1) {
+    const std::size_t enclosing_distance = preceding_scope_ == nullptr ? 1 : 2;
+    if (outer->distance > enclosing_distance) {
       if (outer->distance == 2 && exists_ != nullptr && exists_->middle != nullptr &&
           middle_key_ref_ == ref.span) {
         ARROW_ASSIGN_OR_RAISE(const auto column, outer->scope->Resolve(ref, outer->visible));
@@ -4414,7 +4417,8 @@ class Binder {
   // subquery expression's block has. A derived table's and a CTE's enclosing scope is a sibling or
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
   bool outer_encloses_ = false;
-  bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
+  const Scope* preceding_scope_ = nullptr;  // sibling FROM items remain a lateral scope
+  bool in_correlated_ = false;              // a correlated conjunct is binding: see InputColumn
   bool outer_membership_conjunct_ = false;
   const SubqueryContext* membership_ = nullptr;
   // The EXISTS conjunct this block is bound for, if any. ADR 0023's Path 1 and ADR 0041's
@@ -9842,7 +9846,8 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
                                     const CteFrame* ctes, const Scope* outer,
                                     bool outer_encloses = false,
                                     const SubqueryContext* exists = nullptr,
-                                    Visibility outer_visible = {});
+                                    Visibility outer_visible = {},
+                                    const Scope* preceding_scope = nullptr);
 BoundBlock BoundBlockOf(LogicalPlan plan);
 
 // Rule 7: the binding's column names. The alias list renames the leading columns, each losing its
@@ -9883,8 +9888,8 @@ arrow::Status ApplyColumnNames(std::vector<BindingColumn>& columns,
 // A single projection does not change the multiplicity of a binding. Keep this rule away from
 // aggregates, DISTINCT and row selection, which would need to operate per binding.
 bool IsPlainBindingProjection(const sql::SelectStatement& stmt) {
-  return stmt.from.size() == 1 && !stmt.distinct && !HasGroupBy(stmt) && stmt.having.empty() &&
-         stmt.order_by.empty() && !stmt.limit.has_value() && !stmt.offset.has_value() &&
+  return !stmt.distinct && !HasGroupBy(stmt) && stmt.having.empty() && stmt.order_by.empty() &&
+         !stmt.limit.has_value() && !stmt.offset.has_value() &&
          std::ranges::all_of(stmt.items, [](const sql::SelectItem& item) {
            const auto* expr = item.expr();
            return expr == nullptr || std::holds_alternative<sql::ColumnRef>(*expr) ||
@@ -9902,6 +9907,29 @@ bool IsBindingColumnEquality(const sql::Expr& expr) {
   }
   const auto* distinct = std::get_if<sql::DistinctFromExpr>(&expr);
   return distinct != nullptr && distinct->negated && columns(*distinct->left, *distinct->right);
+}
+
+bool HasPlainBindingConditions(const std::vector<sql::Expr>& conditions) {
+  return std::ranges::all_of(Conjuncts(conditions), [](const sql::Expr* condition) {
+    return IsBindingColumnEquality(*condition);
+  });
+}
+
+// Admit the same simple projections on both arms of one join. The unnesting rule checks that
+// each input can supply the complete binding. Additional predicates and join levels need their
+// own placement rules.
+bool HasBindingInputs(const sql::SelectStatement& stmt) {
+  if (!IsPlainBindingProjection(stmt) || !stmt.where.empty()) {
+    return false;
+  }
+  if (stmt.from.size() == 1) {
+    return true;
+  }
+  if (stmt.from.size() != 2) {
+    return false;
+  }
+  const auto& second = stmt.from.back();
+  return second.connector != sql::Connector::kComma && HasPlainBindingConditions(second.on);
 }
 
 // One FROM item's binding: a table, a path, or a sub-plan over a derived table or a CTE reference.
@@ -9930,23 +9958,27 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
   const sql::SelectStatement& block =
       cte == nullptr ? *std::get<sql::DerivedTable>(item.source).query : *cte->query;
   const CteFrame* frame = cte == nullptr ? &ctes : ctes.ScopeFrameOf(cte);
-  // Only a sub-plan needs the scope of the bindings before it, so it is built here rather than
-  // once per FROM item: a copy of every preceding binding is not free at the relation limit.
-  const Scope preceding(siblings, outer);
-  const Scope* scope = cte == nullptr ? &preceding : ctes.ScopeOf(cte);
   // A sole projected input can use the same binding as the containing EXISTS or membership
   // block. A CTE must be declared in that block so its lookup uses the declaration's visibility.
   const sql::TableRef* leaf = block.from.size() == 1 ? block.from.front().table() : nullptr;
-  const bool carries_binding =
-      binding_visibility.has_value() && (cte == nullptr || ctes.declared.contains(cte)) &&
-      IsPlainBindingProjection(block) && leaf != nullptr && frame != nullptr &&
-      frame->Find(leaf->name) == nullptr && block.with.empty() &&
-      std::ranges::all_of(block.where, IsBindingColumnEquality);
+  const bool carries_binding = binding_visibility.has_value() &&
+                               (cte == nullptr || ctes.declared.contains(cte)) &&
+                               IsPlainBindingProjection(block) && leaf != nullptr &&
+                               frame != nullptr && frame->Find(leaf->name) == nullptr &&
+                               block.with.empty() && HasPlainBindingConditions(block.where);
+  const Visibility enclosing_visibility = binding_visibility.value_or(Visibility{});
+  // The earlier input can shadow an enclosing name, but reading the earlier input would be a
+  // lateral join. Keep it in the lookup chain so the binder can distinguish those two cases.
+  const bool checks_siblings = carries_binding && cte == nullptr && !siblings.empty();
+  const Scope preceding(siblings, outer, checks_siblings ? enclosing_visibility : Visibility{});
+  const Scope* parent = carries_binding && !checks_siblings
+                            ? outer
+                            : (cte == nullptr ? &preceding : ctes.ScopeOf(cte));
   ARROW_ASSIGN_OR_RAISE(
       BoundBlock bound,
-      BindBlock(block, catalog, options, ids, frame, carries_binding ? outer : scope,
-                carries_binding, nullptr,
-                carries_binding ? binding_visibility.value_or(Visibility{}) : Visibility{}));
+      BindBlock(block, catalog, options, ids, frame, parent, carries_binding, nullptr,
+                carries_binding && !checks_siblings ? enclosing_visibility : Visibility{},
+                checks_siblings ? &preceding : nullptr));
   std::vector<BindingColumn> columns = std::move(bound.columns);
   // A column alias list after a CTE name is rejected by the parser (rule 7), so a CTE's list is
   // always the one written where it was declared.
@@ -10348,7 +10380,8 @@ BoundBlock BoundBlockOf(LogicalPlan plan) {
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer, bool outer_encloses,
-                                    const SubqueryContext* exists, Visibility outer_visible) {
+                                    const SubqueryContext* exists, Visibility outer_visible,
+                                    const Scope* preceding_scope) {
   static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
@@ -10389,7 +10422,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   sub_plans.reserve(stmt.from.size());
   std::size_t unnamed = 0;
   const std::optional<Visibility> binding_visibility =
-      outer_encloses && exists != nullptr && IsPlainBindingProjection(stmt) && stmt.where.empty()
+      outer_encloses && exists != nullptr && HasBindingInputs(stmt)
           ? std::optional<Visibility>{outer_visible}
           : std::nullopt;
   for (const sql::FromItem& item : stmt.from) {
@@ -10411,8 +10444,15 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
                      exists_block, scope_visible);
   };
   Binder binder(stmt, std::move(bindings), ids, options, outer, &bind_sub, outer_encloses, exists,
-                outer_visible);
+                outer_visible, preceding_scope);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
+  if (binding_visibility.has_value() && stmt.from.size() == 2 && exists != nullptr &&
+      std::ranges::count_if(sub_plans, [](const LogicalPlan& sub_plan) {
+        return !FreeVariables(*sub_plan.root).empty();
+      }) == 1) {
+    return UnsupportedError("a joined subquery with just one correlated input is not supported",
+                            exists->op_span);
+  }
   BoundBlock bound = BoundBlockOf(std::move(plan));
   bound.spans = binder.OutputSpans();
   return bound;

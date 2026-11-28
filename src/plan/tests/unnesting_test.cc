@@ -324,10 +324,11 @@ TEST(UnnestingTest, EachModeRefusesTheNodesItHasNoRuleFor) {
       "over a block that is not an ungrouped aggregate over its correlation";
   for (const auto& [name, make] : nodes) {
     SCOPED_TRACE(name);
-    // SQ8b also answers LIMIT and grouped EXISTS; scalar values keep their narrower rules.
+    // SQ8b answers LIMIT and grouped EXISTS. SQ10 answers this join because the clone
+    // carries the same binding keys. Scalar values keep their narrower rules.
     const std::string exists = RefusalOf(kExists, over(make));
     const std::string not_exists = RefusalOf(kNotExists, over(make));
-    if (name == "a Sort" || name == "a Limit" || name == "a GroupAggregate") {
+    if (name == "a Sort" || name == "a Limit" || name == "a GroupAggregate" || name == "a Join") {
       EXPECT_EQ(exists, "");
       EXPECT_EQ(not_exists, "");
     } else {
