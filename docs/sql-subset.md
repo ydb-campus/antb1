@@ -1253,8 +1253,9 @@ value is a `Join ONE-ROW` there, and the conjunct that holds it a `Compute` of w
 The relations then join in the order and tree shape a cost search chooses from footer metadata only (row counts, and
 each key's domain from the parts' integer ranges capped at their non-NULL rows, else their distinct-count hints).
 For ordinary grouped aggregates, the row estimator caps the input estimate by the product of known grouping-key
-ranges, allowing one NULL value per key. It follows direct projections and earlier grouping keys back to scan fields.
-If a key's integer range is unavailable, the aggregate keeps the input estimate.
+ranges, allowing one NULL value per key. It follows direct projections and earlier grouping keys back to scan fields
+and counts aliases of the same field in one scan only once. If a key's integer range is unavailable, the aggregate
+keeps the input estimate.
 See "Join order and build sides" under Semantics. Within an inner block, equalities on the same bound key form a class.
 The search can join two members before visiting a third that connects them in the written predicates. It costs
 independent equalities within each subset and keeps the keys needed to enforce them in the chosen tree. A class

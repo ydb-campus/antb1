@@ -4287,6 +4287,60 @@ TEST(BinderTest, JoinBuildUsesTheDomainOfARegroupedKey) {
   EXPECT_EQ(EstimateRows(*computed->root), 100'000);
 }
 
+TEST(BinderTest, GroupEstimatesReuseRangesAndCountSameFieldAliasesOnce) {
+  Catalog catalog;
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  auto events = std::make_shared<FakeTable>(schema, 10'000);
+  events->WithParts({5000, 5000})
+      .WithStats(0, 0, PartStats{.min = 1, .max = 10, .null_count = 0, .rows = 5000})
+      .WithStats(1, 0, PartStats{.min = 1, .max = 10, .null_count = 0, .rows = 5000});
+  ASSERT_TRUE(catalog.Register("events", events).ok());
+  ASSERT_TRUE(catalog.Register("lookup", std::make_shared<FakeTable>(schema, 50)).ok());
+
+  constexpr std::string_view grouped_join =
+      "SELECT l.k FROM lookup l JOIN ("
+      "  SELECT a, SUM(n) FROM ("
+      "    SELECT a, b, COUNT(*) AS n FROM (SELECT k AS a, k AS b FROM events) e"
+      "    GROUP BY a, b"
+      "  ) detail GROUP BY a"
+      ") g ON g.a = l.k";
+  const auto plan = BindSql(grouped_join, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  EXPECT_EQ(events->stats_reads(), 2);  // one read per part across both grouping levels
+
+  const auto aliases = BindSql(
+      "SELECT l.k FROM lookup l JOIN ("
+      "  SELECT a, COUNT(*) FROM (SELECT k AS a, k AS b FROM events) e GROUP BY a, b"
+      ") g ON g.a = l.k",
+      catalog);
+  ASSERT_TRUE(aliases.ok()) << aliases.status();
+  EXPECT_EQ(events->stats_reads(), 4);  // a fresh statement reads its own ranges
+  const auto* join = std::get_if<JoinNode>(&Nth(*aliases, 1));
+  ASSERT_NE(join, nullptr) << Explain(*aliases);
+  const auto& build = join->build == BuildSide::kLeft ? join->left : join->right;
+  EXPECT_EQ(EstimateRows(*build), 11);
+
+  const auto self_join = BindSql(
+      "SELECT a.k, b.k, COUNT(*) FROM events a CROSS JOIN events b GROUP BY a.k, b.k", catalog);
+  ASSERT_TRUE(self_join.ok()) << self_join.status();
+  EXPECT_EQ(EstimateRows(*self_join->root), 121);  // independent scans of the same table
+}
+
+TEST(BinderTest, GroupEstimatesCacheMissingRanges) {
+  Catalog catalog;
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  auto events = std::make_shared<FakeTable>(schema, 10'000);
+  ASSERT_TRUE(catalog.Register("events", events).ok());
+  const auto plan = BindSql(
+      "SELECT k, SUM(n) FROM ("
+      "  SELECT k, SUM(n) AS n FROM (SELECT k, COUNT(*) AS n FROM events GROUP BY k) e GROUP BY k"
+      ") g GROUP BY k",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  EXPECT_EQ(events->stats_reads(), 1);
+  EXPECT_EQ(EstimateRows(*plan->root), 10'000);
+}
+
 TEST(BinderTest, JoinsTheSmallEndpointsThroughAnImpliedKey) {
   Catalog catalog;
   const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
