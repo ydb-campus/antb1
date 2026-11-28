@@ -286,3 +286,97 @@ INTEGER	SMALLINT
 onlyif duckdb
 statement error ^Binder Error: table "g" has 1 columns available but 2 columns specified
 SELECT COUNT(*) FROM (SELECT tr_pickup FROM trips) AS g(a, b)
+
+# The correlation key stays available even when the derived projection omits it.
+query I nosort
+SELECT o.id FROM edge o WHERE EXISTS
+(SELECT 1 FROM (SELECT i.i16 FROM edge i WHERE i.i32 = o.i32) d) ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+3
+4
+6
+7
+8
+10
+11
+
+# Column alias lists rename the membership item. NULL keys match under NOT DISTINCT.
+query I nosort
+SELECT o.id FROM edge o WHERE o.id NOT IN
+(SELECT d.member FROM (SELECT i.i16 FROM edge i WHERE i.i16 IS NOT DISTINCT FROM o.i16) d(member))
+ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+3
+4
+6
+7
+9
+10
+11
+
+# With ordinary equality a NULL key yields an empty set, even for a NULL probe.
+query I nosort
+SELECT o.id FROM edge o WHERE o.i16 NOT IN
+(WITH d(member) AS (SELECT i.i16 FROM edge i WHERE i.i16 = o.i16) SELECT member FROM d)
+ORDER BY o.id
+----
+INTEGER
+5
+8
+
+# The CTE body uses the declaration's scope rather than the alias at the reference.
+query I nosort
+SELECT o.id FROM edge o WHERE o.id IN
+(WITH d(member) AS (SELECT i.id FROM edge i WHERE i.id = o.id) SELECT o.member FROM d o)
+ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+# Duplicate outer keys retain every matching row, even when the key is hidden by the projection.
+query I nosort
+SELECT o.id FROM edge o WHERE NOT EXISTS
+(WITH d AS (SELECT i.id FROM edge i WHERE i.i16 = o.i16) SELECT 1 FROM d)
+ORDER BY o.id
+----
+INTEGER
+5
+8
+
+# Locally bound names shadow the outer relation in the derived table body.
+query I nosort
+SELECT o.id FROM edge o WHERE EXISTS
+(SELECT d.id FROM (SELECT o.id FROM edge o WHERE o.i16 = o.i16) d) ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11

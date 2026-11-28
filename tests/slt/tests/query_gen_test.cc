@@ -2638,7 +2638,8 @@ TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
   const FeatureSet plain =
       Union(kSupportedFeatures, {Feature::kCorrelatedExists})
           .Minus({Feature::kLayout, Feature::kKeywordCase, Feature::kCorrelatedIn,
-                  Feature::kNestedCorrelation, Feature::kMiddleEqualityExists});
+                  Feature::kNestedCorrelation, Feature::kMiddleEqualityExists,
+                  Feature::kDerivedCorrelation});
   const auto gen = MakeOver(JoinTables(), 71, {.supported = plain, .target_percent = 0});
   int exists = 0;
   int negated = 0;
@@ -6110,7 +6111,7 @@ TEST(QueryGenerator, MiddleEqualityExistsReachesPastTheMiddleTable) {
   EXPECT_TRUE(saw_not_in);
 }
 
-TEST(QueryGenerator, MiddleEqualityMembershipBoundsRepeatedKeys) {
+TEST(QueryGenerator, CorrelatedMembershipBoundsRepeatedKeys) {
   const auto generator = [](int64_t rows) {
     auto tables = Tables();
     for (auto& table : tables) {
@@ -6133,11 +6134,17 @@ TEST(QueryGenerator, MiddleEqualityMembershipBoundsRepeatedKeys) {
            query.features.Has(Feature::kMiddleEqualityExists);
   };
   bool sampled = false;
+  bool sampled_mixed = false;
   for (uint64_t i = 0; i < 2000; ++i) {
-    sampled |= nested_membership(within.Generate(i));
-    EXPECT_FALSE(nested_membership(above.Generate(i))) << i;
+    const auto small = within.Generate(i);
+    const auto large = above.Generate(i);
+    sampled |= nested_membership(small);
+    sampled_mixed |= small.features.Has(Feature::kMixedMembershipItem);
+    EXPECT_FALSE(nested_membership(large)) << i;
+    EXPECT_FALSE(large.features.Has(Feature::kMixedMembershipItem)) << i;
   }
   EXPECT_TRUE(sampled);
+  EXPECT_TRUE(sampled_mixed);
 }
 
 TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
@@ -6147,6 +6154,9 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
                 .target_percent = 0});
   int positive = 0;
   int negative = 0;
+  int mixed_positive = 0;
+  int mixed_negative = 0;
+  int derived = 0;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedIn)) {
@@ -6161,15 +6171,36 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
     DeepSubqueries(*parsed, blocks);
     ASSERT_EQ(blocks.size(), q.features.Has(Feature::kMiddleEqualityExists) ? 2U : 1U);
     EXPECT_EQ(blocks.front()->query->items.size(), 1U);
-    EXPECT_FALSE(blocks.front()->query->where.empty());
+    const auto& set = *blocks.front()->query;
+    if (q.features.Has(Feature::kDerivedCorrelation)) {
+      ++derived;
+      EXPECT_TRUE(set.where.empty());
+      ASSERT_EQ(set.from.size(), 1U);
+      const auto* input = std::get_if<sql::DerivedTable>(&set.from.front().source);
+      ASSERT_NE(input, nullptr);
+      EXPECT_EQ(input->query->where.size(), 1U);
+    } else {
+      EXPECT_FALSE(set.where.empty());
+    }
+    const bool mixed = q.features.Has(Feature::kMixedMembershipItem);
+    if (mixed) {
+      EXPECT_EQ(parsed->from.size(), 1U);
+      EXPECT_EQ(parsed->where.size(), 1U);
+      EXPECT_TRUE(q.sql.contains("COALESCE")) << q.sql;
+    }
     if (q.sql.contains("NOT IN")) {
+      mixed_negative += static_cast<int>(mixed);
       ++negative;
     } else {
+      mixed_positive += static_cast<int>(mixed);
       ++positive;
     }
   }
   EXPECT_GT(positive, 10);
   EXPECT_GT(negative, 10);
+  EXPECT_GT(mixed_negative, 0);
+  EXPECT_GT(mixed_positive, 0);
+  EXPECT_GT(derived, 0);
 }
 
 // SQ8b's seven block shapes retain SQ8a's keyed correlation and expose their feature tag.

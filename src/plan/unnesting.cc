@@ -984,6 +984,7 @@ struct Rewritten {
   ExprPtr deferred_match = nullptr;
   // Decide whether to split this membership after the nested joins have been rewritten.
   std::optional<JoinKey> pending_lookups = std::nullopt;
+  LogicalNodePtr pending_outer_safety = nullptr;
 };
 
 // Equality-correlated NOT IN needs two lookups: the membership key, and per-binding row/NULL
@@ -1172,41 +1173,56 @@ Rewritten MembershipNode(const Correlation& correlation, JoinNode join,
   return out;
 }
 
-// Map each child of a value, including CASE's optional branches. Column replacement below keeps
-// the already-expanded pointers, so a Project alias does not copy its definition again.
-template <class F>
-ExprPtr MapValueChildren(const ExprPtr& expr, const F& map) {
-  if (expr == nullptr) {
-    return nullptr;
-  }
-  Expr out = *expr;
+// Visit each child, including CASE's optional condition and result arms.
+template <class E, class F>
+void VisitValueChildren(E& expr, const F& visit) {
   std::visit(
-      [&map](auto& node) {
+      [&visit](auto& node) {
         using Node = std::decay_t<decltype(node)>;
-        const auto all = [&map](std::vector<ExprPtr>& children) {
-          for (ExprPtr& child : children) {
-            child = map(child);
-          }
-        };
         if constexpr (std::is_same_v<Node, ArithExpr>) {
-          node.left = map(node.left);
-          node.right = map(node.right);
+          visit(node.left);
+          visit(node.right);
         } else if constexpr (std::is_same_v<Node, NegateExpr> || std::is_same_v<Node, CastExpr>) {
-          node.operand = map(node.operand);
+          visit(node.operand);
         } else if constexpr (std::is_same_v<Node, FunctionExpr> || std::is_same_v<Node, BoolExpr>) {
-          all(node.args);
+          std::ranges::for_each(node.args, visit);
         } else if constexpr (std::is_same_v<Node, PredicateExpr>) {
-          all(node.operands);
+          std::ranges::for_each(node.operands, visit);
         } else if constexpr (std::is_same_v<Node, CaseExpr>) {
-          all(node.whens);
-          all(node.thens);
-          node.otherwise = map(node.otherwise);
+          std::ranges::for_each(node.whens, visit);
+          std::ranges::for_each(node.thens, visit);
+          visit(node.otherwise);
         } else {
           static_assert(std::is_same_v<Node, ColumnExpr> || std::is_same_v<Node, ConstantExpr>);
         }
       },
-      out.node);
-  return std::make_shared<const Expr>(std::move(out));
+      expr.node);
+}
+
+bool ReadsOuterDouble(const Expr& expr, const std::set<ColumnId>& outer) {
+  if (const auto* column = std::get_if<ColumnExpr>(&expr.node)) {
+    return expr.type == LogicalType::kDouble && outer.contains(column->id);
+  }
+  bool reads = false;
+  VisitValueChildren(expr, [&](const ExprPtr& child) {
+    reads = reads || (child && ReadsOuterDouble(*child, outer));
+  });
+  return reads;
+}
+
+// A binding can group positive and negative zero together. A quotient can distinguish those
+// bindings when its divisor reads the outer row, even though ordinary comparisons cannot.
+bool ObservesBindingZeroSign(const Expr& expr, const std::set<ColumnId>& outer) {
+  if (const auto* op = std::get_if<ArithExpr>(&expr.node);
+      op != nullptr && op->op == ArithOp::kDivide && op->right->type == LogicalType::kDouble &&
+      ReadsOuterDouble(*op->right, outer)) {
+    return true;
+  }
+  bool observes = false;
+  VisitValueChildren(expr, [&](const ExprPtr& child) {
+    observes = observes || (child && ObservesBindingZeroSign(*child, outer));
+  });
+  return observes;
 }
 
 ExprPtr InlineValues(const ExprPtr& expr, const std::map<ColumnId, ExprPtr>& values) {
@@ -1217,13 +1233,15 @@ ExprPtr InlineValues(const ExprPtr& expr, const std::map<ColumnId, ExprPtr>& val
     const auto found = values.find(column->id);
     return found == values.end() ? expr : found->second;
   }
-  return MapValueChildren(expr,
-                          [&values](const ExprPtr& child) { return InlineValues(child, values); });
+  Expr out = *expr;
+  VisitValueChildren(out, [&](ExprPtr& child) { child = InlineValues(child, values); });
+  return std::make_shared<const Expr>(std::move(out));
 }
 
 struct MembershipInput {
   LogicalNodePtr right;
   ExprPtr deferred_item;
+  bool mixed;
 };
 
 // This is deliberately a proof of harmless evaluation, not IsStrict: a strict cast can still
@@ -1248,10 +1266,13 @@ bool SafeBeforeMembership(const Expr& expr) {
       expr.node);
 }
 
+const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded = false,
+                                        const std::set<const LogicalNode*>& existing_inputs = {},
+                                        const Expr* deferred_match = nullptr);
+
 // Preserve inner maps, with Projects as maps so correlation columns remain available. An
-// outer-only item instead runs in the final residual, AFTER the correlation residuals: an empty
-// correlated set must not evaluate its item on an outer row. Only the single selected value is
-// inlined; aliases reuse their definition and unrelated ORDER BY expressions are not evaluated.
+// item that needs the outer row runs in the final residual, after correlation. Only the selected
+// value is inlined; aliases reuse their definition.
 // A risky inner item also runs after correlation for IN, or for NOT IN with residual correlation;
 // plain NOT IN keeps DuckDB's eager evaluation. Safe inner maps retain the hash-key path. All
 // qualifying pairs are evaluated, including later items that can fail after an earlier item
@@ -1260,6 +1281,7 @@ arrow::Result<MembershipInput> MembershipMaps(const Correlation& correlation, co
                                               const BoundColumn& item, bool has_residual) {
   LogicalNodePtr input = spine.below;
   std::set<ColumnId> outer = correlation.outer;
+  bool mixed = false;
   std::map<ColumnId, ExprPtr> values;
   for (const Step& step : std::ranges::reverse_view(spine.steps)) {
     ComputeNode maps{.input = input, .exprs = {}, .ids = {}, .span = correlation.join.span};
@@ -1285,9 +1307,7 @@ arrow::Result<MembershipInput> MembershipMaps(const Correlation& correlation, co
     ComputeNode inner{.input = input, .exprs = {}, .ids = {}, .span = maps.span};
     for (std::size_t i = 0; i < maps.exprs.size(); ++i) {
       const Sides sides = SidesOf(*maps.exprs[i], outer);
-      if (sides.both()) {
-        return correlation.Refuse("whose selected expression mixes inner and outer columns");
-      }
+      mixed |= sides.both();
       std::vector<ColumnId> reads;
       CollectColumnIds(*maps.exprs[i], reads);
       const bool reads_deferred =
@@ -1308,10 +1328,57 @@ arrow::Result<MembershipInput> MembershipMaps(const Correlation& correlation, co
       input = Make(std::move(inner));
     }
   }
-  return MembershipInput{.right = std::move(input),
-                         .deferred_item = outer.contains(item.id) || values.contains(item.id)
-                                              ? InlineValues(ColumnValue(item), values)
-                                              : nullptr};
+  ExprPtr selected = outer.contains(item.id) || values.contains(item.id)
+                         ? InlineValues(ColumnValue(item), values)
+                         : nullptr;
+  if (mixed) {
+    // A checked expression can raise on a different set of rows when DuckDB substitutes an
+    // equality key. Include hidden sort items, correlation predicates and derived inputs in
+    // the proof: a harmless selected column can name a checked expression below the filter.
+    const auto safe = [](const ExprPtr& expr) { return CanEvaluateOnUnmatchedRow(*expr, nullptr); };
+    for (const Step& step : spine.steps) {
+      const auto* compute = std::get_if<ComputeNode>(step.node.get());
+      if (compute != nullptr && !std::ranges::all_of(compute->exprs, safe)) {
+        return correlation.Refuse("with a potentially failing mixed projection or sort item");
+      }
+    }
+    if ((selected && ObservesBindingZeroSign(*selected, correlation.outer)) ||
+        std::ranges::any_of(spine.computed->exprs, [&](const ExprPtr& expr) {
+          return ObservesBindingZeroSign(*expr, correlation.outer);
+        })) {
+      return correlation.Refuse(
+          "with a mixed projection that can observe the sign of a binding's zero");
+    }
+    if (!std::ranges::all_of(spine.computed->exprs, safe) ||
+        FirstUnsafeInnerNode(spine.below, true) != nullptr) {
+      return correlation.Refuse("with a mixed projection over a potentially failing set input");
+    }
+  }
+  return MembershipInput{
+      .right = std::move(input), .deferred_item = std::move(selected), .mixed = mixed};
+}
+
+// Equality can supply every outer value in a mixed item. Compute it once per set row.
+void HashMixedMembershipItem(const Correlation& correlation, std::span<const JoinKey> keys,
+                             ColumnId output, LogicalNodePtr& right, ExprPtr& item) {
+  if (item == nullptr || !SidesOf(*item, correlation.outer).both()) {
+    return;
+  }
+  const auto available = OutputIds(*right);
+  std::map<ColumnId, ExprPtr> equivalents;
+  for (const JoinKey& key : keys) {
+    if (correlation.outer.contains(key.left.id) && std::ranges::contains(available, key.right.id)) {
+      equivalents.try_emplace(key.left.id, ColumnValue(key.right));
+    }
+  }
+  ExprPtr local = InlineValues(item, equivalents);
+  if (!SidesOf(*local, correlation.outer).outer) {
+    right = Make(ComputeNode{.input = std::move(right),
+                             .exprs = {std::move(local)},
+                             .ids = {output},
+                             .span = correlation.join.span});
+    item.reset();
+  }
 }
 
 arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& spine) {
@@ -1417,11 +1484,13 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
   LogicalNodePtr left = join.left;
   LogicalNodePtr right = spine.below;
   ExprPtr deferred_item;
+  bool mixed = false;
   if (join.membership.has_value()) {
     ARROW_ASSIGN_OR_RAISE(
         auto mapped, MembershipMaps(correlation, spine, join.membership->right, !residual.empty()));
     right = std::move(mapped.right);
     deferred_item = std::move(mapped.deferred_item);
+    mixed = mapped.mixed;
   } else if (Traits(join.kind).single_match) {
     // PlainScalarMaps proves these maps can run on the build before the residual.
     const auto& item = std::get<ProjectNode>(*join.right).columns.front();
@@ -1451,6 +1520,15 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
     right = Make(ComputeNode{
         .input = std::move(right), .exprs = inner_casts, .ids = inner_cast_ids, .span = join.span});
   }
+  LogicalNodePtr pending_outer_safety;
+  if (mixed && join.membership.has_value()) {
+    if (FirstDependentJoin(join.left) != nullptr) {
+      pending_outer_safety = join.left;
+    } else if (FirstUnsafeInnerNode(join.left, true) != nullptr) {
+      return correlation.Refuse("with a mixed projection over a potentially failing outer input");
+    }
+    HashMixedMembershipItem(correlation, keys, join.membership->right.id, right, deferred_item);
+  }
   // ADR 0026's C2b, C2c and C3: a semi or an anti join may build on its left input, the side it
   // preserves, when the subquery side is decisively larger -- the shape a correlated EXISTS or NOT
   // EXISTS over a large relation has, where ADR 0022's rule built the whole of that relation to
@@ -1460,7 +1538,7 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
       Traits(join.kind).may_build_left
           ? ChooseBuildSide(left_rows, EstimateRows(*right), correlation.build_side_ratio)
           : BuildSide::kRight;
-  return MembershipNode(
+  Rewritten rewritten = MembershipNode(
       correlation,
       JoinNode{.kind = join.kind,
                .left = std::move(left),
@@ -1475,6 +1553,8 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
                .estimate = left_rows,
                .span = join.span},
       deferred_item);
+  rewritten.pending_outer_safety = std::move(pending_outer_safety);
+  return rewritten;
 }
 
 // A simple selected value can be carried directly by the hash build while the keys and
@@ -2109,9 +2189,9 @@ bool ReadsEmptyScan(const LogicalNodePtr& input) {
 }
 
 // A derived table may hide a checked expression behind an ordinary column reference.
-const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded = false,
-                                        const std::set<const LogicalNode*>& existing_inputs = {},
-                                        const Expr* deferred_match = nullptr) {
+const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded,
+                                        const std::set<const LogicalNode*>& existing_inputs,
+                                        const Expr* deferred_match) {
   if (existing_inputs.contains(input.get())) {
     return nullptr;
   }
@@ -3781,12 +3861,12 @@ class Walker {
       : last_id_(last_id), build_side_ratio_(build_side_ratio), report_(report) {}
 
   arrow::Result<LogicalNodePtr> Walk(const LogicalNodePtr& node) {
-    if (middle_inputs_.empty()) {
+    if (tracked_inputs_.empty()) {
       return WalkNode(node);
     }
     ARROW_ASSIGN_OR_RAISE(LogicalNodePtr result, WalkNode(node));
     if (node != result) {
-      for (auto& input : middle_inputs_) {
+      for (auto& input : tracked_inputs_) {
         if (input == node) {
           input = result;
         }
@@ -3800,10 +3880,10 @@ class Walker {
                                                 const DependentJoinNode& dependent) {
     // Follow the existing middle input through sibling rewrites. Check work on extra middle
     // rows, including eager projections. The final deferred item only runs on matched pairs.
-    middle_inputs_.push_back(dependent.left);
+    tracked_inputs_.push_back(dependent.left);
     auto result = Walk(rewritten.node);
-    LogicalNodePtr middle = std::move(middle_inputs_.back());
-    middle_inputs_.pop_back();
+    LogicalNodePtr middle = std::move(tracked_inputs_.back());
+    tracked_inputs_.pop_back();
     if (result.ok() && FirstUnsafeInnerNode(*result, /*guarded=*/true, {middle.get()},
                                             rewritten.deferred_match.get()) != nullptr) {
       if (dependent.membership.has_value()) {
@@ -3835,8 +3915,22 @@ class Walker {
       }
       const bool guarded = dependent->guard_membership ||
                            dependent->middle_key == DependentJoinNode::MiddleKey::kSubstituted;
-      ARROW_ASSIGN_OR_RAISE(
-          auto result, guarded ? WalkSubstituted(rewritten, *dependent) : Walk(rewritten.node));
+      if (rewritten.pending_outer_safety != nullptr) {
+        tracked_inputs_.push_back(rewritten.pending_outer_safety);
+      }
+      auto walked = guarded ? WalkSubstituted(rewritten, *dependent) : Walk(rewritten.node);
+      if (rewritten.pending_outer_safety != nullptr) {
+        LogicalNodePtr outer = std::move(tracked_inputs_.back());
+        tracked_inputs_.pop_back();
+        if (walked.ok() && FirstUnsafeInnerNode(outer, true) != nullptr) {
+          return UnsupportedError(
+              std::format("a correlated {} with a mixed projection over a potentially failing "
+                          "outer input is not supported",
+                          dependent->kind == JoinKind::kAnti ? "NOT IN" : "IN"),
+              dependent->span);
+        }
+      }
+      ARROW_ASSIGN_OR_RAISE(auto result, std::move(walked));
       if (rewritten.pending_lookups.has_value()) {
         const auto& join = std::get<JoinNode>(*result);
         if (WorthNestedLookups(join, above_) && !UnsafeToClone(join.right) &&
@@ -3871,7 +3965,7 @@ class Walker {
     return changed ? WithInputs(*node, std::move(inputs)) : node;
   }
 
-  std::vector<LogicalNodePtr> middle_inputs_;
+  std::vector<LogicalNodePtr> tracked_inputs_;
   ColumnId& last_id_;
   int64_t build_side_ratio_;
   UnnestReport* report_;

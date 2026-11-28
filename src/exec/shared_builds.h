@@ -70,6 +70,9 @@ class SharedBuildsOperator final : public Operator {
   std::vector<SharedBuild> builds_;
   Fallback fallback_;
   std::unique_ptr<Operator> unshared_;
+  // The profile node `unshared_` was built into. Cleared at each Open and set again only when
+  // that Open actually runs the original plan.
+  ProfileNode* fallback_profile_ = nullptr;
   bool use_fallback_ = false;
   bool retry_if_empty_ = false;
 };

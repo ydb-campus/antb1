@@ -667,16 +667,21 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   separate hash lookups test membership, NULL items and set existence; additional correlation predicates use
   candidate-pair residuals. An empty set therefore keeps even a NULL probe. The set may project expressions,
   use `DISTINCT`, group or aggregate, and filter groups with `HAVING`; static aggregates preserve their empty-input row.
-  In a plain set, an item that reads only the enclosing block is evaluated in the membership residual, after
-  the correlation predicates, so an empty correlated set never evaluates it. A potentially failing inner item
-  is also evaluated after correlation for IN, and after any correlation residuals for NOT IN. Plain NOT IN
-  retains DuckDB's eager evaluation of inner items. Deferred items still need a correlation key.
+  A plain keyed set can select an expression that reads both query blocks. For example,
+  `COALESCE(i.value, o.fallback)` uses the current outer row's fallback, even when several outer rows
+  share a key. The planner must prove that the mixed projection, sort items, correlation predicates and
+  both inputs can be evaluated without a value error. A mixed item can use an equivalent inner equality key
+  for hash membership. Checked mixed expressions and division that can distinguish the sign of an outer
+  floating-point zero remain SQ10 (exit 4).
+  Items that need the outer row run after the correlation predicates, so an empty set never evaluates
+  them. A potentially failing inner-only item is also evaluated after correlation for IN, and after
+  any correlation residuals for NOT IN. Plain NOT IN retains DuckDB's eager evaluation of inner items.
+  Deferred items still need a correlation key.
   Aggregated sets and DISTINCT IN restrict potentially failing maps to actual outer bindings before evaluating
   them; DISTINCT NOT IN retains DuckDB's eager evaluation of inner items.
   When that restriction would clone pending correlated subqueries, free outer references or a LIMIT in the
   outer input, the query is unsupported (SQ9's general binding domains); a nonthrowing column or exact widening
   needs no such restriction. An equality between computed expressions on separate sides can supply that key.
-  Mixed inner/outer select expressions remain SQ10.
   A correlated membership predicate under `OR`, `NOT` or `CASE` remains SQ12, and a per-binding `LIMIT` or
   `OFFSET` that selects set values remains SQ14 (`LIMIT 0` is an empty set).
   Every other correlated shape
@@ -727,6 +732,11 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   EXISTS has been unnested, when the set can be evaluated twice and repeated keys make pair testing costly.
   A NULL set member can make `NOT IN` unknown, and an empty set makes it true even for a NULL probe. Names resolve in the
   nearest visible scope before substitution.
+  A plain EXISTS or membership subquery can also take its only input from a derived table or a CTE
+  declared in that subquery. The inner block selects plain columns or literals from one base table and
+  can correlate through column equalities, including `IS NOT DISTINCT FROM`. The enclosing subquery
+  projects columns or literals without its own filter, grouping, ordering or row limit. The correlation
+  key stays available even when it is omitted from the projection, and aliases keep their written scope.
   The inner plan must be safe to evaluate for middle rows whose key no outer row binds. A checked
   expression that could fail on such a row gives exit code 4. This check also covers the rewritten
   membership set, including its filters and eager projections, and sibling predicates over middle and inner rows.
@@ -750,7 +760,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   outer reference is read only in a `WHERE` conjunct of the subquery's own block, an inner join's `ON` included, and
   can reach two blocks out through the middle-block equality above. Other distant references, references in a
   select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or `FULL JOIN`'s `ON`, and references in a
-  derived table or a CTE (a lateral reference) give exit code 4 at the reference, each with its
+  derived table or a CTE outside the single-input projection rule above (a lateral reference) give exit code 4
+  at the reference, each with its
   own message. A star in an `EXISTS` block is checked by name but not expanded (but under an uncorrelated block's
   `DISTINCT`): a `GROUP BY` or `ORDER BY` position there counts its columns, and one that names a column of it is exit
   code 4 (one out of range is a bind error, as in DuckDB);
@@ -1411,7 +1422,12 @@ condition went into the blocks and a block is left, else the `Filter` above the 
 left, or a condition the binder computes). A `SetOperation` line shows the number of its inputs, its
 formula over them in written order (`0 UNION 1 UNION 2`, parenthesized where a term nests) and its columns,
 named as the first block names them. Use `--physical` to see which repeated results the executor plans to
-materialize. Their consumers read a `Scan` marked `source=shared`.
+materialize. Their consumers read a `Scan` marked `source=shared#N`. `N` numbers the retained results
+in plan order, starting at 1, so every scan of one result carries the same `N`. A reader of one
+lookup value is `source=shared-group-partition#N` with that same `N`. The operators that produce the
+retained result are drawn in full under the first of those scans, in the same left-then-right order as
+the rest of the plan. Each later scan with that `N` names the source and, under `--analyze`, its own
+rows and time, without the subtree.
 
 ```text
 Output: x:INTEGER n:BIGINT
@@ -1568,16 +1584,20 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     input reports `shared_rows` for a completed shared build. Its `shared_fallbacks` counter
     includes retries that keep the deferred lookup and run the per-value aggregates independently.
   - `SharedGroupPartitions` shows two grouped DOUBLE sums sharing a fact scan and lookup join.
-    Each `source=shared-group-partition` reader receives the groups for its own lookup value.
+    Each `source=shared-group-partition#N` reader receives the groups for its own lookup value.
+    `N` is the shared result those readers share.
     `split_scan_parts` counts fact parts processed by the shared producers.
     `split_rows_0` and `split_rows_1` count joined rows routed to the first and second aggregate
     states in reader order. These counters are summed across producers. `shared_fallbacks` records
     a retry with the independent aggregates.
   - on the query's root, `shared` is time spent preparing shared sub-plans and `shared_rows` is
-    the number of rows retained when sharing succeeds. If a shared result exceeds the 256 MiB cap,
-    the query budget refuses a reservation, or preparation fails, antb1 releases the shared results
-    and producer working memory before opening the original plan. In that case,
-    `shared_fallbacks` counts the retry and the root includes the original plan as an additional input.
+    the number of rows retained when sharing succeeds. The producer's operators are profiled as
+    well and printed under the first `source=shared#N` scan; their rows and time are their own, not
+    part of that scan's. If a shared result exceeds the 256 MiB cap, the query budget refuses a
+    reservation, or preparation fails, antb1 releases the shared results and producer working
+    memory before opening the original plan. In that case, `shared_fallbacks` counts the retry and
+    the profile shows that original plan in place of the shared one, including when the shared plan
+    is nested under another operator, with `shared` and `shared_fallbacks` on the replacement.
   - `wait` (for parts);
   - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;
