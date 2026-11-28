@@ -211,3 +211,84 @@ SMALLINT
 # NOT IN: plain inner item keeps eager evaluation
 statement error out of range
 SELECT o.k FROM (SELECT ct_id AS k FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+
+# Different outer rows share a key but supply different values to the same selected expression.
+query I nosort
+WITH v AS (SELECT id, id % 3 AS k FROM edge)
+SELECT o.id FROM v o WHERE 3 IN (SELECT CAST(i.id AS BIGINT) + o.id AS val FROM v i
+WHERE i.k = o.k AND i.id < 2 ORDER BY val) ORDER BY o.id
+----
+INTEGER
+3
+
+# A NULL set item makes NOT IN unknown. An absent binding keeps even a NULL probe.
+query I nosort
+WITH v AS (SELECT id, id % 3 AS k, CASE WHEN id = 2 THEN NULL ELSE id END AS probe FROM edge)
+SELECT o.id FROM v o WHERE o.probe NOT IN (SELECT CASE WHEN i.id = 4 THEN NULL
+ELSE CAST(i.id AS BIGINT) + o.id END FROM v i WHERE i.k = o.k AND i.id IN (0, 1, 4)) ORDER BY o.id
+----
+INTEGER
+2
+5
+8
+11
+
+# A mixed item in an inner ON reads the outer row and each matching set row.
+query II nosort
+SELECT o.id, j.id FROM edge o JOIN edge j ON j.id = o.id AND j.id IN
+(SELECT COALESCE(i.i16, o.id) FROM edge i WHERE i.id = o.id) ORDER BY o.id, j.id
+----
+INTEGER	INTEGER
+5	5
+8	8
+
+# IS NOT DISTINCT FROM includes the NULL-key set. An additional predicate can empty that set.
+query I nosort
+WITH v AS (SELECT id, CASE WHEN id IN (0, 1, 2) THEN NULL ELSE id END AS k FROM edge)
+SELECT o.id FROM v o WHERE o.id NOT IN (SELECT COALESCE(i.k, o.id) FROM v i
+WHERE i.k IS NOT DISTINCT FROM o.k AND i.id < o.id) ORDER BY o.id
+----
+INTEGER
+0
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+# The probe and the outer fallback can be different columns.
+query I nosort
+SELECT o.id FROM edge o WHERE o.i16 IN (SELECT COALESCE(i.i16, o.i32) FROM edge i
+WHERE i.id % 3 = o.id % 3) ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+3
+4
+6
+7
+9
+10
+11
+
+# An inner NULL takes its fallback from the outer key in an equality-only NOT IN.
+query I nosort
+WITH v AS (SELECT id, id % 2 AS k, CASE WHEN id = 0 THEN NULL ELSE id END AS x FROM edge)
+SELECT o.id FROM v o WHERE o.id NOT IN (SELECT COALESCE(i.x, o.k) FROM v i
+WHERE i.k = o.k AND i.id < 4) ORDER BY o.id
+----
+INTEGER
+4
+5
+6
+7
+8
+9
+10
+11
