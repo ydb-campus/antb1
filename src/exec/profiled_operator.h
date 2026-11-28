@@ -24,6 +24,7 @@ class ProfiledOperator final : public Operator {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return input_->output_schema();
   }
+  void SetMayStopEarly() override { input_->SetMayStopEarly(); }
   const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override {
     return input_->RequestPartitioning(column, request);
   }

@@ -18,6 +18,7 @@ class LimitOperator final : public Operator {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return input_->output_schema();
   }
+  void SetMayStopEarly() override { input_->SetMayStopEarly(); }
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override { return input_->Close(); }

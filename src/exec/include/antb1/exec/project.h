@@ -21,6 +21,7 @@ class ProjectOperator final : public Operator {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
   }
+  void SetMayStopEarly() override { input_->SetMayStopEarly(); }
   const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override;
   [[nodiscard]] std::size_t ReadyBatches(std::size_t limit, int64_t min_rows,
                                          int64_t max_rows) const override;

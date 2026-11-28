@@ -375,6 +375,10 @@ class HashJoinOperator final : public Operator {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
   }
+  void SetMayStopEarly() override {
+    bounded_consumer_ = true;
+    input_->SetMayStopEarly();  // The build is drained before probing.
+  }
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override;
@@ -404,9 +408,9 @@ class HashJoinOperator final : public Operator {
   // The next probe batch with selected rows and its matches (none when nothing is looked up), or
   // the end of the input.
   arrow::Status Pull();
-  // Starts an ordered wave over already finalized, immutable inputs. Only the consumer reads the
-  // group operator. Each task looks up, marks and gathers its own batch against the shared build.
-  arrow::Status StartReadyProbes();
+  // Moves first into an ordered wave when the group operator has already materialized eligible
+  // successors. On the serial path the caller retains first and the group cursor stays put.
+  arrow::Status StartReadyProbes(Batch& first);
   arrow::Result<Batch> ProbeReady(const Batch& input) const;
   arrow::Status FindMatches(const Batch& in, arrow::ArrayVector& keys,
                             std::vector<JoinMatches>& matches, MemoryReservation& memory) const;
@@ -520,6 +524,7 @@ class HashJoinOperator final : public Operator {
   // marks and, once its input ends, emits the build rows no probe row matched through tail_rows_
   // before it releases the build (ADR 0037's OJ2).
   bool own_tail_ = false;
+  bool bounded_consumer_ = false;
   bool tailing_ = false;  // its input ended and tail_rows_ is emitting
   BuildRowEmitter tail_rows_;
   std::vector<int> pair_probe_;  // columns of the probe's output

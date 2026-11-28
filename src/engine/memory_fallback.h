@@ -13,8 +13,8 @@ template <class Run>
 auto RunWithMemoryFallback(const plan::LogicalPlan& logical, const plan::LogicalPlan& fallback,
                            Run run) {
   auto attempt = [&run](const plan::LogicalPlan& chosen) {
-    // A parent may need the budget held by pending join output. No result has escaped Drain.
-    // Drop the entire attempted tree, then rerun exactly the same plan without this lookahead.
+    // Even with an unlimited query budget, the backend can refuse an allocation while a probe
+    // holds speculative batches. Drop the attempted tree and rerun with serial probes.
     std::atomic<bool> used = false;
     auto result = run(chosen, &used);
     if (!result.ok() && result.status().IsOutOfMemory() && used.load(std::memory_order_relaxed)) {

@@ -1170,10 +1170,8 @@ arrow::Result<Batch> HashJoinOperator::Next() {
   }
   while (!done_) {
     if (batch_.data == nullptr) {
-      if (!ready_probes_ && own_tail_ && ctx_.executor != nullptr && ctx_.threads > 1 &&
-          table_->unique() && residual_.empty() && !probe_keys_.empty() &&
-          (ctx_.budget == nullptr || !ctx_.budget->under_pressure())) {
-        ARROW_RETURN_NOT_OK(StartReadyProbes());
+      if (!ready_probes_) {
+        ARROW_RETURN_NOT_OK(Pull());
       }
       if (ready_probes_) {
         ARROW_ASSIGN_OR_RAISE(auto out, ready_probes_->Next());
@@ -1189,7 +1187,6 @@ arrow::Result<Batch> HashJoinOperator::Next() {
         }
         return out;
       }
-      ARROW_RETURN_NOT_OK(Pull());
       continue;
     }
     ARROW_ASSIGN_OR_RAISE(std::optional<Batch> out, NextOutput());
@@ -1248,20 +1245,23 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
   return arrow::Status::Invalid("hash join: unhandled join kind");  // unreachable
 }
 
-arrow::Status HashJoinOperator::StartReadyProbes() {
+arrow::Status HashJoinOperator::StartReadyProbes(Batch& first) {
   // A worker must have enough rows to repay dispatch, and its whole output must fit one batch.
   constexpr int64_t kMinProbeTaskRows = 512;
   const auto max_rows = std::min<int64_t>(batch_size_, std::numeric_limits<std::uint32_t>::max());
-  const bool limited = ctx_.budget != nullptr && ctx_.budget->limit().has_value();
-  if (ctx_.executor->IsCurrentExecutor() || (limited && ctx_.ready_probe_used == nullptr)) {
+  if (first.selection != nullptr || first.data->num_rows() < kMinProbeTaskRows ||
+      first.data->num_rows() > max_rows || ctx_.executor->IsCurrentExecutor()) {
     return arrow::Status::OK();
   }
-  const auto count =
-      input_->ReadyBatches(static_cast<std::size_t>(ctx_.threads), kMinProbeTaskRows, max_rows);
-  if (count < 2) {
+  // Pulling the first batch may have finished an entire wave of grouped output. Let the first
+  // batch use a worker too, even when only one other partition is ready.
+  const auto successors =
+      input_->ReadyBatches(static_cast<std::size_t>(ctx_.threads - 1), kMinProbeTaskRows, max_rows);
+  if (successors == 0) {
     return arrow::Status::OK();
   }
-  // If the additional references cannot fit, leave the group cursor untouched for Pull().
+  // If the extra references cannot fit, Pull still owns the first batch for its serial probe.
+  const auto count = successors + 1;
   const auto status = ready_memory_.Resize(Narrow<int64_t>(count * sizeof(Batch)));
   if (status.IsOutOfMemory()) {
     return arrow::Status::OK();
@@ -1273,7 +1273,10 @@ arrow::Status HashJoinOperator::StartReadyProbes() {
     ready_memory_.Release();
     return arrow::Status::OK();
   }
-  for (std::size_t i = 0; i < count; ++i) {
+  // Even a ready projection may allocate heap metadata when Next() wraps its arrays.
+  ctx_.ready_probe_used->store(true, std::memory_order_relaxed);
+  ready_inputs_.push_back(std::move(first));
+  for (std::size_t i = 0; i < successors; ++i) {
     ARROW_ASSIGN_OR_RAISE(auto in, input_->Next());
     ANTB1_CHECK(!in.end());
     ANTB1_CHECK(in.selection == nullptr);
@@ -1287,9 +1290,6 @@ arrow::Status HashJoinOperator::StartReadyProbes() {
   Free(build_rows_);
   keys_.clear();
   memory_.Release();
-  if (limited) {
-    ctx_.ready_probe_used->store(true, std::memory_order_relaxed);
-  }
   const auto parts = Narrow<int64_t>(ready_inputs_.size());
   next_ready_ = 0;
   auto task = [this](int64_t part, const std::atomic<bool>&) {
@@ -1345,6 +1345,18 @@ arrow::Status HashJoinOperator::Pull() {
   }
   if (std::cmp_greater(in.data->num_rows(), std::numeric_limits<std::uint32_t>::max())) {
     return arrow::Status::CapacityError("a join probe batch of ", in.data->num_rows(), " rows");
+  }
+  if (own_tail_ && !bounded_consumer_ && ctx_.ready_probe_used != nullptr &&
+      ctx_.executor != nullptr && ctx_.threads > 1 && table_->unique() && residual_.empty() &&
+      !probe_keys_.empty() && (ctx_.budget == nullptr || !ctx_.budget->under_pressure())) {
+    try {
+      ARROW_RETURN_NOT_OK(StartReadyProbes(in));
+    } catch (const std::bad_alloc&) {
+      return arrow::Status::OutOfMemory("preparing grouped hash join probes");
+    }
+    if (ready_probes_) {
+      return arrow::Status::OK();
+    }
   }
   if (keep_ != Keep::kAll) {  // the rows' matches decide
     ARROW_RETURN_NOT_OK(FindMatches(in, keys_, matches_, memory_));

@@ -51,9 +51,9 @@ struct ExecContext {
   std::shared_ptr<plan::ScanContext> scans = nullptr;
   // A combined equality-domain producer may only scan the union of its members' parts.
   CombinedJoinFilter join_filter = CombinedJoinFilter::kOrdinary;
-  // A finite-budget execution may hold speculative probe output while its parent allocates only
-  // when the whole-query caller can retry with a fresh tree. Set on the first such wave; nullptr
-  // selects the original serial path for direct callers and for the retry.
+  // The caller can retry this execution with a fresh tree after an allocation failure. Set
+  // before fetching speculative probe input, including when only the backend limits allocations.
+  // A null pointer requests serial probes (the retry, or a caller without a retry boundary).
   std::atomic<bool>* ready_probe_used = nullptr;
 };
 
@@ -91,6 +91,9 @@ class Operator {
 
   // The schema of every batch's data. Field names are internal: the engine names the result.
   [[nodiscard]] virtual const std::shared_ptr<arrow::Schema>& output_schema() const = 0;
+  // A finite LIMIT may stop pulling after any batch. Streaming operators pass this hint to
+  // inputs they can stop early; an operator that drains its input need not pass it on.
+  virtual void SetMayStopEarly() {}
   virtual const BatchPartition* RequestPartitioning(int /*column*/, PartitionRequest /*request*/) {
     return nullptr;
   }

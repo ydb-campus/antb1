@@ -43,7 +43,11 @@ Batch Window(const Batch& in, int64_t skip, int64_t take) {
 
 LimitOperator::LimitOperator(std::unique_ptr<Operator> input, std::optional<int64_t> limit,
                              int64_t offset)
-    : input_(std::move(input)), limit_(limit), offset_(offset) {}
+    : input_(std::move(input)), limit_(limit), offset_(offset) {
+  if (limit_.has_value()) {
+    input_->SetMayStopEarly();
+  }
+}
 
 arrow::Status LimitOperator::Open(ExecContext& ctx) {
   if (limit_.has_value() && *limit_ < 0) {

@@ -34,7 +34,8 @@ namespace fs = std::filesystem;
 
 TEST(MemoryFallbackTest, ReleasesPendingProbeOutputBeforeRetryingAParentAllocation) {
   constexpr int64_t kLimit = 128;
-  exec::MemoryBudget budget(kLimit);
+  exec::MemoryBudget backend(kLimit);
+  exec::MemoryBudget budget(std::nullopt, &backend);
   plan::LogicalPlan logical;
   plan::LogicalPlan fallback;
   fallback.root = std::make_shared<const plan::LogicalNode>(plan::RowCountNode{});
@@ -44,14 +45,13 @@ TEST(MemoryFallbackTest, ReleasesPendingProbeOutputBeforeRetryingAParentAllocati
     EXPECT_EQ(&chosen, &logical);
     EXPECT_EQ(budget.bytes_allocated(), 0);
     lookahead.push_back(used != nullptr);
-    exec::MemoryReservation queued;
+    std::unique_ptr<arrow::Buffer> queued;
     if (used != nullptr) {
       EXPECT_FALSE(used->load());
-      queued.Reset(&budget);
-      ARROW_RETURN_NOT_OK(queued.Resize(kLimit / 2));
+      ARROW_ASSIGN_OR_RAISE(queued, arrow::AllocateBuffer(kLimit / 2, &budget));
       used->store(true);
     }
-    // The parent needs the entire budget. It fits after the first attempt's queued output goes.
+    // The backend refuses the parent buffer until the previous attempt's queued output goes.
     return arrow::AllocateBuffer(kLimit, &budget);
   };
   const auto result = RunWithMemoryFallback(logical, fallback, run);
