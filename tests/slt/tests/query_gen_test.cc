@@ -2638,7 +2638,8 @@ TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
   const FeatureSet plain =
       Union(kSupportedFeatures, {Feature::kCorrelatedExists})
           .Minus({Feature::kLayout, Feature::kKeywordCase, Feature::kCorrelatedIn,
-                  Feature::kNestedCorrelation, Feature::kMiddleEqualityExists});
+                  Feature::kNestedCorrelation, Feature::kMiddleEqualityExists,
+                  Feature::kDerivedCorrelation});
   const auto gen = MakeOver(JoinTables(), 71, {.supported = plain, .target_percent = 0});
   int exists = 0;
   int negated = 0;
