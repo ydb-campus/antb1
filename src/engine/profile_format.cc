@@ -54,7 +54,7 @@ std::string MetricKey(const exec::ProfileMetric& metric) {
 // the known ones as a query runs, then any other by name. A hash join's probe has find, gather,
 // residual and window_rows; its build parts, skipped, part_time, wait, lanes_tail and finish,
 // then what its table holds: null_keys, unique, direct and cols_dropped.
-std::vector<exec::ProfileMetric> Ordered(const exec::ProfileNode& node) {
+std::size_t MetricRank(std::string_view name) {
   static constexpr std::array<std::string_view, 29> kOrder = {
       "parts",        "skipped",    "sample_parts", "heavy_keys",
       "part_time",    "raw_parts",  "raw_rows",     "cols_filter_only",
@@ -64,15 +64,43 @@ std::vector<exec::ProfileMetric> Ordered(const exec::ProfileNode& node) {
       "outer",        "build",      "sort",         "groups",
       "heavy_groups", "null_keys",  "unique",       "direct",
       "cols_dropped"};
-  const auto rank = [](const exec::ProfileMetric& metric) {
-    const auto* it = std::ranges::find(kOrder, metric.name);
-    return static_cast<std::size_t>(it - kOrder.begin());
-  };
+  const auto* it = std::ranges::find(kOrder, name);
+  return static_cast<std::size_t>(it - kOrder.begin());
+}
+
+void SortMetrics(std::vector<exec::ProfileMetric>& metrics) {
+  std::ranges::stable_sort(metrics, [](const exec::ProfileMetric& a, const exec::ProfileMetric& b) {
+    const std::size_t rank_a = MetricRank(a.name);
+    const std::size_t rank_b = MetricRank(b.name);
+    return rank_a != rank_b ? rank_a < rank_b : a.name < b.name;
+  });
+}
+
+std::vector<exec::ProfileMetric> Ordered(const exec::ProfileNode& node) {
   std::vector<exec::ProfileMetric> metrics = node.metrics();
-  std::ranges::stable_sort(metrics,
-                           [&](const exec::ProfileMetric& a, const exec::ProfileMetric& b) {
-                             return rank(a) != rank(b) ? rank(a) < rank(b) : a.name < b.name;
-                           });
+  SortMetrics(metrics);
+  return metrics;
+}
+
+// `abandoned` is the shared plan that was dropped. Its preparation metrics belong on the original
+// plan's root, which is the plan that ran.
+std::vector<exec::ProfileMetric> DisplayMetrics(const exec::ProfileNode& node,
+                                                const exec::ProfileNode* abandoned) {
+  std::vector<exec::ProfileMetric> metrics = Ordered(node);
+  if (abandoned == nullptr) {
+    return metrics;
+  }
+  for (const exec::ProfileMetric& metric : abandoned->metrics()) {
+    if (metric.name != "shared" && metric.name != "shared_rows" &&
+        metric.name != "shared_fallbacks") {
+      continue;
+    }
+    if (std::ranges::contains(metrics, metric.name, &exec::ProfileMetric::name)) {
+      continue;
+    }
+    metrics.push_back(metric);
+  }
+  SortMetrics(metrics);
   return metrics;
 }
 
@@ -115,6 +143,9 @@ std::string_view DetailText(const exec::ProfileNode& node) {
 // the operator that prepares it.
 struct Drawn {
   const exec::ProfileNode* node = nullptr;
+  // Set when `node` replaced a shared plan that was dropped. Its preparation metrics are printed
+  // on this line.
+  const exec::ProfileNode* abandoned = nullptr;
   std::vector<Drawn> children;
 };
 
@@ -200,6 +231,14 @@ void OrderJoinSides(Drawn& drawn) {
 }
 
 Drawn Draw(const exec::ProfileNode& node, std::vector<const exec::ProfileNode*>& queue) {
+  // A nested shared plan can drop its result too. Show the original plan in its place, and do
+  // not let that plan claim HashBuilds that belong to the operator above it.
+  if (const exec::ProfileNode* fallback = node.fallback_plan()) {
+    std::vector<const exec::ProfileNode*> none;
+    Drawn drawn = Draw(*fallback, none);
+    drawn.abandoned = &node;
+    return drawn;
+  }
   Drawn drawn{.node = &node};
   std::vector<const exec::ProfileNode*> own;
   std::vector<const exec::ProfileNode*> lifted;
@@ -240,6 +279,26 @@ Drawn Draw(const exec::ProfileNode& node, std::vector<const exec::ProfileNode*>&
   return drawn;
 }
 
+bool Claim(std::vector<const exec::ProfileNode*>& seen, const exec::ProfileNode* producer) {
+  if (producer == nullptr || std::ranges::contains(seen, producer)) {
+    return false;
+  }
+  seen.push_back(producer);
+  return true;
+}
+
+// The shared producer is not an input. Draw it under the first consumer in the order the lines
+// are printed, and under no later consumer.
+void AttachShared(Drawn& drawn, std::vector<const exec::ProfileNode*>& seen) {
+  if (Claim(seen, drawn.node->shared_producer())) {
+    std::vector<const exec::ProfileNode*> queue;
+    drawn.children.push_back(Draw(*drawn.node->shared_producer(), queue));
+  }
+  for (Drawn& child : drawn.children) {
+    AttachShared(child, seen);
+  }
+}
+
 // One line per operator, root first. Without `counters` -- a plan nobody ran
 // (FormatPhysicalPlan) -- the line ends after the operator and its logical node, since rows, times
 // and metrics are what a run measures and this node has never been through one.
@@ -267,7 +326,7 @@ void Write(const Drawn& drawn, std::string_view prefix, bool last, bool root, bo
     if (HasInputInside(node)) {
       line += std::format(" self={}", Duration(SelfTime(node)));
     }
-    for (const exec::ProfileMetric& metric : Ordered(node)) {
+    for (const exec::ProfileMetric& metric : DisplayMetrics(node, drawn.abandoned)) {
       line += std::format(" {}={}", metric.name, MetricText(metric));
     }
     line += ']';
@@ -284,28 +343,68 @@ void Write(const Drawn& drawn, std::string_view prefix, bool last, bool root, bo
 
 void Text(const exec::ProfileNode& node, bool counters, std::string& out) {
   std::vector<const exec::ProfileNode*> pending;
-  Write(Draw(node, pending), "", false, true, counters, out);
+  Drawn drawn = Draw(node, pending);
+  std::vector<const exec::ProfileNode*> seen;
+  AttachShared(drawn, seen);
+  Write(drawn, "", false, true, counters, out);
 }
 
-void Json(const exec::ProfileNode& node, std::string& out) {
+// Nodes whose drawn children include the shared producer. Text and JSON then expand the same scan,
+// the first one in printed order, including when a join prints its left input before its right.
+void CollectOwners(const Drawn& drawn, std::vector<const exec::ProfileNode*>& owners) {
+  const exec::ProfileNode* producer = drawn.node->shared_producer();
+  if (producer != nullptr && std::ranges::any_of(drawn.children, [producer](const Drawn& child) {
+        return child.node == producer;
+      })) {
+    owners.push_back(drawn.node);
+  }
+  for (const Drawn& child : drawn.children) {
+    CollectOwners(child, owners);
+  }
+}
+
+void Json(const exec::ProfileNode& node, const std::vector<const exec::ProfileNode*>& owners,
+          std::string& out) {
+  const exec::ProfileNode* abandoned = nullptr;
+  const exec::ProfileNode* shown = &node;
+  if (const exec::ProfileNode* fallback = node.fallback_plan()) {
+    shown = fallback;
+    abandoned = &node;
+  }
   out += std::format(
       R"({{"name":"{}","detail":"{}","per_part":{},"runs":{},"rows":{},"batches":{},"time_ns":{},"self_time_ns":{},"metrics":{{)",
-      JsonEscape(node.name()), JsonEscape(node.detail()), node.per_part() ? "true" : "false",
-      node.instances(), node.rows(), node.batches(), node.time().count(), SelfTime(node));
+      JsonEscape(shown->name()), JsonEscape(shown->detail()), shown->per_part() ? "true" : "false",
+      shown->instances(), shown->rows(), shown->batches(), shown->time().count(), SelfTime(*shown));
   bool first = true;
-  for (const exec::ProfileMetric& metric : Ordered(node)) {
+  for (const exec::ProfileMetric& metric : DisplayMetrics(*shown, abandoned)) {
     out +=
         std::format(R"({}"{}":{})", first ? "" : ",", JsonEscape(MetricKey(metric)), metric.value);
     first = false;
   }
   out += R"(},"inputs":[)";
   first = true;
-  for (const exec::ProfileNode* child : node.children()) {
+  const auto emit = [&](const exec::ProfileNode& input) {
     out += first ? "" : ",";
-    Json(*child, out);
+    Json(input, owners, out);
     first = false;
+  };
+  for (const exec::ProfileNode* child : shown->children()) {
+    emit(*child);
+  }
+  if (std::ranges::contains(owners, shown) && shown->shared_producer() != nullptr) {
+    emit(*shown->shared_producer());
   }
   out += "]}";
+}
+
+void EmitJson(const exec::ProfileNode& node, std::string& out) {
+  std::vector<const exec::ProfileNode*> pending;
+  Drawn drawn = Draw(node, pending);
+  std::vector<const exec::ProfileNode*> seen;
+  AttachShared(drawn, seen);
+  std::vector<const exec::ProfileNode*> owners;
+  CollectOwners(drawn, owners);
+  Json(node, owners, out);
 }
 
 }  // namespace
@@ -318,7 +417,7 @@ std::string FormatProfile(const QueryProfile& profile, ProfileFormat format) {
         JsonEscape(profile.output), profile.time.count(), profile.rows, profile.peak_memory,
         profile.threads);
     if (profile.root != nullptr) {
-      Json(*profile.root, out);
+      EmitJson(*profile.root, out);
     } else {
       out += "null";
     }

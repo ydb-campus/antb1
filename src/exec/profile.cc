@@ -19,6 +19,18 @@ ProfileNode* ProfileNode::Child(std::size_t index) {
   return children_[index].get();
 }
 
+ProfileNode* ProfileNode::Park() {
+  const std::scoped_lock lock(mutex_);
+  parked_.push_back(std::make_unique<ProfileNode>());
+  return parked_.back().get();
+}
+
+ProfileNode* ProfileNode::Adopt(std::unique_ptr<ProfileNode> node) {
+  const std::scoped_lock lock(mutex_);
+  parked_.push_back(std::move(node));
+  return parked_.back().get();
+}
+
 ProfileMetric& ProfileNode::Find(std::string_view name, MetricUnit unit) {
   for (ProfileMetric& metric : metrics_) {
     if (metric.name == name) {

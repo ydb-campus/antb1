@@ -22,6 +22,8 @@
 
 namespace antb1::exec {
 
+class ProfileNode;
+
 // Made empty, filled once, then read. The planner makes it and rewrites each consumer to a scan of
 // it; the operator that owns it fills it before the consumers run and releases it with the query.
 //
@@ -37,6 +39,14 @@ class MaterializedTable final : public plan::Table {
 
   explicit MaterializedTable(std::shared_ptr<arrow::Schema> schema) : schema_(std::move(schema)) {}
 
+  // The profile of the operator tree that fills this table. Scans of the table point at it.
+  void set_shared_profile(ProfileNode* node) { shared_profile_ = node; }
+  [[nodiscard]] ProfileNode* shared_profile() const { return shared_profile_; }
+  // 1-based index among the shared results of one plan. 0 until the planner assigns it.
+  // EXPLAIN prints it so every consumer of this result can be matched to the others.
+  void set_shared_id(std::size_t id) { shared_id_ = id; }
+  [[nodiscard]] std::size_t shared_id() const { return shared_id_; }
+
   // Charges what it holds to `budget` from now on (nullptr: no budget).
   void Reset(MemoryBudget* budget);
   // False if retaining the batch would exceed the cap or the query budget.
@@ -49,7 +59,9 @@ class MaterializedTable final : public plan::Table {
 
   const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
   std::optional<int64_t> exact_row_count() const override;
-  std::string Describe() const override { return "shared"; }
+  std::string Describe() const override {
+    return shared_id_ == 0 ? std::string("shared") : "shared#" + std::to_string(shared_id_);
+  }
 
  protected:
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
@@ -63,6 +75,8 @@ class MaterializedTable final : public plan::Table {
       const arrow::Scalar* value = nullptr) const;
 
   std::shared_ptr<arrow::Schema> schema_;
+  ProfileNode* shared_profile_ = nullptr;
+  std::size_t shared_id_ = 0;
   // Guards the batches against the consumer threads: filling happens before any of them starts,
   // but a scan is const and may run on any of them, so the handover needs the lock to be visible.
   mutable std::mutex mutex_;
@@ -82,7 +96,12 @@ class MaterializedGroupPartition final : public plan::Table {
 
   const std::shared_ptr<arrow::Schema>& schema() const override { return table_->schema(); }
   std::optional<int64_t> exact_row_count() const override { return std::nullopt; }
-  std::string Describe() const override { return "shared-group-partition"; }
+  std::string Describe() const override {
+    const std::size_t id = table_->shared_id();
+    return id == 0 ? std::string("shared-group-partition")
+                   : "shared-group-partition#" + std::to_string(id);
+  }
+  [[nodiscard]] ProfileNode* shared_profile() const { return table_->shared_profile(); }
 
  protected:
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(

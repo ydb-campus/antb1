@@ -1412,7 +1412,12 @@ condition went into the blocks and a block is left, else the `Filter` above the 
 left, or a condition the binder computes). A `SetOperation` line shows the number of its inputs, its
 formula over them in written order (`0 UNION 1 UNION 2`, parenthesized where a term nests) and its columns,
 named as the first block names them. Use `--physical` to see which repeated results the executor plans to
-materialize. Their consumers read a `Scan` marked `source=shared`.
+materialize. Their consumers read a `Scan` marked `source=shared#N`. `N` numbers the retained results
+in plan order, starting at 1, so every scan of one result carries the same `N`. A reader of one
+lookup value is `source=shared-group-partition#N` with that same `N`. The operators that produce the
+retained result are drawn in full under the first of those scans, in the same left-then-right order as
+the rest of the plan. Each later scan with that `N` names the source and, under `--analyze`, its own
+rows and time, without the subtree.
 
 ```text
 Output: x:INTEGER n:BIGINT
@@ -1569,16 +1574,20 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     input reports `shared_rows` for a completed shared build. Its `shared_fallbacks` counter
     includes retries that keep the deferred lookup and run the per-value aggregates independently.
   - `SharedGroupPartitions` shows two grouped DOUBLE sums sharing a fact scan and lookup join.
-    Each `source=shared-group-partition` reader receives the groups for its own lookup value.
+    Each `source=shared-group-partition#N` reader receives the groups for its own lookup value.
+    `N` is the shared result those readers share.
     `split_scan_parts` counts fact parts processed by the shared producers.
     `split_rows_0` and `split_rows_1` count joined rows routed to the first and second aggregate
     states in reader order. These counters are summed across producers. `shared_fallbacks` records
     a retry with the independent aggregates.
   - on the query's root, `shared` is time spent preparing shared sub-plans and `shared_rows` is
-    the number of rows retained when sharing succeeds. If a shared result exceeds the 256 MiB cap,
-    the query budget refuses a reservation, or preparation fails, antb1 releases the shared results
-    and producer working memory before opening the original plan. In that case,
-    `shared_fallbacks` counts the retry and the root includes the original plan as an additional input.
+    the number of rows retained when sharing succeeds. The producer's operators are profiled as
+    well and printed under the first `source=shared#N` scan; their rows and time are their own, not
+    part of that scan's. If a shared result exceeds the 256 MiB cap, the query budget refuses a
+    reservation, or preparation fails, antb1 releases the shared results and producer working
+    memory before opening the original plan. In that case, `shared_fallbacks` counts the retry and
+    the profile shows that original plan in place of the shared one, including when the shared plan
+    is nested under another operator, with `shared` and `shared_fallbacks` on the replacement.
   - `wait` (for parts);
   - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;

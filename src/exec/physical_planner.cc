@@ -1156,6 +1156,23 @@ bool ExceedsExactKeyLimit(const plan::JoinNode& join) {
   return false;
 }
 
+// A scan of a retained shared result points at the producer's profile. The first build of the
+// plan writes it; later builds of a part pipeline only read the node.
+void NoteSharedProducer(ProfileNode& slot, const plan::Table& table) {
+  if (slot.shared_producer() != nullptr) {
+    return;
+  }
+  const ProfileNode* producer = nullptr;
+  if (const auto* shared = dynamic_cast<const MaterializedTable*>(&table)) {
+    producer = shared->shared_profile();
+  } else if (const auto* part = dynamic_cast<const MaterializedGroupPartition*>(&table)) {
+    producer = part->shared_profile();
+  }
+  if (producer != nullptr) {
+    slot.set_shared_producer(producer);
+  }
+}
+
 struct Builder {
   std::optional<int64_t> part;     // inside the pipeline of this part
   ProfileNode* slot = nullptr;     // the profile node of the operator built (nullptr: no profile)
@@ -1257,6 +1274,9 @@ struct Builder {
         };
       }
     }
+    if (slot != nullptr && slot->name().empty()) {
+      NoteSharedProducer(*slot, *node.table);
+    }
     Name("Scan");
     // What a key filter could do here, which is all a plan knows and all `explain --physical`
     // reports: the planner's own conditions hold on this scan's field, and the conditions that
@@ -1311,6 +1331,7 @@ struct Builder {
         ProfileNode* input_slot = Input();
         const bool names_it = input_slot != nullptr && input_slot->name().empty();
         if (names_it) {
+          NoteSharedProducer(*input_slot, *scan->table);
           input_slot->set_name("Scan");
           input_slot->set_detail(std::format("{}, {} pushed predicate{}",
                                              plan::ExplainNode(*node.input), pushed.size(),
@@ -1938,20 +1959,40 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
     const auto* widened =
         group.widens_join_build ? std::get_if<plan::GroupAggregateNode>(node.get()) : nullptr;
     const bool split = group.separate_partition_states;
-    auto make_producer = [node, widened, split, predicates = group.reader_predicates, profile] {
-      return widened ? Builder{}.Grouped(*widened, /*check_widened_build=*/true,
-                                         split ? &predicates : nullptr, profile)
-                     : Build(node);
+    // Held aside until the producer is accepted, so a declined group does not park a node on
+    // the guard profile.
+    std::unique_ptr<ProfileNode> held =
+        profile == nullptr ? nullptr : std::make_unique<ProfileNode>();
+    ProfileNode* const producer_profile = held.get();
+    auto make_producer = [node, widened, split, predicates = group.reader_predicates, profile,
+                          producer_profile] -> OperatorResult {
+      if (widened == nullptr) {
+        return Build(node, std::nullopt, producer_profile);
+      }
+      // Grouped names the slot but does not wrap the operator, so its rows and time would stay
+      // zero. Profiled is what records them, as Build does for every other producer.
+      ARROW_ASSIGN_OR_RAISE(auto built, Builder{.slot = producer_profile}.Grouped(
+                                            *widened, /*check_widened_build=*/true,
+                                            split ? &predicates : nullptr, profile));
+      if (!built) {
+        return std::unique_ptr<Operator>{};
+      }
+      OperatorResult accepted = std::move(built);
+      return Profiled(std::move(accepted), node, producer_profile);
     };
     ARROW_ASSIGN_OR_RAISE(auto op, make_producer());
     if (!op) {
       declined_split |= split;
       return arrow::Status::OK();
     }
+    if (held != nullptr) {
+      profile->Adopt(std::move(held));
+    }
     if (split) {
       accepted_members.insert(accepted_members.end(), group.members.begin(), group.members.end());
     }
     auto table = std::make_shared<MaterializedTable>(op->output_schema());
+    table->set_shared_profile(producer_profile);
     for (std::size_t i = 0; i < group.members.size(); ++i) {
       const plan::LogicalNodePtr& member = group.members[i];
       std::vector<plan::ColumnId> ids = plan::OutputIds(*member);
@@ -2018,6 +2059,9 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
     }
     profile = profile == nullptr ? nullptr : profile->Child(0);
   }
+  for (std::size_t i = 0; i < shared.size(); ++i) {
+    shared[i].table->set_shared_id(i + 1);
+  }
   const plan::LogicalNodePtr root_node =
       PreparePhysicalJoins(replacements.empty() ? plan.root : Substituted(plan.root, replacements));
   ARROW_ASSIGN_OR_RAISE(auto root, Build(root_node, std::nullopt, profile));
@@ -2036,11 +2080,8 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
   }
   auto builds = std::make_unique<SharedBuildsOperator>(std::move(root), std::move(shared),
                                                        std::move(fallback));
-  // Profiled into the root's own node, so the shared results' time and rows are visible without
-  // the profile tree changing shape. The sub-plans themselves are unprofiled: a reader sees what
-  // sharing cost and what it produced, and the consumers' `Scan ... source=shared` lines say who
-  // reads it, but not the breakdown inside. Enough to tell the optimisation happened, which is
-  // what ADR 0030's consequences ask for; less than a full accounting.
+  // `shared` and `shared_rows` stay on this node. The producer tree is parked beside it and each
+  // consumer scan points at that tree, so EXPLAIN can draw it once under the first scan.
   builds->set_profile(profile);
   return builds;
 }
