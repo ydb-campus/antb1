@@ -9509,7 +9509,7 @@ TEST(BinderTest, MiddleEqualityRequiresAnOrdinaryUnconditionalSameTypeKey) {
 
 TEST(BinderTest, MiddleEqualityRejectsCheckedInnerExpressionsAfterBinding) {
   const Catalog catalog = MakeCatalog();
-  for (const auto residual : {"CAST(i.i64 AS SMALLINT) > m.i16", "CAST(i.i64 AS SMALLINT) > 0"}) {
+  for (const char* residual : {"CAST(i.i64 AS SMALLINT) > m.i16", "CAST(i.i64 AS SMALLINT) > 0"}) {
     const std::string sql = std::format(
         "SELECT o.i16 FROM t o WHERE EXISTS (SELECT 1 FROM u m WHERE m.i16 = o.i16 "
         "AND EXISTS (SELECT 1 FROM t i WHERE i.i16 = o.i16 AND {}))",
