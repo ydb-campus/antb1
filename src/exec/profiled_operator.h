@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 
 #include <arrow/result.h>
@@ -23,8 +24,13 @@ class ProfiledOperator final : public Operator {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return input_->output_schema();
   }
+  void SetMayStopEarly() override { input_->SetMayStopEarly(); }
   const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override {
     return input_->RequestPartitioning(column, request);
+  }
+  [[nodiscard]] std::size_t ReadyBatches(std::size_t limit, int64_t min_rows,
+                                         int64_t max_rows) const override {
+    return input_->ReadyBatches(limit, min_rows, max_rows);
   }
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;

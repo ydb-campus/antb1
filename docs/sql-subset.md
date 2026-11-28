@@ -1590,6 +1590,15 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     a window all of whose rows did keeps the probe's columns where they are and gathers the build for the window, and
     any other window gathers only the rows that matched, which is why a selective join's `gather` is near its output
     rather than near its probe — [ADR 0026](adr/0026-join-performance.md));
+  - a `FULL JOIN` with unique build keys and only equality conditions can probe a grouped batch alongside
+    its already materialized successors. Each batch in the wave contains at least 512 rows and fits one output batch.
+    A finite `LIMIT` that can stop the probe early keeps the join on one batch at a time. A join feeding a
+    blocking operator such as an aggregate can still probe in parallel because that operator drains its input.
+    Workers look up keys, record matches and gather output. The join returns batches in probe order
+    and emits unmatched build rows after all probes finish. If speculative work causes an out-of-memory failure,
+    the session retries with serial probing, including when no explicit query memory limit is set.
+    `parallel_probe_batches` counts batches returned by the parallel path.
+    Its `find` and `gather` timings sum worker durations, which can overlap;
   - a `HashBuild`'s `finish` (the table built from its parts, the arrays of its columns that its gathers read, and a
     one-row join's values), `null_keys` (rows with a NULL in a key that compares `=`, which no key's range holds and no
     lookup returns; a join that emits the build rows which did not match keeps their rows apart from the table it

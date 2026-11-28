@@ -1,6 +1,7 @@
 #include "antb1/engine/session.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <memory>
@@ -24,6 +25,8 @@
 #include "antb1/plan/optimizer.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/sql/parser.h"
+
+#include "memory_fallback.h"
 
 namespace antb1::engine {
 namespace {
@@ -98,19 +101,6 @@ arrow::Result<plan::LogicalPlan> ParseAndBind(std::string_view sql, const plan::
   return bound;
 }
 
-// Drain finishes or discards the whole result before it is exposed. If the new plan runs out of
-// budget (including buffers held by earlier queries), release it and run the original plan once.
-// Other errors, including validation failures and arithmetic overflow, propagate directly.
-template <class Run>
-auto RunWithMemoryFallback(const plan::LogicalPlan& logical, const plan::LogicalPlan& fallback,
-                           Run run) {
-  auto result = run(logical);
-  if (!result.ok() && result.status().IsOutOfMemory() && fallback.root) {
-    return run(fallback);
-  }
-  return result;
-}
-
 }  // namespace
 
 Session::Session(SessionOptions options)
@@ -165,12 +155,15 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
                                                    &result.timings, &fallback));
   const auto t0 = Clock::now();
   result.memory = memory_;
-  exec::ExecContext ctx{.pool = memory_.get(),
-                        .batch_size = options_.batch_size,
-                        .executor = pool_.get(),
-                        .threads = options_.threads,
-                        .budget = memory_.get()};
-  auto run = [&](const plan::LogicalPlan& chosen) -> arrow::Result<std::shared_ptr<arrow::Table>> {
+  auto run =
+      [&](const plan::LogicalPlan& chosen,
+          std::atomic<bool>* ready_probe_used) -> arrow::Result<std::shared_ptr<arrow::Table>> {
+    exec::ExecContext ctx{.pool = memory_.get(),
+                          .batch_size = options_.batch_size,
+                          .executor = pool_.get(),
+                          .threads = options_.threads,
+                          .budget = memory_.get(),
+                          .ready_probe_used = ready_probe_used};
     ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(chosen));
     return exec::Drain(*op, ctx);
   };
@@ -212,14 +205,16 @@ arrow::Result<QueryProfile> Session::ExplainAnalyze(std::string_view sql) {
   profile.threads = options_.threads;
   memory_->ResetPeak();
   const auto t0 = Clock::now();
-  auto run = [&](const plan::LogicalPlan& chosen) -> arrow::Result<int64_t> {
+  auto run = [&](const plan::LogicalPlan& chosen,
+                 std::atomic<bool>* ready_probe_used) -> arrow::Result<int64_t> {
     profile.root = std::make_shared<exec::ProfileNode>();
     ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(chosen, profile.root.get()));
     exec::ExecContext ctx{.pool = memory_.get(),
                           .batch_size = options_.batch_size,
                           .executor = pool_.get(),
                           .threads = options_.threads,
-                          .budget = memory_.get()};
+                          .budget = memory_.get(),
+                          .ready_probe_used = ready_probe_used};
     ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
     return table->num_rows();
   };

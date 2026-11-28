@@ -885,6 +885,27 @@ arrow::Status PartGroupAggregateOperator::Merge() {
   return status;
 }
 
+std::size_t PartGroupAggregateOperator::ReadyBatches(std::size_t limit, int64_t min_rows,
+                                                     int64_t max_rows) const {
+  if (top_n_.has_value()) {
+    return 0;
+  }
+  // Only inspect the current wave of materialized partitions, in Next() order. A small or
+  // oversized batch ends this prefix and remains available to the serial consumer.
+  std::size_t ready = 0;
+  std::size_t chunk = next_chunk_;
+  for (std::size_t p = next_table_; p < built_ && ready < limit; ++p, chunk = 0) {
+    for (; chunk < rows_[p].size() && ready < limit; ++chunk) {
+      const auto rows = rows_[p][chunk]->num_rows();
+      if (rows < min_rows || rows > max_rows) {
+        return ready;
+      }
+      ++ready;
+    }
+  }
+  return ready;
+}
+
 arrow::Result<Batch> PartGroupAggregateOperator::Next() {
   if (!opened_) {
     return arrow::Status::Invalid("part group aggregate: Next() before Open() or after Close()");
