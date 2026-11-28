@@ -732,6 +732,11 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   EXISTS has been unnested, when the set can be evaluated twice and repeated keys make pair testing costly.
   A NULL set member can make `NOT IN` unknown, and an empty set makes it true even for a NULL probe. Names resolve in the
   nearest visible scope before substitution.
+  A plain EXISTS or membership subquery can also take its only input from a derived table or a CTE
+  declared in that subquery. The inner block selects plain columns or literals from one base table and
+  can correlate through column equalities, including `IS NOT DISTINCT FROM`. The enclosing subquery
+  projects columns or literals without its own filter, grouping, ordering or row limit. The correlation
+  key stays available even when it is omitted from the projection, and aliases keep their written scope.
   The inner plan must be safe to evaluate for middle rows whose key no outer row binds. A checked
   expression that could fail on such a row gives exit code 4. This check also covers the rewritten
   membership set, including its filters and eager projections, and sibling predicates over middle and inner rows.
@@ -755,7 +760,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   outer reference is read only in a `WHERE` conjunct of the subquery's own block, an inner join's `ON` included, and
   can reach two blocks out through the middle-block equality above. Other distant references, references in a
   select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or `FULL JOIN`'s `ON`, and references in a
-  derived table or a CTE (a lateral reference) give exit code 4 at the reference, each with its
+  derived table or a CTE outside the single-input projection rule above (a lateral reference) give exit code 4
+  at the reference, each with its
   own message. A star in an `EXISTS` block is checked by name but not expanded (but under an uncorrelated block's
   `DISTINCT`): a `GROUP BY` or `ORDER BY` position there counts its columns, and one that names a column of it is exit
   code 4 (one out of range is a bind error, as in DuckDB);

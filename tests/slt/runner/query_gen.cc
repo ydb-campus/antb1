@@ -3169,6 +3169,30 @@ class Builder {
     }
     Keyword(membership ? "IN" : "EXISTS");
     Symbol("(");
+    // Use the upper quarter of the same draw that reserves the lower quarter for mixed items.
+    // Copy the stream so disabling either projection form preserves the ordinary query.
+    Rng derived_rng = corr_rng_;
+    if (allowed_.Has(Feature::kDerivedCorrelation) && allowed_.Has(Feature::kDerivedTable) &&
+        !derived_rng.Percent(75)) {
+      used_.Add(Feature::kDerivedCorrelation);
+      used_.Add(Feature::kDerivedTable);
+      Keyword("SELECT");
+      Symbol("*");
+      Keyword("FROM");
+      Symbol("(");
+      Keyword("SELECT");
+      InnerColumn(c, *item);
+      Keyword("FROM");
+      used_.Add(Feature::kTableName);
+      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+      Keyword("WHERE");
+      InnerColumn(c, *c.inner_key);
+      static_cast<void>(CorrelatedKeyComparison());
+      OuterColumn(c);
+      Symbol(")");
+      Symbol(")");
+      return;
+    }
     Keyword("SELECT");
     Rng item_rng = corr_rng_;
     // General outer predicates and join residuals may contain checked expressions.
