@@ -1360,7 +1360,7 @@ arrow::Result<MembershipInput> MembershipMaps(const Correlation& correlation, co
 
 // Equality can supply every outer value in a mixed item. Compute it once per set row.
 void HashMixedMembershipItem(const Correlation& correlation, std::span<const JoinKey> keys,
-                             LogicalNodePtr& right, ExprPtr& item) {
+                             ColumnId output, LogicalNodePtr& right, ExprPtr& item) {
   if (item == nullptr || !SidesOf(*item, correlation.outer).both()) {
     return;
   }
@@ -1375,7 +1375,7 @@ void HashMixedMembershipItem(const Correlation& correlation, std::span<const Joi
   if (!SidesOf(*local, correlation.outer).outer) {
     right = Make(ComputeNode{.input = std::move(right),
                              .exprs = {std::move(local)},
-                             .ids = {correlation.join.membership->right.id},
+                             .ids = {output},
                              .span = correlation.join.span});
     item.reset();
   }
@@ -1521,13 +1521,13 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
         .input = std::move(right), .exprs = inner_casts, .ids = inner_cast_ids, .span = join.span});
   }
   LogicalNodePtr pending_outer_safety;
-  if (mixed) {
+  if (mixed && join.membership.has_value()) {
     if (FirstDependentJoin(join.left) != nullptr) {
       pending_outer_safety = join.left;
     } else if (FirstUnsafeInnerNode(join.left, true) != nullptr) {
       return correlation.Refuse("with a mixed projection over a potentially failing outer input");
     }
-    HashMixedMembershipItem(correlation, keys, right, deferred_item);
+    HashMixedMembershipItem(correlation, keys, join.membership->right.id, right, deferred_item);
   }
   // ADR 0026's C2b, C2c and C3: a semi or an anti join may build on its left input, the side it
   // preserves, when the subquery side is decisively larger -- the shape a correlated EXISTS or NOT
