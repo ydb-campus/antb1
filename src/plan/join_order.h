@@ -3,8 +3,10 @@
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "antb1/common/int128.h"
@@ -201,8 +203,17 @@ std::optional<int64_t> ColumnDomain(const Table& table, int field, const ColumnR
 int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRange& range,
                       std::optional<int64_t> domain);
 
-// The rows of a binding: a table's exact row count, a sub-plan's estimate (EstimateRows).
-std::optional<int64_t> RelationRows(const Binding& binding);
+// Reuse footer ranges for a statement's bindings and across one recursive estimate.
+class RowEstimates {
+ public:
+  [[nodiscard]] ColumnRange Range(const std::shared_ptr<Table>& table, int field);
+  [[nodiscard]] std::optional<int64_t> Rows(const Binding& binding);
+  [[nodiscard]] std::optional<int64_t> Rows(const LogicalNode& node);
+
+ private:
+  // Own the table handles so a released table's address cannot be reused as a cache key.
+  std::unordered_map<std::shared_ptr<Table>, std::unordered_map<int, ColumnRange>> ranges_;
+};
 
 // The distinct values a grouping of `columns` over `node` would produce -- the groups a
 // pre-aggregation there would build (docs/adr/0032-aggregate-placement.md's gate). The product of

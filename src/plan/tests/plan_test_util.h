@@ -84,7 +84,9 @@ class FakeTable final : public Table {
                ? std::optional((*parts_)[Narrow<std::size_t>(part)])
                : std::nullopt;
   }
+  [[nodiscard]] int64_t stats_reads() const { return stats_reads_; }
   std::optional<PartStats> part_stats(int64_t part, int field) const override {
+    ++stats_reads_;
     const auto it = stats_.find({part, field});
     return it != stats_.end() ? std::optional(it->second) : std::nullopt;
   }
@@ -110,6 +112,7 @@ class FakeTable final : public Table {
   std::vector<int> float_fields_;
   std::optional<std::vector<int64_t>> parts_;
   std::map<std::pair<int64_t, int>, PartStats> stats_;
+  mutable int64_t stats_reads_ = 0;
   std::map<std::pair<int64_t, int>, int64_t> distinct_counts_;
 };
 

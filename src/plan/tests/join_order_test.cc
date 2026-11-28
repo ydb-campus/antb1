@@ -539,7 +539,7 @@ TEST(JoinOrderTest, KeyDomainsOfExtremeStatistics) {
   EXPECT_EQ(KeyDomain(negative, 0), std::optional<int64_t>(10));
 }
 
-// RelationRows and EstimateRows: a table's exact row count; for a sub-plan, a Scan's table's rows
+// RowEstimates and EstimateRows: a table's exact row count; for a sub-plan, a Scan's table's rows
 // through every single-input node, one row for an ungrouped aggregate and a RowCount, and unknown
 // for a join.
 TEST(JoinOrderTest, RowsOfRelationsAndSubPlans) {
@@ -547,14 +547,14 @@ TEST(JoinOrderTest, RowsOfRelationsAndSubPlans) {
   ColumnIdSource ids;
   const Binding t =
       Binding::OfTable("t", TableSource{.table = table, .table_name = "t", .span = {}}, ids);
-  EXPECT_EQ(RelationRows(t), std::optional<int64_t>(100));
+  EXPECT_EQ(RowEstimates{}.Rows(t), std::optional<int64_t>(100));
   const Binding unknown = Binding::OfTable(
       "u",
       TableSource{.table = std::make_shared<FakeTable>(testing::AllTypesSchema(), std::nullopt),
                   .table_name = "u",
                   .span = {}},
       ids);
-  EXPECT_EQ(RelationRows(unknown), std::nullopt);
+  EXPECT_EQ(RowEstimates{}.Rows(unknown), std::nullopt);
 
   const LogicalNodePtr scan = t.Node();
   const auto node = [](auto n) { return std::make_shared<const LogicalNode>(std::move(n)); };
@@ -587,7 +587,7 @@ TEST(JoinOrderTest, RowsOfRelationsAndSubPlans) {
                          .aggregates = {AggregateCall{.kind = AggKind::kCountStar, .id = count}}});
   const Binding sub = Binding::OfPlan(
       "sub", aggregate, {BindingColumn{.name = "n", .id = count, .type = LogicalType::kBigInt}});
-  EXPECT_EQ(RelationRows(sub), std::optional<int64_t>(1));
+  EXPECT_EQ(RowEstimates{}.Rows(sub), std::optional<int64_t>(1));
 }
 
 // The relation limit's worst cases stay cheap: a chain of 256 relations joins from its largest end,

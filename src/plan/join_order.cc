@@ -549,8 +549,13 @@ class Orderer {
   JoinOrderSearch search_;
 };
 
+std::optional<int64_t> GroupedRows(const GroupAggregateNode& node, std::optional<int64_t> rows,
+                                   RowEstimates& estimates);
+
 // One overload per node type: a node type without one fails to compile.
 struct RowsOf {
+  RowEstimates& estimates;
+
   std::optional<int64_t> operator()(const ScanNode& node) const {
     return node.table->exact_row_count();
   }
@@ -559,7 +564,9 @@ struct RowsOf {
   std::optional<int64_t> operator()(const ComputeNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const ProjectNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const AggregateNode& /*node*/) const { return 1; }
-  std::optional<int64_t> operator()(const GroupAggregateNode& node) const { return Input(node); }
+  std::optional<int64_t> operator()(const GroupAggregateNode& node) const {
+    return GroupedRows(node, Input(node), estimates);
+  }
   std::optional<int64_t> operator()(const SortNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const LimitNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const RowCountNode& /*node*/) const { return 1; }
@@ -574,14 +581,14 @@ struct RowsOf {
   // lopsided it was (ADR 0026). Over-estimating a left input makes ChooseBuildSide flip less
   // readily, which is the safe direction.
   std::optional<int64_t> operator()(const DependentJoinNode& node) const {
-    return EstimateRows(*node.left);
+    return estimates.Rows(*node.left);
   }
   // Its inputs' rows added up, saturated; unknown where any input's is, since an unknown must never
   // read as small.
   std::optional<int64_t> operator()(const UnionAllNode& node) const {
     Int128 rows = 0;
     for (const LogicalNodePtr& input : node.inputs) {
-      const std::optional<int64_t> input_rows = EstimateRows(*input);
+      const std::optional<int64_t> input_rows = estimates.Rows(*input);
       if (!input_rows.has_value()) {
         return std::nullopt;
       }
@@ -601,7 +608,7 @@ struct RowsOf {
     std::vector<std::optional<int64_t>> stack;
     for (const SetTerm& term : node.formula) {
       if (term.kind == SetTermKind::kInput) {
-        stack.push_back(EstimateRows(*node.inputs.at(term.input)));
+        stack.push_back(estimates.Rows(*node.inputs.at(term.input)));
         continue;
       }
       const auto first = stack.end() - static_cast<std::ptrdiff_t>(term.operands);
@@ -648,8 +655,8 @@ struct RowsOf {
   }
 
   template <class Node>
-  static std::optional<int64_t> Input(const Node& node) {
-    return EstimateRows(*node.input);
+  std::optional<int64_t> Input(const Node& node) const {
+    return estimates.Rows(*node.input);
   }
 };
 
@@ -1128,23 +1135,40 @@ int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRang
   return rows;
 }
 
-std::optional<int64_t> RelationRows(const Binding& binding) {
+ColumnRange RowEstimates::Range(const std::shared_ptr<Table>& table, int field) {
+  auto [entry, inserted] = ranges_[table].try_emplace(field);
+  if (inserted) {
+    entry->second = ColumnRangeOf(*table, field);
+  }
+  return entry->second;
+}
+
+std::optional<int64_t> RowEstimates::Rows(const Binding& binding) {
   if (const auto* table = std::get_if<TableSource>(&binding.source())) {
     return table->table->exact_row_count();
   }
-  return EstimateRows(*std::get<PlanSource>(binding.source()).root);
+  return Rows(*std::get<PlanSource>(binding.source()).root);
 }
 
-std::optional<int64_t> EstimateRows(const LogicalNode& node) { return std::visit(RowsOf{}, node); }
+std::optional<int64_t> RowEstimates::Rows(const LogicalNode& node) {
+  return std::visit(RowsOf{.estimates = *this}, node);
+}
+
+std::optional<int64_t> EstimateRows(const LogicalNode& node) { return RowEstimates{}.Rows(node); }
 
 namespace {
+
+using ScanColumns = std::unordered_map<ColumnId, std::pair<const ScanNode*, int>>;
+using RepeatedScans = std::unordered_map<const ScanNode*, bool>;
 
 // Every column a Scan below `node` defines, as its table and field: the only columns whose domain
 // the footers can give. Collected rather than looked up one at a time because one walk answers for
 // every column of a pre-grouping.
-void ScannedColumns(const LogicalNode& node,
-                    std::unordered_map<ColumnId, std::pair<const ScanNode*, int>>& out) {
+void ScannedColumns(const LogicalNode& node, ScanColumns& out, RepeatedScans* repeated = nullptr) {
   if (const auto* scan = std::get_if<ScanNode>(&node)) {
+    if (repeated != nullptr && !repeated->try_emplace(scan, false).second) {
+      repeated->at(scan) = true;
+    }
     for (std::size_t i = 0; i < scan->ids.size() && i < scan->fields.size(); ++i) {
       if (scan->ids[i] != kNoColumnId && scan->table != nullptr) {
         out.emplace(scan->ids[i], std::pair(scan, scan->fields[i]));
@@ -1154,9 +1178,61 @@ void ScannedColumns(const LogicalNode& node,
   }
   for (const LogicalNodePtr& input : InputsOf(node)) {
     if (input != nullptr) {
-      ScannedColumns(*input, out);
+      ScannedColumns(*input, out, repeated);
     }
   }
+  if (repeated == nullptr) {
+    return;
+  }
+  const auto map = [&](std::span<const ColumnId> ids, std::span<const BoundColumn> columns) {
+    for (std::size_t i = 0; i < std::min(ids.size(), columns.size()); ++i) {
+      const auto source = out.find(columns[i].id);
+      if (ids[i] != kNoColumnId && source != out.end()) {
+        out.emplace(ids[i], source->second);
+      }
+    }
+  };
+  if (const auto* project = std::get_if<ProjectNode>(&node)) {
+    map(project->ids, project->columns);
+  } else if (const auto* group = std::get_if<GroupAggregateNode>(&node)) {
+    map(group->key_ids, group->keys);
+  }
+}
+
+std::optional<int64_t> GroupedRows(const GroupAggregateNode& node, std::optional<int64_t> rows,
+                                   RowEstimates& estimates) {
+  if (!rows || *rows <= 1 || node.keys.empty()) {
+    return rows;
+  }
+  ScanColumns scanned;
+  RepeatedScans repeated;
+  ScannedColumns(*node.input, scanned, &repeated);
+
+  std::unordered_map<const ScanNode*, std::set<int>> counted;
+  int64_t groups = 1;
+  for (const BoundColumn& key : node.keys) {
+    const auto source = scanned.find(key.id);
+    if (source == scanned.end()) {
+      return rows;
+    }
+    const auto& [scan, field] = source->second;
+    // Two aliases of the same field from the same scan occurrence have the same value.
+    // A reused scan node can execute independently down different branches.
+    if (!repeated.at(scan) && !counted[scan].insert(field).second) {
+      continue;
+    }
+    const ColumnRange range = estimates.Range(scan->table, field);
+    if (!range.exact) {
+      return rows;
+    }
+    const int64_t non_null = ColumnDomain(*scan->table, field, range).value_or(kLargest);
+    // Allow one NULL group, including NULLs introduced above the scan by an outer join.
+    groups = std::min(*rows, Saturated(Int128{groups} * (Int128{non_null} + 1)));
+    if (groups == *rows) {
+      return rows;
+    }
+  }
+  return groups;
 }
 
 }  // namespace
@@ -1172,7 +1248,7 @@ std::vector<std::optional<int64_t>> EachDistinctValues(const LogicalNode& node,
   if (columns.empty()) {
     return out;
   }
-  std::unordered_map<ColumnId, std::pair<const ScanNode*, int>> scanned;
+  ScanColumns scanned;
   ScannedColumns(node, scanned);  // once, however many columns are asked about
   for (const ColumnId column : columns) {
     if (!sources.empty()) {
