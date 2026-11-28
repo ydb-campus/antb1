@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -2600,6 +2601,37 @@ TEST(OptimizerTest, OuterScalarConditionFiltersOnlyAnEmptyRejectingConsumer) {
   }
 }
 
+TEST(OptimizerTest, RestrictsLargeScalarGroupsOnlyForSelectiveOuterGuards) {
+  auto catalog = MakeCatalog();
+  constexpr int64_t kRows = 8000;
+  auto table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), kRows);
+  table->WithStats(0, 0, {.min = 1, .max = 50, .rows = kRows})
+      .WithStats(0, 1, {.min = 1, .max = kRows, .rows = kRows})
+      .WithStats(0, 3, {.min = 1, .max = 60000, .rows = kRows});
+  ASSERT_TRUE(catalog.Register("r", std::move(table)).ok());
+  for (const auto& [key, guard, restrict] :
+       {std::tuple{"i32", "o.i16 = 1", true},
+        std::tuple{"i32", "o.i16 = 1 AND o.i64 IS NULL", true},
+        std::tuple{"i32", "o.i16 > 0", false}, std::tuple{"i32", "o.u16 = 1", false},
+        std::tuple{"u16", "o.i16 = 1", false}, std::tuple{"i32", "o.i64 = 1", false},
+        std::tuple{"i32", "o.i16 = 1 OR o.i16 = 2", true},
+        std::tuple{"i32", "o.i16 = 1 OR o.i64 IS NULL", false},
+        std::tuple{"i16", "o.i32 = 1", false}}) {
+    SCOPED_TRACE(std::format("key={}, guard={}", key, guard));
+    const auto bound = BindSql(
+        std::format("SELECT (SELECT MAX(i.i64) FROM r i WHERE i.{} = o.{} AND ({})) FROM r o", key,
+                    key, guard),
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimize(*bound);
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    const auto* group = Find<GroupAggregateNode>(plan->root);
+    ASSERT_NE(group, nullptr) << Explain(*plan);
+    EXPECT_EQ(Find<JoinNode>(group->input) != nullptr, restrict) << Explain(*plan);
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt);
+  }
+}
+
 TEST(OptimizerTest, GuardedScalarArgumentsRequireAnExactSetOfEnabledKeys) {
   const auto catalog = MakeCatalog();
   constexpr std::string_view kCount = "SELECT COUNT(*) FROM u WHERE u.i32 = t.i32 AND ";
@@ -2616,11 +2648,18 @@ TEST(OptimizerTest, GuardedScalarArgumentsRequireAnExactSetOfEnabledKeys) {
   CheckScalarRewrite(catalog, std::format("SELECT t.i64 FROM t WHERE {} > 0", kChecked), true);
   CheckScalarRewrite(
       catalog, "SELECT (SELECT AVG(u.dt) FROM u WHERE u.i32 = t.i32 AND t.i16 > 0) FROM t", true);
-  CheckScalarRewrite(
-      catalog,
+  const auto derived = BindSql(
       "SELECT (SELECT MAX(i.v) FROM (SELECT i32 AS k, CAST(i64 AS SMALLINT) AS v FROM u) i "
       "WHERE i.k = t.i32 AND t.i16 > 0) FROM t",
-      false);
+      catalog);
+  ASSERT_TRUE(derived.ok()) << derived.status();
+  const auto refused = Optimize(*derived);
+  ASSERT_FALSE(refused.ok());
+  const auto error = GetSqlError(refused.status());
+  ASSERT_NE(error, nullptr);
+  EXPECT_EQ(error->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_TRUE(refused.status().message().contains(
+      "a correlated scalar subquery with a potentially failing derived input is not supported"));
 }
 
 TEST(OptimizerTest, ComputedScalarKeysRequireSafeSideLocalOperands) {

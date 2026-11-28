@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -85,6 +86,77 @@ TEST(Session, KeylessCountOverEmptyTableFitsTheMemoryBudget) {
                            "(SELECT COUNT(*) FROM promos p WHERE p.pm_id < f.fl_row) = 0");
   ASSERT_TRUE(count.ok()) << count.status().ToString();
   EXPECT_EQ(*count, 7488);
+}
+
+TEST(Session, SelectiveOuterScalarGuardFitsTheMemoryBudget) {
+  auto session = engine::Session::Make({.threads = 1, .memory_limit = 2304 * 1024}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("fleet", {Fixture("star/fleet.parquet")}).ok());
+  const auto count = Count(*session,
+                           "SELECT COUNT(*) FROM fleet f WHERE "
+                           "(SELECT MAX(i.fl_available) FROM fleet i "
+                           "WHERE i.fl_row = f.fl_row AND f.fl_available = 0) IS NULL");
+  ASSERT_TRUE(count.ok()) << count.status();
+  EXPECT_EQ(*count, 7338);  // 7,488 outer rows, of which 150 enable a group.
+}
+
+TEST(Session, OuterEqualityCanDisableEveryCheckedScalarGroup) {
+  auto session = engine::Session::Make({.threads = 1, .memory_limit = 2304 * 1024}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("fleet", {Fixture("star/fleet.parquet")}).ok());
+  const auto count =
+      Count(*session,
+            "SELECT COUNT(*) FROM fleet f WHERE "
+            "(SELECT MAX(CAST(i.fl_model AS SMALLINT)) FROM fleet i WHERE "
+            "i.fl_row = f.fl_row AND f.fl_row = f.fl_model AND f.fl_available >= 0) IS NULL");
+  ASSERT_TRUE(count.ok()) << count.status();
+  EXPECT_EQ(*count, 7488);
+}
+
+TEST(Session, SparseScalarKeyStatisticsKeepTheOrdinaryGroupBuild) {
+  auto session = engine::Session::Make({.threads = 1, .memory_limit = 2304 * 1024}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {Fixture("hits_like.parquet")}).ok());
+  const auto count = Count(*session,
+                           "SELECT COUNT(*) FROM t o WHERE (SELECT MAX(i.UserID) FROM t i "
+                           "WHERE i.CounterID=o.CounterID AND o.ResolutionWidth=1024) IS NULL");
+  ASSERT_TRUE(count.ok()) << count.status();
+  EXPECT_EQ(*count, 8735);  // 1,265 outer rows enable the 40 groups.
+}
+
+TEST(Session, SkewedOuterScalarGuardsFitTheOrdinaryGroupBudget) {
+  auto session = engine::Session::Make({.threads = 1, .memory_limit = 2752 * 1024}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {Fixture("hits_like.parquet")}).ok());
+  for (const auto& [guard, disabled] :
+       {std::pair{"ParamCurrencyID", 506}, std::pair{"HTTPError", 489}}) {
+    SCOPED_TRACE(guard);
+    // Both guards enable over 9,400 of 10,000 rows. For HTTPError the min/max range
+    // predicts fewer than 20, so only the runtime bound keeps this build small.
+    const auto count = Count(
+        *session, std::format("SELECT COUNT(*) FROM t o WHERE (SELECT MAX(i.CounterID) FROM t i "
+                              "WHERE i.SendTiming=o.SendTiming AND o.{}=0) IS NULL",
+                              guard));
+    ASSERT_TRUE(count.ok()) << count.status();
+    EXPECT_EQ(*count, disabled);
+  }
+}
+
+TEST(Session, SelectiveScalarGroupPrefilterPreservesNullEqualBindings) {
+  auto session = NewSession();
+  ASSERT_NE(session, nullptr);
+  ASSERT_TRUE(session->RegisterParquet("edge", {Fixture("edge.parquet")}).ok());
+  ASSERT_TRUE(
+      session
+          ->RegisterParquet("t", {Fixture("hits_like_nulls.parquet"), Fixture("hits_like.parquet")})
+          .ok());
+  for (const auto& [comparison, empty] :
+       {std::pair{"IS NOT DISTINCT FROM", 11}, std::pair{"=", 12}}) {
+    SCOPED_TRACE(comparison);
+    // Row 5 enables only the NULL key. The other eleven outer rows see an empty group.
+    const auto count = Count(
+        *session, std::format("SELECT COUNT(*) FROM edge o WHERE (SELECT COUNT(*) FROM t i WHERE "
+                              "i.SendTiming {} o.i32 AND o.id=5) = 0",
+                              comparison));
+    ASSERT_TRUE(count.ok()) << count.status();
+    EXPECT_EQ(*count, empty);
+  }
 }
 
 TEST(Session, ComputedScalarKeyOverAnEmptyOuterTableFitsTheMemoryBudget) {

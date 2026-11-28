@@ -634,7 +634,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   every correlation key (see D39 for unprobed bindings). If precomputing a key or grouping unbound rows
   could still introduce an evaluation error, the rewrite declines (exit 4 when no existing rule applies).
   A scalar aggregate can lift a separate `WHERE` conjunct that tests only the enclosing row
-  when inner equality keys represent every remaining enclosing reference. A residual that
+  when inner equality keys represent every remaining enclosing reference. A chain of ordinary
+  `=` predicates can connect two enclosing columns to the same inner key. A residual that
   also needs the distinct-binding domain described below falls outside this rule.
   A false or NULL test gives that row the aggregate over empty input, including zero for `COUNT`.
   Rows with the same key can therefore receive different values. A consumer that rejects the empty

@@ -171,7 +171,7 @@ bool RestrictionIsWorth(const std::optional<int64_t>& outer, const std::optional
 // A join or set operation blocks D5. A computed key also has no scan column to filter,
 // but for a small input the extra hash build can cost more than grouping the whole input.
 // At 3,000 rows with 101 groups it cost 20%; at 4,096 distinct rows it already saved 15%.
-constexpr int64_t kMinComputedKeyRows = 4096;
+constexpr int64_t kMinRestrictionRows = 4096;
 
 bool NeedsKeyRestriction(const LogicalNodePtr& node, ColumnId key) {
   if (node == nullptr) {
@@ -183,7 +183,7 @@ bool NeedsKeyRestriction(const LogicalNodePtr& node, ColumnId key) {
   }
   if (const auto* compute = std::get_if<ComputeNode>(node.get());
       compute != nullptr && std::ranges::contains(compute->ids, key) &&
-      EstimateRows(*compute->input).value_or(0) >= kMinComputedKeyRows) {
+      EstimateRows(*compute->input).value_or(0) >= kMinRestrictionRows) {
     return true;
   }
   if (const auto* project = std::get_if<ProjectNode>(node.get())) {
@@ -1660,7 +1660,8 @@ arrow::Result<Representatives> ScalarDomain(const Correlation& correlation, cons
 // from the distinct bindings attached to its input.
 arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation, const Spine& spine,
                                                  Equivalences& equivalences,
-                                                 LogicalNodePtr* domain_input = nullptr) {
+                                                 LogicalNodePtr* domain_input = nullptr,
+                                                 Equivalences* enabled = nullptr) {
   const std::vector<ColumnId> inner_ids = OutputIds(*spine.below);
   const std::set<ColumnId> inner(inner_ids.begin(), inner_ids.end());
   Representatives out;
@@ -1684,6 +1685,16 @@ arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation,
         found = used->inner;
         out.null_equal.insert(id);
         out.used_links.insert(used);
+      }
+    }
+    // The lifted guard still enforces its outer equalities on every row that reads a group.
+    // Use that original class only for a surviving reference without a direct representative.
+    if (found == kNoColumnId && enabled != nullptr) {
+      const auto member = std::ranges::find_if(
+          inner_ids, [&](ColumnId candidate) { return enabled->classes.Same(id, candidate); });
+      if (member != inner_ids.end()) {
+        found = *member;
+        equivalences.described.try_emplace(id, enabled->described.at(id));
       }
     }
     if (found == kNoColumnId) {
@@ -1745,13 +1756,160 @@ LogicalNodePtr FilterScalarBindings(LogicalNodePtr input, const ExprPtr& conditi
                          .span = span});
 }
 
+// A range wider than the population can contain mostly gaps and one very frequent value.
+// Its width is not evidence for adding an extra hash build. Prefer a recorded distinct count
+// in that case, keeping the existing plan when the footer has none.
+std::optional<int64_t> CompactDomain(const Table& table, int field, const ColumnRange& range) {
+  if (range.exact && range.min && range.max) {
+    Int128 width = 0;
+    if (!__builtin_sub_overflow(*range.max, *range.min, &width) && width < range.non_null) {
+      return ColumnDomain(table, field, range);
+    }
+  }
+  return ColumnDomain(table, field, ColumnRange{});
+}
+
+// Estimate a simple guard on the outer scan using the join planner's footer statistics.
+// For AND, each conjunct bounds the result on its own; do not assume they are independent.
+int64_t EnabledScanRows(const Expr& condition, const ScanNode& scan, int64_t rows) {
+  if (const auto* both = std::get_if<BoolExpr>(&condition.node);
+      both != nullptr && both->op == BoolOp::kAnd) {
+    int64_t kept = rows;
+    for (const ExprPtr& arg : both->args) {
+      kept = std::min(kept, EnabledScanRows(*arg, scan, rows));
+    }
+    return kept;
+  }
+  const auto* test = std::get_if<PredicateExpr>(&condition.node);
+  if (test == nullptr || test->operands.size() != 1) {
+    return rows;
+  }
+  const auto* column = std::get_if<ColumnExpr>(&test->operands.front()->node);
+  if (column == nullptr) {
+    return rows;
+  }
+  const auto at = std::ranges::find(scan.ids, column->id);
+  if (at == scan.ids.end()) {
+    return rows;
+  }
+  const int field = scan.fields.at(Narrow<std::size_t>(at - scan.ids.begin()));
+  const ColumnRange range = ColumnRangeOf(*scan.table, field);
+  if (test->predicate.kind == Predicate::Kind::kIsNull ||
+      test->predicate.kind == Predicate::Kind::kIsNotNull) {
+    return range.exact ? PredicateRows(rows, test->predicate, range, std::nullopt) : rows;
+  }
+  const auto domain = CompactDomain(*scan.table, field, range);
+  return domain.has_value() ? PredicateRows(rows, test->predicate, range, domain) : rows;
+}
+
+// Limit the speculative read and the membership table to a few hundred bindings. This
+// prefilter only earns its extra scan when the guard is expected to fit in that set.
+constexpr int64_t kMaxPrefilterRows = 512;
+
+// LEFT must preserve disabled rows, but their keys need no aggregate. Re-read a plain scan
+// only when it is no larger than the input and the expected enabled rows are few relative
+// to the groups. An enabled row can request at most one group, even with duplicate keys.
+bool RestrictSelectiveBindings(const LogicalNodePtr& outer, const Expr& condition,
+                               const LogicalNodePtr& inner, std::span<const ColumnId> keys) {
+  const auto* scan = std::get_if<ScanNode>(outer.get());
+  const auto* grouped_scan = std::get_if<ScanNode>(inner.get());
+  if (scan == nullptr || grouped_scan == nullptr || keys.size() != 1) {
+    return false;
+  }
+  const auto rows = scan->table->exact_row_count();
+  const int64_t inner_rows = EstimateRows(*inner).value_or(0);
+  if (!rows.has_value() || *rows <= 0 || *rows > inner_rows || inner_rows < kMinRestrictionRows) {
+    return false;
+  }
+  const int64_t enabled = EnabledScanRows(condition, *scan, *rows);
+  if (enabled >= *rows || enabled > kMaxPrefilterRows) {
+    return false;
+  }
+  const auto key = std::ranges::find(grouped_scan->ids, keys.front());
+  if (key == grouped_scan->ids.end()) {
+    return false;
+  }
+  const int field = grouped_scan->fields.at(Narrow<std::size_t>(key - grouped_scan->ids.begin()));
+  const auto groups =
+      CompactDomain(*grouped_scan->table, field, ColumnRangeOf(*grouped_scan->table, field));
+  return groups.value_or(0) >= kMinRestrictionRows;
+}
+
+// A bounded set is enough for an optional prefilter. Above the limit a NULL in the
+// membership set makes every nonmatch UNKNOWN, so the probe keeps every row. Exclude real NULL
+// keys from the set and retain the NULL group separately for a NULL-equal correlation. The
+// outer join and guard still decide the answer.
+// A checked aggregate must never use this prefilter: it needs the exact set of enabled keys.
+LogicalNodePtr PrefilterScalarGroups(const Correlation& correlation, const LogicalNodePtr& input,
+                                     const LogicalNodePtr& domain, JoinKey key) {
+  const auto fresh = [&correlation] {
+    correlation.last_id = ColumnId{std::to_underlying(correlation.last_id) + 1};
+    return correlation.last_id;
+  };
+  const SourceSpan span = correlation.join.span;
+  auto non_null =
+      Make(FilterNode{.input = domain,
+                      .predicates = {{.kind = Predicate::Kind::kIsNotNull, .column = key.right}},
+                      .span = span});
+  auto limited =
+      Make(LimitNode{.input = std::move(non_null), .limit = kMaxPrefilterRows + 1, .span = span});
+  const BoundColumn rows{.id = fresh(), .name = "enabled_rows", .type = LogicalType::kBigInt};
+  auto counted = Make(WindowNode{.input = std::move(limited),
+                                 .calls = {WindowCall{.frame = WindowCall::Frame::kWholePartition,
+                                                      .name = rows.name,
+                                                      .id = rows.id,
+                                                      .span = span,
+                                                      .over_span = span}},
+                                 .span = span});
+  const auto small = std::make_shared<const Expr>(Expr{
+      .node =
+          PredicateExpr{
+              .predicate = Predicate{.kind = Predicate::Kind::kCompare,
+                                     .column = BoundColumn{.name = rows.name, .type = rows.type},
+                                     .op = CompareOp::kLe,
+                                     .constant = Constant{.type = rows.type,
+                                                          .value = Int128{kMaxPrefilterRows}}},
+              .operands = {ColumnValue(rows)}},
+      .type = LogicalType::kBoolean,
+      .name = "small enabled set"});
+  auto bounded = std::make_shared<const Expr>(Expr{
+      .node = CaseExpr{.whens = {small}, .thens = {ColumnValue(key.right)}, .otherwise = nullptr},
+      .type = key.right.type,
+      .name = "enabled key"});
+  const auto null_group = key.null_equal ? IsNullValue(key.left) : nullptr;
+  key.right.id = fresh();
+  key.null_equal = false;
+  auto build = Make(ComputeNode{.input = std::move(counted),
+                                .exprs = {std::move(bounded)},
+                                .ids = {key.right.id},
+                                .span = span});
+  const BoundColumn mark{
+      .id = fresh(), .name = "enabled key membership", .type = LogicalType::kBoolean};
+  auto marked = Make(JoinNode{.kind = JoinKind::kNullAwareMark,
+                              .left = input,
+                              .right = std::move(build),
+                              .keys = {std::move(key)},
+                              .mark = mark.id,
+                              .span = span});
+  std::vector<ExprPtr> possible{ColumnValue(mark), IsNullValue(mark)};
+  if (null_group != nullptr) {
+    possible.push_back(null_group);
+  }
+  auto keep = std::make_shared<const Expr>(
+      Expr{.node = BoolExpr{.op = BoolOp::kOr, .args = std::move(possible)},
+           .type = LogicalType::kBoolean,
+           .name = "possibly enabled"});
+  return FilterScalarBindings(std::move(marked), keep, correlation.last_id, span);
+}
+
 // Evaluate error-prone maps only for actual bindings.
 arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlation,
                                                    const LogicalNodePtr& input,
                                                    const std::map<ColumnId, BoundColumn>& carried,
                                                    const Representatives& representatives,
                                                    const Equivalences& equivalences,
-                                                   const ExprPtr& condition = nullptr) {
+                                                   const ExprPtr& condition = nullptr,
+                                                   bool prefilter_only = false) {
   LogicalNodePtr outer = correlation.join.left;
   if (Traits(correlation.join.kind).single_match || correlation.mode == Mode::kValue) {
     std::set<ColumnId> bindings;
@@ -1782,6 +1940,9 @@ arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlatio
     keys.push_back(JoinKey{.left = inner,
                            .right = domain.Rename(equivalences.described.at(id)),
                            .null_equal = representatives.null_equal.contains(id)});
+  }
+  if (prefilter_only) {
+    return PrefilterScalarGroups(correlation, input, domain.node, keys.front());
   }
   const auto estimate = EstimateRows(*input);
   return Make(JoinNode{.kind = JoinKind::kSemi,
@@ -1916,7 +2077,7 @@ arrow::Result<LogicalNodePtr> GuardDerivedProjection(const Correlation& correlat
     }
     node = compute->input;
   }
-  return correlation.Refuse("with a computed key and a potentially failing derived input");
+  return correlation.Refuse("with a potentially failing derived input");
 }
 
 ExprPtr SubstituteBindings(const ExprPtr& expr, const std::map<ColumnId, BoundColumn>& carried) {
@@ -2020,7 +2181,8 @@ std::string NameOfCall(const AggregateCall& call, const Spine& spine) {
 
 arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& spine,
                                    bool computed_keys = false,
-                                   const ExprPtr& outer_condition = nullptr);
+                                   const ExprPtr& outer_condition = nullptr,
+                                   Equivalences* enabled = nullptr);
 
 // Repeated keys on one side share their computed column.
 ExprPtr ScalarKeyColumn(const ExprPtr& value, ComputeNode& keys, ColumnId& last_id) {
@@ -2107,6 +2269,7 @@ ExprPtr NormalizeScalarKey(const ExprPtr& expr, bool computed_pass, const Correl
 // type. Once key normalization is exhausted, lift safe outer-only conjuncts and retry substitution.
 arrow::Result<Rewritten> NormalizeScalarCorrelation(const Correlation& correlation, Spine spine,
                                                     const arrow::Status& missing_representative,
+                                                    Equivalences& equivalences,
                                                     bool computed_keys) {
   const auto inner_ids = OutputIds(*spine.below);
   DependentJoinNode join = correlation.join;
@@ -2196,7 +2359,8 @@ arrow::Result<Rewritten> NormalizeScalarCorrelation(const Correlation& correlati
                             .above = correlation.above,
                             .report = correlation.report};
   // Each retry either normalizes an equality or removes the outer conditions in one pass.
-  return ValueJoin(widened, spine, computed_keys, outer_condition);
+  return ValueJoin(widened, spine, computed_keys, outer_condition,
+                   outer_condition != nullptr ? &equivalences : nullptr);
 }
 
 // Even a NULL select item can have an operand that raises on the empty aggregate values.
@@ -2237,7 +2401,8 @@ bool CanSkipEmptyScalarItem(const Step& step) {
 //         Filter t.k = o.k                     GroupAggregate keys t.k  n' := count(*)
 //           Scan t                               Scan t
 arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& spine,
-                                   bool computed_keys, const ExprPtr& outer_condition) {
+                                   bool computed_keys, const ExprPtr& outer_condition,
+                                   Equivalences* enabled) {
   const DependentJoinNode& join = correlation.join;
   ColumnId& last_id = correlation.last_id;
   std::map<ColumnId, EmptyValue> values;
@@ -2246,9 +2411,10 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   LogicalNodePtr right = spine.below;
   const bool try_domain = correlation.mode == Mode::kValue && outer_condition == nullptr;
   auto resolved =
-      RepresentativesOf(correlation, spine, equivalences, try_domain ? &right : nullptr);
+      RepresentativesOf(correlation, spine, equivalences, try_domain ? &right : nullptr, enabled);
   if (!resolved.ok() && try_domain) {
-    return NormalizeScalarCorrelation(correlation, spine, resolved.status(), computed_keys);
+    return NormalizeScalarCorrelation(correlation, spine, resolved.status(), equivalences,
+                                      computed_keys);
   }
   ARROW_ASSIGN_OR_RAISE(const Representatives representatives, std::move(resolved));
   const bool has_domain = right != spine.below;
@@ -2400,14 +2566,16 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
           (computed_keys || guarded) ? FirstUnsafeInnerNode(spine.below, guarded) : nullptr) {
     if (guarded || empty_outer || has_domain || !equivalences.kept.empty() ||
         !ConsumesAllBindings(correlation.above)) {
-      return correlation.Refuse("with a computed key and a potentially failing derived input");
+      return correlation.Refuse("with a potentially failing derived input");
     }
     ARROW_ASSIGN_OR_RAISE(
         right, GuardDerivedProjection(correlation, right, unsafe, representatives, equivalences));
     restricted = true;
   }
-  if (needs_enabled_keys) {
-    if (!ConsumesAllBindings(correlation.above, OutputIds(*join.right))) {
+  const bool prefilter = !needs_enabled_keys && guarded && join_back == JoinBack::kLeft &&
+                         RestrictSelectiveBindings(join.left, *outer_condition, right, group);
+  if (needs_enabled_keys || prefilter) {
+    if (needs_enabled_keys && !ConsumesAllBindings(correlation.above, OutputIds(*join.right))) {
       return correlation.Refuse("whose checked aggregate needs every enabled binding");
     }
     std::map<ColumnId, BoundColumn> carried;
@@ -2415,8 +2583,8 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
       carried.emplace(outer, described.at(inner));
     }
     ARROW_ASSIGN_OR_RAISE(right, RestrictBindingInput(correlation, right, carried, representatives,
-                                                      equivalences, outer_condition));
-    restricted = true;
+                                                      equivalences, outer_condition, prefilter));
+    restricted |= needs_enabled_keys;
   }
   if (Traits(join.kind).single_match &&
       std::ranges::any_of(equivalences.kept,
@@ -2467,7 +2635,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
       }
       case Role::kStatic: {
         GroupAggregateNode node = grouped;  // the one static step
-        node.input = restricted
+        node.input = (restricted || prefilter)
                          ? std::move(right)
                          : RestrictToTheOuterKeys(std::move(right), join, equivalent,
                                                   representatives.null_equal, described, join_back,

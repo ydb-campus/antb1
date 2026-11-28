@@ -1650,6 +1650,36 @@ ORDER BY 1
 INTEGER
 2
 
+# fl_zone gets its inner representative from the outer equality. The independent guard lifts.
+query I nosort
+SELECT COUNT(*) FROM fleet f WHERE
+  (SELECT COUNT(*) FROM fleet i WHERE i.fl_model = f.fl_model AND f.fl_model = f.fl_zone
+   AND i.fl_available >= f.fl_zone AND f.fl_available = 0) > 0
+----
+BIGINT
+10
+
+# The separate equality between two enclosing columns can itself lift when neither supplies a key.
+query I nosort
+SELECT COUNT(*) FROM fleet f WHERE
+  (SELECT COUNT(*) FROM fleet i WHERE i.fl_row = f.fl_row AND f.fl_model = f.fl_zone) > 0
+----
+BIGINT
+312
+
+# SUM of these two stored decimals exceeds 38 digits only when their group is enabled.
+query I nosort
+SELECT COUNT(*) FROM edge o WHERE
+  (SELECT SUM(i.d38_0) FROM decimals i WHERE i.id IN (7, 8) AND i.id // 10 = o.id
+   AND o.i32 = 0) IS NULL
+----
+BIGINT
+12
+
+statement error [Oo]verflow
+SELECT o.id, (SELECT SUM(i.d38_0) FROM decimals i WHERE i.id IN (7, 8) AND i.id // 10 = o.id
+              AND o.i32 < 0) FROM edge o ORDER BY o.id
+
 # A keyless SQ9 aggregate returns zero for a binding with no passing row.
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city > c.ct_id) = 0 ORDER BY 1
