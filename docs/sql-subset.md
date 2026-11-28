@@ -633,6 +633,16 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   checked expression can run after a semi join on the actual outer bindings when its input already carries
   every correlation key (see D39 for unprobed bindings). If precomputing a key or grouping unbound rows
   could still introduce an evaluation error, the rewrite declines (exit 4 when no existing rule applies).
+  A scalar aggregate can lift a separate `WHERE` conjunct that tests only the enclosing row
+  when inner equality keys represent every remaining enclosing reference. A chain of ordinary
+  `=` predicates can connect two enclosing columns to the same inner key. A residual that
+  also needs the distinct-binding domain described below falls outside this rule.
+  A false or NULL test gives that row the aggregate over empty input, including zero for `COUNT`.
+  Rows with the same key can therefore receive different values. A consumer that rejects the empty
+  value (such as `COUNT(*) > 0`) can filter the enclosing rows first. Otherwise the empty aggregate
+  values are selected before evaluating the scalar select list and `HAVING`. The lifted test must
+  be safe to evaluate on the enclosing input. Checked aggregate arguments require an exact set of
+  enabled keys; when the planner cannot safely obtain it, the rewrite declines.
   A scalar aggregate can also correlate through inequalities and through AND, OR or NOT over comparisons
   between plain inner and enclosing columns of the same hashable type. SQ9 groups the distinct tuples of
   enclosing values. A top-level equality conjunct (`=` or `IS NOT DISTINCT FROM`) supplies a hash key.

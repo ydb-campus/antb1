@@ -3363,6 +3363,26 @@ class Builder {
         Symbol(",");
         InnerColumn(c, *arg);
       }
+    } else if (!keyless && !used_.Has(Feature::kKeyedDomainAggregate) &&
+               allowed_.Contains({Feature::kScalarOuterCondition, Feature::kWhereAnd})) {
+      Rng predicate_rng = corr_rng_;
+      auto columns = BranchColumns(c);
+      std::erase(columns, c.outer_key);
+      if (!columns.empty() && predicate_rng.Percent(45)) {
+        const GenColumn& column = *predicate_rng.Pick(columns);
+        used_.Add({Feature::kScalarOuterCondition, Feature::kWhereAnd});
+        Keyword("AND");
+        OuterValue(c, column);
+        const Literal bound = MakeLiteral(predicate_rng, column);
+        if (allowed_.Contains(bound.features)) {
+          used_.Add(bound.features);
+          Symbol(predicate_rng.Pick(kOps));
+          Emit(bound.tokens);
+        } else {
+          Keyword("IS");
+          Keyword("NULL");
+        }
+      }
     }
     Symbol(")");
     if (!literal_first) {
