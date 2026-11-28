@@ -4258,6 +4258,35 @@ KeySet KeyNames(const JoinNode& join) {
   return out;
 }
 
+TEST(BinderTest, JoinBuildUsesTheDomainOfARegroupedKey) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("product", arrow::int64())});
+  auto detail = std::make_shared<FakeTable>(schema, 100'000);
+  detail->WithStats(0, 0, PartStats{.min = 1, .max = 10, .null_count = 5, .rows = 100'000})
+      .WithStats(0, 1, PartStats{.min = 1, .max = 1000, .null_count = 0, .rows = 100'000});
+  Catalog catalog;
+  ASSERT_TRUE(catalog.Register("events", detail).ok());
+  ASSERT_TRUE(catalog.Register("lookup", std::make_shared<FakeTable>(schema, 1000)).ok());
+
+  auto plan = BindSql(
+      "SELECT lookup.product, summary.total "
+      "FROM lookup JOIN ("
+      "  SELECT bucket, SUM(n) AS total FROM ("
+      "    SELECT k AS bucket, COUNT(*) AS n FROM events GROUP BY k, product"
+      "  ) AS detail GROUP BY bucket"
+      ") AS summary ON lookup.k = summary.bucket",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  const auto* join = std::get_if<JoinNode>(&Nth(*plan, 1));
+  ASSERT_NE(join, nullptr) << Explain(*plan);
+  const auto& build = join->build == BuildSide::kLeft ? join->left : join->right;
+  EXPECT_EQ(EstimateRows(*build), 11);
+
+  const auto computed = BindSql("SELECT k + 1, COUNT(*) FROM events GROUP BY 1", catalog);
+  ASSERT_TRUE(computed.ok()) << computed.status();
+  EXPECT_EQ(EstimateRows(*computed->root), 100'000);
+}
+
 TEST(BinderTest, JoinsTheSmallEndpointsThroughAnImpliedKey) {
   Catalog catalog;
   const auto schema = arrow::schema({arrow::field("k", arrow::int64())});

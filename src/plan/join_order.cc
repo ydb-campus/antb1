@@ -549,6 +549,8 @@ class Orderer {
   JoinOrderSearch search_;
 };
 
+std::optional<int64_t> GroupedRows(const GroupAggregateNode& node, std::optional<int64_t> rows);
+
 // One overload per node type: a node type without one fails to compile.
 struct RowsOf {
   std::optional<int64_t> operator()(const ScanNode& node) const {
@@ -559,7 +561,9 @@ struct RowsOf {
   std::optional<int64_t> operator()(const ComputeNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const ProjectNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const AggregateNode& /*node*/) const { return 1; }
-  std::optional<int64_t> operator()(const GroupAggregateNode& node) const { return Input(node); }
+  std::optional<int64_t> operator()(const GroupAggregateNode& node) const {
+    return GroupedRows(node, Input(node));
+  }
   std::optional<int64_t> operator()(const SortNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const LimitNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const RowCountNode& /*node*/) const { return 1; }
@@ -1139,11 +1143,12 @@ std::optional<int64_t> EstimateRows(const LogicalNode& node) { return std::visit
 
 namespace {
 
+using ScanColumns = std::unordered_map<ColumnId, std::pair<const ScanNode*, int>>;
+
 // Every column a Scan below `node` defines, as its table and field: the only columns whose domain
 // the footers can give. Collected rather than looked up one at a time because one walk answers for
 // every column of a pre-grouping.
-void ScannedColumns(const LogicalNode& node,
-                    std::unordered_map<ColumnId, std::pair<const ScanNode*, int>>& out) {
+void ScannedColumns(const LogicalNode& node, ScanColumns& out, bool follow_aliases = false) {
   if (const auto* scan = std::get_if<ScanNode>(&node)) {
     for (std::size_t i = 0; i < scan->ids.size() && i < scan->fields.size(); ++i) {
       if (scan->ids[i] != kNoColumnId && scan->table != nullptr) {
@@ -1154,9 +1159,53 @@ void ScannedColumns(const LogicalNode& node,
   }
   for (const LogicalNodePtr& input : InputsOf(node)) {
     if (input != nullptr) {
-      ScannedColumns(*input, out);
+      ScannedColumns(*input, out, follow_aliases);
     }
   }
+  if (!follow_aliases) {
+    return;
+  }
+  const auto map = [&](std::span<const ColumnId> ids, std::span<const BoundColumn> columns) {
+    for (std::size_t i = 0; i < std::min(ids.size(), columns.size()); ++i) {
+      const auto source = out.find(columns[i].id);
+      if (ids[i] != kNoColumnId && source != out.end()) {
+        out.emplace(ids[i], source->second);
+      }
+    }
+  };
+  if (const auto* project = std::get_if<ProjectNode>(&node)) {
+    map(project->ids, project->columns);
+  } else if (const auto* group = std::get_if<GroupAggregateNode>(&node)) {
+    map(group->key_ids, group->keys);
+  }
+}
+
+std::optional<int64_t> GroupedRows(const GroupAggregateNode& node, std::optional<int64_t> rows) {
+  if (!rows || *rows <= 1 || node.keys.empty()) {
+    return rows;
+  }
+  ScanColumns scanned;
+  ScannedColumns(*node.input, scanned, /*follow_aliases=*/true);
+
+  int64_t groups = 1;
+  for (const BoundColumn& key : node.keys) {
+    const auto source = scanned.find(key.id);
+    if (source == scanned.end()) {
+      return rows;
+    }
+    const auto& [scan, field] = source->second;
+    const ColumnRange range = ColumnRangeOf(*scan->table, field);
+    if (!range.exact) {
+      return rows;
+    }
+    const int64_t non_null = ColumnDomain(*scan->table, field, range).value_or(kLargest);
+    // Allow one NULL group, including NULLs introduced above the scan by an outer join.
+    groups = std::min(*rows, Saturated(Int128{groups} * (Int128{non_null} + 1)));
+    if (groups == *rows) {
+      return rows;
+    }
+  }
+  return groups;
 }
 
 }  // namespace
@@ -1172,7 +1221,7 @@ std::vector<std::optional<int64_t>> EachDistinctValues(const LogicalNode& node,
   if (columns.empty()) {
     return out;
   }
-  std::unordered_map<ColumnId, std::pair<const ScanNode*, int>> scanned;
+  ScanColumns scanned;
   ScannedColumns(node, scanned);  // once, however many columns are asked about
   for (const ColumnId column : columns) {
     if (!sources.empty()) {
