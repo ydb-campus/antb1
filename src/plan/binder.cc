@@ -3215,14 +3215,15 @@ class Binder {
     Binder& binder;
 
     arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
-      auto resolved = binder.Resolve(ref);
+      std::string name = RefName(ref);
+      auto resolved = binder.Resolve(ref, &name);
       if (!resolved.ok() && binder.shape_ == Shape::kProjection) {
         if (auto alias = binder.AliasFallback(ref, resolved.status())) {
           return *std::move(alias);
         }
       }
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, std::move(resolved));
-      return ColumnLeaf(column.id, column.type, RefName(ref),
+      return ColumnLeaf(column.id, column.type, std::move(name),
                         binder.scope_.StoredAsFloat(column.id));
     }
     arrow::Result<Typed> operator()(const sql::Literal& lit) const { return LiteralOperand(lit); }
@@ -4273,7 +4274,8 @@ class Binder {
   // Rule 9 is applied here rather than in the scope, after the select-list aliases: an inner
   // block's `GROUP BY <alias>` whose alias happens to name a column of an enclosing block is the
   // alias, not a correlation, and whether it resolves must not depend on the FROM order.
-  [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const {
+  [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref,
+                                                   std::string* expr_name = nullptr) const {
     auto resolved = scope_.Resolve(ref, visible_);
     if (resolved.ok() || (ref.qualifier.empty() && FindAlias(select_, ref.name).has_value())) {
       return resolved;
@@ -4309,6 +4311,9 @@ class Binder {
         ARROW_ASSIGN_OR_RAISE(const auto column, outer->scope->Resolve(ref, outer->visible));
         if (auto key = exists_->middle->MiddleEqualityKey(column.id)) {
           exists_->used_middle_key = true;
+          if (expr_name != nullptr) {
+            *expr_name = ArgumentName(key->qualifier) + "." + ArgumentName(key->name);
+          }
           return *key;
         }
       }
@@ -6795,8 +6800,9 @@ std::optional<BoundColumn> Binder::MiddleEqualityKey(ColumnId outer) const {
       }
       classes.Merge(left->id, right->id);
       for (const BoundColumn* column : {&*left, &*right}) {
-        if (scope_.Find(column->id)) {
+        if (const auto location = scope_.Find(column->id)) {
           local.push_back(*column);
+          local.back().qualifier = scope_.bindings()[location->binding].name();
         } else {
           enclosing.push_back(column->id);
         }

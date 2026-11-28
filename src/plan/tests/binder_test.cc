@@ -9460,6 +9460,25 @@ TEST(BinderTest, MiddleEqualityProducesClosedNestedSemiAndAntiJoins) {
   }
 }
 
+TEST(BinderTest, MiddleEqualityExplainsTheKeyAvailableToTheInnerJoin) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&](std::string_view key) -> arrow::Result<LogicalPlan> {
+    ARROW_ASSIGN_OR_RAISE(
+        auto bound,
+        BindSql(
+            std::format("SELECT o.i16 FROM t o WHERE EXISTS (SELECT 1 FROM u m WHERE m.i16 = o.i16 "
+                        "AND EXISTS (SELECT 1 FROM ok i WHERE i.i16 = {}))",
+                        key),
+            catalog));
+    return Optimize(bound);
+  };
+  const auto distant = optimized("o.i16");
+  const auto direct = optimized("m.i16");
+  ASSERT_TRUE(distant.ok()) << distant.status();
+  ASSERT_TRUE(direct.ok()) << direct.status();
+  EXPECT_EQ(Explain(*distant), Explain(*direct));
+}
+
 TEST(BinderTest, MiddleEqualityRequiresAnOrdinaryUnconditionalSameTypeKey) {
   const Catalog catalog = MakeCatalog();
   for (const auto& [proof, inner] : std::vector<std::pair<std::string_view, std::string_view>>{
