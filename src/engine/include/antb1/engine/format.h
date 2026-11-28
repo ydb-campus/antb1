@@ -29,10 +29,13 @@ enum class ProfileFormat { kText, kJson };
 
 // Renders a query profile (`antb1 explain --analyze`, docs/adr/0015-query-profiles.md). kText: the
 // "Output:" line, a "Total:" line (time, rows, peak memory, threads), then one line per physical
-// operator, root first, each input indented by two more spaces, as EXPLAIN: its name, its logical
-// node's EXPLAIN text, and in brackets its rows, time (and self time when its inputs ran on the
-// same thread), runs (per part) and metrics. kJson: the same as one object, times in
-// nanoseconds, memory in bytes.
+// operator, root first, linked as EXPLAIN links a logical plan (`├─` / `└─`, with `│ ` under an
+// earlier input). Each line is the operator's name, its logical node's EXPLAIN text, and in
+// brackets its rows, time (and self time when its inputs ran on the same thread), runs (per part)
+// and metrics. A HashBuild is drawn under its HashJoin, before the probe when the join builds on
+// the left and after it when the join builds on the right. kJson: the same operators
+// as one object, times in nanoseconds, memory in bytes, with each HashBuild left on the operator
+// that prepares it.
 std::string FormatProfile(const QueryProfile& profile, ProfileFormat format);
 
 // Renders a physical plan nobody ran (`antb1 explain --physical`, Session::ExplainPhysical): the

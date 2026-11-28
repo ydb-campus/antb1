@@ -6,6 +6,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "antb1/engine/format.h"
@@ -107,39 +108,155 @@ std::string_view DetailText(const exec::ProfileNode& node) {
   return detail;
 }
 
+// The text tree. A part pipeline prepares each HashBuild on the consumer, as a later child of that
+// operator, while the HashJoin it belongs to sits inside the pipeline. The drawing moves that
+// HashBuild under its HashJoin, and places it before the probe when the join builds on the left so
+// the left input is always printed first. The profile tree itself, and the JSON, keep the build on
+// the operator that prepares it.
+struct Drawn {
+  const exec::ProfileNode* node = nullptr;
+  std::vector<Drawn> children;
+};
+
+bool HasBuildChild(const exec::ProfileNode& node) {
+  return std::ranges::any_of(
+      node.children(), [](const exec::ProfileNode* child) { return child->name() == "HashBuild"; });
+}
+
+// HashBuilds a part consumer prepares for joins inside its pipeline (child 0, marked per part).
+// A HashJoin's own build is already its child and stays there.
+void SplitBuilds(const exec::ProfileNode& node, std::vector<const exec::ProfileNode*>& own,
+                 std::vector<const exec::ProfileNode*>& lifted) {
+  const std::vector<const exec::ProfileNode*> kids = node.children();
+  const bool pipeline = !kids.empty() && kids.front()->per_part() && node.name() != "HashJoin";
+  for (std::size_t i = 0; i < kids.size(); ++i) {
+    if (pipeline && i > 0 && kids[i]->name() == "HashBuild") {
+      lifted.push_back(kids[i]);
+    } else {
+      own.push_back(kids[i]);
+    }
+  }
+}
+
+// The left input of a join is printed before the right one, as a logical plan prints them. The
+// probe is the other side from the build, so a build=left join's HashBuild moves in front of it.
+void OrderJoinSides(Drawn& drawn) {
+  if (drawn.node->name() != "HashJoin" && drawn.node->name() != "RightJoin") {
+    return;
+  }
+  const std::string_view detail = drawn.node->detail();
+  const bool build_left = detail.find("build=left") != std::string_view::npos;
+  const bool build_right = detail.find("build=right") != std::string_view::npos;
+  if (build_left == build_right) {
+    return;
+  }
+  std::size_t build = drawn.children.size();
+  for (std::size_t i = 0; i < drawn.children.size(); ++i) {
+    const exec::ProfileNode& child = *drawn.children[i].node;
+    if (child.name() == "HashBuild" && child.detail() == detail) {
+      build = i;
+      break;
+    }
+  }
+  if (build == drawn.children.size() || (build_left && build == 0) ||
+      (build_right && build + 1 == drawn.children.size())) {
+    return;
+  }
+  Drawn taken = std::move(drawn.children[build]);
+  drawn.children.erase(drawn.children.begin() + static_cast<std::ptrdiff_t>(build));
+  if (build_left) {
+    drawn.children.insert(drawn.children.begin(), std::move(taken));
+  } else {
+    drawn.children.push_back(std::move(taken));
+  }
+}
+
+Drawn Draw(const exec::ProfileNode& node, std::vector<const exec::ProfileNode*>& queue) {
+  Drawn drawn{.node = &node};
+  std::vector<const exec::ProfileNode*> own;
+  std::vector<const exec::ProfileNode*> lifted;
+  SplitBuilds(node, own, lifted);
+  const bool owns = !lifted.empty();
+  std::vector<const exec::ProfileNode*> merged;
+  std::vector<const exec::ProfileNode*>* builds = &queue;
+  if (owns) {
+    merged.insert(merged.end(), queue.begin(), queue.end());
+    queue.clear();
+    merged.insert(merged.end(), lifted.begin(), lifted.end());
+    builds = &merged;
+  }
+  for (const exec::ProfileNode* child : own) {
+    const bool claim = child->name() == "HashJoin" && !HasBuildChild(*child) && !builds->empty() &&
+                       builds->front()->detail() == child->detail();
+    if (!claim) {
+      drawn.children.push_back(Draw(*child, *builds));
+      continue;
+    }
+    const exec::ProfileNode* build = builds->front();
+    builds->erase(builds->begin());
+    Drawn nested = Draw(*child, *builds);
+    std::vector<const exec::ProfileNode*> none;
+    nested.children.push_back(Draw(*build, none));
+    OrderJoinSides(nested);
+    drawn.children.push_back(std::move(nested));
+  }
+  if (owns) {
+    while (!builds->empty()) {
+      const exec::ProfileNode* build = builds->front();
+      builds->erase(builds->begin());
+      std::vector<const exec::ProfileNode*> none;
+      drawn.children.push_back(Draw(*build, none));
+    }
+  }
+  OrderJoinSides(drawn);
+  return drawn;
+}
+
 // One line per operator, root first. Without `counters` -- a plan nobody ran
 // (FormatPhysicalPlan) -- the line ends after the operator and its logical node, since rows, times
 // and metrics are what a run measures and this node has never been through one.
-void Text(const exec::ProfileNode& node, std::size_t depth, bool counters, std::string& out) {
-  std::string line = std::string(2 * depth, ' ') + node.name();
+void Write(const Drawn& drawn, std::string_view prefix, bool last, bool root, bool counters,
+           std::string& out) {
+  const exec::ProfileNode& node = *drawn.node;
+  std::string line;
+  if (!root) {
+    line += prefix;
+    line += last ? "└─" : "├─";
+  }
+  line += node.name();
   if (const std::string_view detail = DetailText(node); !detail.empty()) {
     line += ' ';
     line += detail;
   }
-  if (!counters) {
-    out += line + '\n';
-    for (const exec::ProfileNode* child : node.children()) {
-      Text(*child, depth + 1, counters, out);
+  if (counters) {
+    line += std::format("  [rows={} batches={}", node.rows(), node.batches());
+    if (node.per_part()) {
+      line += std::format(" parts={} time={} (summed over parts)", node.instances(),
+                          Duration(node.time().count()));
+    } else {
+      line += std::format(" time={}", Duration(node.time().count()));
     }
-    return;
+    if (HasInputInside(node)) {
+      line += std::format(" self={}", Duration(SelfTime(node)));
+    }
+    for (const exec::ProfileMetric& metric : Ordered(node)) {
+      line += std::format(" {}={}", metric.name, MetricText(metric));
+    }
+    line += ']';
   }
-  line += std::format("  [rows={} batches={}", node.rows(), node.batches());
-  if (node.per_part()) {
-    line += std::format(" parts={} time={} (summed over parts)", node.instances(),
-                        Duration(node.time().count()));
-  } else {
-    line += std::format(" time={}", Duration(node.time().count()));
+  out += line + '\n';
+  std::string child_prefix(prefix);
+  if (!root) {
+    child_prefix += last ? "  " : "│ ";
   }
-  if (HasInputInside(node)) {
-    line += std::format(" self={}", Duration(SelfTime(node)));
+  for (std::size_t i = 0; i < drawn.children.size(); ++i) {
+    Write(drawn.children[i], child_prefix, i + 1 == drawn.children.size(), false, counters, out);
   }
-  for (const exec::ProfileMetric& metric : Ordered(node)) {
-    line += std::format(" {}={}", metric.name, MetricText(metric));
-  }
-  out += line + "]\n";
-  for (const exec::ProfileNode* child : node.children()) {
-    Text(*child, depth + 1, counters, out);
-  }
+}
+
+void Text(const exec::ProfileNode& node, bool counters, std::string& out) {
+  std::vector<const exec::ProfileNode*> pending;
+  Write(Draw(node, pending), "", false, true, counters, out);
 }
 
 void Json(const exec::ProfileNode& node, std::string& out) {
@@ -185,14 +302,14 @@ std::string FormatProfile(const QueryProfile& profile, ProfileFormat format) {
                      Duration(profile.time.count()), profile.rows,
                      exec::FormatBytes(profile.peak_memory), profile.threads);
   if (profile.root != nullptr) {
-    Text(*profile.root, 0, /*counters=*/true, out);
+    Text(*profile.root, /*counters=*/true, out);
   }
   return out;
 }
 
 std::string FormatPhysicalPlan(std::string_view output, const exec::ProfileNode& root) {
   std::string out = std::string(output) + '\n';
-  Text(root, 0, /*counters=*/false, out);
+  Text(root, /*counters=*/false, out);
   return out;
 }
 

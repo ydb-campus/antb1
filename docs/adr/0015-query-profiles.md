@@ -76,6 +76,12 @@ Proposed
     against the rows it returns); and its build, `HashBuild`, under the operator that prepares it, with the rows its
     table holds, `parts`, `skipped` (a build from a part pipeline), `part_time`, `wait`, `lanes_tail`, `finish`,
     `null_keys`, `unique` and `direct`. The display order lists them where they come as a query runs.
+  - Update (2026-11-28): the text form draws each input with `├─` or `└─`, and a vertical bar plus a space under an
+    earlier input. A
+    `HashBuild` is drawn under its `HashJoin`, before the probe when the join builds on the left and after it
+    when the join builds on the right, so the left input is first. The JSON profile is unchanged: the `HashBuild`
+    stays an input of the operator
+    that prepares it.
   - Update (2026-10-09, E2a): semi, anti, null-aware anti and one-row joins show the same two lines and metrics. A
     probe has `find` only when it looks keys up: not a one-row join's, nor one that keeps every row or none without
     looking (an anti join over a build without rows, a null-aware anti join over an empty build input or one with a

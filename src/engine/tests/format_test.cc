@@ -408,10 +408,10 @@ TEST(FormatProfileTest, JoinMetricsShowInAFixedOrder) {
             "Total: time=0.000ms rows=1 peak_memory=0 bytes threads=4\n"
             "PartAggregate Aggregate COUNT(*)  [rows=1 batches=1 time=0.000ms self=0.000ms parts=6 "
             "skipped=0 part_time=1.000ms wait=1.000ms merge=1.000ms]\n"
-            "  HashJoin Join INNER build=right keys=[a = b]  [rows=0 batches=0 parts=0 "
+            "└─HashJoin Join INNER build=right keys=[a = b]  [rows=0 batches=0 parts=0 "
             "time=0.000ms (summed over parts) find=1.000ms gather=1.000ms residual=1.000ms "
             "window_rows=8 alpha=1 zeta=1]\n"
-            "  HashBuild Join INNER build=right keys=[a = b]  [rows=0 batches=0 time=0.000ms "
+            "  └─HashBuild Join INNER build=right keys=[a = b]  [rows=0 batches=0 time=0.000ms "
             "parts=3 skipped=1 part_time=1.000ms wait=1.000ms lanes_tail=1.000ms finish=1.000ms "
             "null_keys=2 unique=1 direct=0]\n");
   const std::string json = FormatProfile(profile, ProfileFormat::kJson);
@@ -457,10 +457,78 @@ TEST(FormatPhysicalPlanTest, PrintsTheOperatorsWithoutAnyCounter) {
   EXPECT_EQ(FormatPhysicalPlan("Output: c:BIGINT", *root),
             "Output: c:BIGINT\n"
             "PartAggregate Aggregate COUNT(*)\n"
-            "  HashJoin Join INNER build=right keys=[a = b]\n"
-            "    Scan table=t source=memory columns=[a], 1 pushed predicate, part skip candidate "
+            "└─HashJoin Join INNER build=right keys=[a = b]\n"
+            "  ├─Scan table=t source=memory columns=[a], 1 pushed predicate, part skip candidate "
             "on a\n"
-            "  HashBuild Join INNER build=right keys=[a = b]\n");
+            "  └─HashBuild Join INNER build=right keys=[a = b]\n");
+}
+
+// A part pipeline's HashBuild is a child of the consumer, while its HashJoin can sit under another
+// operator of that pipeline. The text draws the build as the last input of that HashJoin. The
+// profile children stay where the planner attached them.
+TEST(FormatPhysicalPlanTest, DrawsAPipelineBuildUnderItsHashJoin) {
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("PartGroupAggregate");
+  root->set_detail("GroupAggregate keys=[k] COUNT(*)");
+  exec::ProfileNode& compute = *root->Child(0);
+  compute.set_name("Compute");
+  compute.set_detail("Compute (a + 1)");
+  compute.set_per_part(true);
+  exec::ProfileNode& join = *compute.Child(0);
+  join.set_name("HashJoin");
+  join.set_detail("Join INNER build=right keys=[t.k = u.k]");
+  join.set_per_part(true);
+  exec::ProfileNode& scan = *join.Child(0);
+  scan.set_name("Scan");
+  scan.set_detail("Scan table=t source=memory columns=[k]");
+  scan.set_per_part(true);
+  exec::ProfileNode& build = *root->Child(1);
+  build.set_name("HashBuild");
+  build.set_detail("Join INNER build=right keys=[t.k = u.k]");
+  exec::ProfileNode& dimension = *build.Child(0);
+  dimension.set_name("Scan");
+  dimension.set_detail("Scan table=u source=memory columns=[k]");
+  EXPECT_EQ(FormatPhysicalPlan("Output: c:BIGINT", *root),
+            "Output: c:BIGINT\n"
+            "PartGroupAggregate GroupAggregate keys=[k] COUNT(*)\n"
+            "└─Compute (a + 1)\n"
+            "  └─HashJoin Join INNER build=right keys=[t.k = u.k]\n"
+            "    ├─Scan table=t source=memory columns=[k]\n"
+            "    └─HashBuild Join INNER build=right keys=[t.k = u.k]\n"
+            "      └─Scan table=u source=memory columns=[k]\n");
+  EXPECT_EQ(root->children().size(), 2U);
+  EXPECT_EQ(root->children()[1]->name(), "HashBuild");
+}
+
+// build=left puts the build on the left input. The text prints that side before the probe, which is
+// the right input. The profile still stores the build as the consumer's later child.
+TEST(FormatPhysicalPlanTest, DrawsTheLeftInputBeforeTheRight) {
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("PartAggregate");
+  root->set_detail("Aggregate COUNT(*)");
+  exec::ProfileNode& join = *root->Child(0);
+  join.set_name("HashJoin");
+  join.set_detail("Join INNER build=left keys=[u.k = t.k]");
+  join.set_per_part(true);
+  exec::ProfileNode& probe = *join.Child(0);
+  probe.set_name("Scan");
+  probe.set_detail("Scan table=t source=memory columns=[k]");
+  probe.set_per_part(true);
+  exec::ProfileNode& build = *root->Child(1);
+  build.set_name("HashBuild");
+  build.set_detail("Join INNER build=left keys=[u.k = t.k]");
+  exec::ProfileNode& left = *build.Child(0);
+  left.set_name("Scan");
+  left.set_detail("Scan table=u source=memory columns=[k]");
+  EXPECT_EQ(FormatPhysicalPlan("Output: c:BIGINT", *root),
+            "Output: c:BIGINT\n"
+            "PartAggregate Aggregate COUNT(*)\n"
+            "└─HashJoin Join INNER build=left keys=[u.k = t.k]\n"
+            "  ├─HashBuild Join INNER build=left keys=[u.k = t.k]\n"
+            "  │ └─Scan table=u source=memory columns=[k]\n"
+            "  └─Scan table=t source=memory columns=[k]\n");
+  EXPECT_EQ(root->children()[0]->name(), "HashJoin");
+  EXPECT_EQ(root->children()[1]->name(), "HashBuild");
 }
 
 }  // namespace

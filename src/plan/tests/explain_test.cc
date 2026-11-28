@@ -41,34 +41,33 @@ TEST(ExplainTest, BoundPlanScansEveryField) {
   EXPECT_EQ(ExplainSql("SELECT COUNT(*) FROM t", /*optimize=*/false),
             "Output: count_star():BIGINT\n"
             "Aggregate COUNT(*)\n"
-            "  Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
-            "\"Mixed Case\", from]\n");
+            "└─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+            "Case\", from]\n");
 }
 
 TEST(ExplainTest, AggregatesOverAFilter) {
   EXPECT_EQ(ExplainSql("SELECT COUNT(*), SUM(i16) AS total, AVG(d), MIN(\"Mixed Case\") FROM t "
                        "WHERE i16 <> 0 AND dt >= '2013-07-01' AND d < 0.5 AND i64 > 1.5 "
                        "AND u16 < 70000 AND i32 = 0.5 AND s = 'it''s'"),
-            "Output: count_star():BIGINT total:HUGEINT avg(d):DOUBLE "
-            "min(\"Mixed Case\"):INTEGER\n"
+            "Output: count_star():BIGINT total:HUGEINT avg(d):DOUBLE min(\"Mixed Case\"):INTEGER\n"
             "Aggregate COUNT(*), SUM(i16), AVG(d), MIN(\"Mixed Case\")\n"
-            "  Filter i16 <> 0 AND dt >= DATE '2013-07-01' AND d < 0.5 AND i64 >= 2 AND "
-            "u16 IS NOT NULL AND FALSE AND s = 'it''s'\n"
-            "    Scan table=t source=fake columns=[i16, i64, u16, d, s, dt, \"Mixed Case\"]\n");
+            "└─Filter i16 <> 0 AND dt >= DATE '2013-07-01' AND d < 0.5 AND i64 >= 2 AND u16 IS NOT "
+            "NULL AND FALSE AND s = 'it''s'\n"
+            "  └─Scan table=t source=fake columns=[i16, i64, u16, d, s, dt, \"Mixed Case\"]\n");
 }
 
 TEST(ExplainTest, ProjectionWithLimit) {
   EXPECT_EQ(ExplainSql("SELECT * FROM ok LIMIT 10"),
             "Output: i16:SMALLINT s:VARCHAR\n"
             "Project i16, s\n"
-            "  Limit 10\n"
-            "    Scan table=ok source=fake columns=[i16, s]\n");
+            "└─Limit 10\n"
+            "  └─Scan table=ok source=fake columns=[i16, s]\n");
   EXPECT_EQ(ExplainSql("SELECT s AS \"The S\", I16 FROM OK WHERE i16 >= -32768.5 LIMIT 0"),
             "Output: The S:VARCHAR i16:SMALLINT\n"
             "Project s, i16\n"
-            "  Limit 0\n"
-            "    Filter i16 >= -32768\n"
-            "      Scan table=OK source=fake columns=[i16, s]\n");
+            "└─Limit 0\n"
+            "  └─Filter i16 >= -32768\n"
+            "    └─Scan table=OK source=fake columns=[i16, s]\n");
 }
 
 // The Limit moves below the Project, right above the Sort (a top-N in the executor); the Sort
@@ -77,24 +76,24 @@ TEST(ExplainTest, SortAndOffset) {
   EXPECT_EQ(ExplainSql("SELECT s FROM ok ORDER BY i16 DESC, s NULLS FIRST LIMIT 3 OFFSET 2"),
             "Output: s:VARCHAR\n"
             "Project s\n"
-            "  Limit 3 OFFSET 2\n"
-            "    Sort i16 DESC NULLS LAST, s ASC NULLS FIRST\n"
-            "      Scan table=ok source=fake columns=[i16, s]\n");
+            "└─Limit 3 OFFSET 2\n"
+            "  └─Sort i16 DESC NULLS LAST, s ASC NULLS FIRST\n"
+            "    └─Scan table=ok source=fake columns=[i16, s]\n");
   EXPECT_EQ(ExplainSql("SELECT i16 FROM ok GROUP BY i16 ORDER BY COUNT(*) DESC OFFSET 1"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Limit ALL OFFSET 1\n"
-            "    Sort \"count_star()\" DESC NULLS LAST\n"
-            "      GroupAggregate keys=[i16] COUNT(*)\n"
-            "        Scan table=ok source=fake columns=[i16]\n");
+            "└─Limit ALL OFFSET 1\n"
+            "  └─Sort \"count_star()\" DESC NULLS LAST\n"
+            "    └─GroupAggregate keys=[i16] COUNT(*)\n"
+            "      └─Scan table=ok source=fake columns=[i16]\n");
 }
 
 TEST(ExplainTest, In) {
   EXPECT_EQ(ExplainSql("SELECT i16 FROM ok WHERE i16 IN (3, 1.5, 7) AND s NOT IN ('x', 'it''s')"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter i16 IN (3, 7) AND s NOT IN ('x', 'it''s')\n"
-            "    Scan table=ok source=fake columns=[i16, s]\n");
+            "└─Filter i16 IN (3, 7) AND s NOT IN ('x', 'it''s')\n"
+            "  └─Scan table=ok source=fake columns=[i16, s]\n");
 }
 
 // A DECIMAL compared with a DOUBLE constant or IN list compares in DOUBLE (ADR 0021 rule 11), so
@@ -104,17 +103,17 @@ TEST(ExplainTest, DecimalComparedInDouble) {
                        "p NOT IN (1.555) AND z = 2.5 AND p < f"),
             "Output: count_star():BIGINT\n"
             "Aggregate COUNT(*)\n"
-            "  Filter CAST(p AS DOUBLE) > 10 AND CAST(q AS DOUBLE) IN (1.5, 2) AND "
-            "p IS NOT NULL AND z = 2.5000000000 AND p < f\n"
-            "    Scan table=dec source=fake columns=[p, q, z, f]\n");
+            "└─Filter CAST(p AS DOUBLE) > 10 AND CAST(q AS DOUBLE) IN (1.5, 2) AND p IS NOT NULL "
+            "AND z = 2.5000000000 AND p < f\n"
+            "  └─Scan table=dec source=fake columns=[p, q, z, f]\n");
 }
 
 TEST(ExplainTest, Like) {
   EXPECT_EQ(ExplainSql("SELECT i16 FROM ok WHERE s LIKE '%it''s_%' AND s NOT LIKE ''"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter s LIKE '%it''s_%' AND s NOT LIKE ''\n"
-            "    Scan table=ok source=fake columns=[i16, s]\n");
+            "└─Filter s LIKE '%it''s_%' AND s NOT LIKE ''\n"
+            "  └─Scan table=ok source=fake columns=[i16, s]\n");
 }
 
 // HAVING is a Filter over the aggregation, below the Sort; COUNT(*) without WHERE still becomes a
@@ -125,35 +124,35 @@ TEST(ExplainTest, Having) {
                  "2) AND s LIKE 'a%' ORDER BY s LIMIT 5"),
       "Output: s:VARCHAR n:BIGINT\n"
       "Project s, n\n"
-      "  Limit 5\n"
-      "    Sort s ASC NULLS LAST\n"
-      "      Filter n > 1 AND \"min(i16)\" IN (1, 2) AND s LIKE 'a%'\n"
-      "        GroupAggregate keys=[s] COUNT(*), MIN(i16)\n"
-      "          Scan table=ok source=fake columns=[i16, s]\n");
+      "└─Limit 5\n"
+      "  └─Sort s ASC NULLS LAST\n"
+      "    └─Filter n > 1 AND \"min(i16)\" IN (1, 2) AND s LIKE 'a%'\n"
+      "      └─GroupAggregate keys=[s] COUNT(*), MIN(i16)\n"
+      "        └─Scan table=ok source=fake columns=[i16, s]\n");
   EXPECT_EQ(ExplainSql("SELECT COUNT(*) FROM ok HAVING COUNT(*) > 1"),
             "Output: count_star():BIGINT\n"
             "Filter \"count_star()\" > 1\n"
-            "  RowCount table=ok source=fake\n");
+            "└─RowCount table=ok source=fake\n");
 }
 
 TEST(ExplainTest, ConstantsAndPositions) {
   EXPECT_EQ(ExplainSql("SELECT 1, 'x', s, COUNT(*) FROM ok GROUP BY 1, 3 ORDER BY 4 DESC"),
             "Output: 1:INTEGER 'x':VARCHAR s:VARCHAR count_star():BIGINT\n"
             "Project 1, 'x', s, \"count_star()\"\n"
-            "  Sort \"count_star()\" DESC NULLS LAST\n"
-            "    GroupAggregate keys=[s] COUNT(*)\n"
-            "      Scan table=ok source=fake columns=[s]\n");
+            "└─Sort \"count_star()\" DESC NULLS LAST\n"
+            "  └─GroupAggregate keys=[s] COUNT(*)\n"
+            "    └─Scan table=ok source=fake columns=[s]\n");
   EXPECT_EQ(ExplainSql("SELECT 2 FROM ok"),
             "Output: 2:INTEGER\n"
             "Project 2\n"
-            "  Scan table=ok source=fake columns=[]\n");
+            "└─Scan table=ok source=fake columns=[]\n");
 }
 
 TEST(ExplainTest, CountDistinct) {
   EXPECT_EQ(ExplainSql("SELECT COUNT(DISTINCT s), COUNT(s) FROM ok"),
             "Output: count(DISTINCT s):BIGINT count(s):BIGINT\n"
             "Aggregate COUNT(DISTINCT s), COUNT(s)\n"
-            "  Scan table=ok source=fake columns=[s]\n");
+            "└─Scan table=ok source=fake columns=[s]\n");
 }
 
 TEST(ExplainTest, NamesAndStringsStayOnOneAsciiLine) {
@@ -167,8 +166,8 @@ TEST(ExplainTest, NamesAndStringsStayOnOneAsciiLine) {
   EXPECT_EQ(Explain(Optimized(*plan)),
             "Output: a\"b:VARCHAR \\xC3\\xA9\\x0A:INTEGER\n"
             "Project \"a\"\"b\", \"\\xC3\\xA9\\x0A\"\n"
-            "  Filter \"a\"\"b\" = 'x\\x09y\\x5Cz'\n"
-            "    Scan table=w source=fake columns=[\"a\"\"b\", \"\\xC3\\xA9\\x0A\"]\n");
+            "└─Filter \"a\"\"b\" = 'x\\x09y\\x5Cz'\n"
+            "  └─Scan table=w source=fake columns=[\"a\"\"b\", \"\\xC3\\xA9\\x0A\"]\n");
 }
 
 TEST(ExplainTest, EmptyPlan) { EXPECT_EQ(Explain(LogicalPlan{}), "Output:\n"); }
@@ -234,12 +233,12 @@ TEST(ExplainTest, JoinsShowBothInputs) {
   EXPECT_EQ(Explain(plan),
             "Output: i16:SMALLINT i64:BIGINT\n"
             "Project t.i16, i64\n"
-            "  Join INNER build=left keys=[t.i32 = u.i32, t.i64 IS NOT DISTINCT FROM i64] "
+            "└─Join INNER build=left keys=[t.i32 = u.i32, t.i64 IS NOT DISTINCT FROM i64] "
             "residual=[(t.i16 < u.i16), (t.s <> 'it''s\\x0A')]\n"
-            "    Scan table=t source=fake columns=[i16, i32, i64]\n"
-            "    Join SEMI build=right keys=[u.i32 = \"x y\".\"Mixed Case\"]\n"
-            "      Scan table=u source=fake columns=[i32]\n"
-            "      Scan table=dir/x.parquet source=fake columns=[i32, \"Mixed Case\"]\n");
+            "  ├─Scan table=t source=fake columns=[i16, i32, i64]\n"
+            "  └─Join SEMI build=right keys=[u.i32 = \"x y\".\"Mixed Case\"]\n"
+            "    ├─Scan table=u source=fake columns=[i32]\n"
+            "    └─Scan table=dir/x.parquet source=fake columns=[i32, \"Mixed Case\"]\n");
 }
 
 TEST(ExplainTest, EveryJoinKind) {
@@ -301,8 +300,8 @@ TEST(ExplainTest, DependentJoinShowsBothInputs) {
                                 .output = {}}),
             "Output:\n"
             "DependentJoin ONE-ROW\n"
-            "  Scan table=a source=fake columns=[i16]\n"
-            "  Scan table=b source=fake columns=[i16]\n");
+            "├─Scan table=a source=fake columns=[i16]\n"
+            "└─Scan table=b source=fake columns=[i16]\n");
 }
 
 // A union names its columns as its first input does, which are the union's names, and renders its
@@ -319,9 +318,9 @@ TEST(ExplainTest, UnionAllShowsEveryInputInOrder) {
                 .output = {}}),
             "Output:\n"
             "UnionAll inputs=3 columns=[a.i16, i32]\n"
-            "  Scan table=a source=fake columns=[i16, i32]\n"
-            "  Scan table=b source=fake columns=[i32, i16]\n"
-            "  Scan table=c source=fake columns=[i16, i32]\n");
+            "├─Scan table=a source=fake columns=[i16, i32]\n"
+            "├─Scan table=b source=fake columns=[i32, i16]\n"
+            "└─Scan table=c source=fake columns=[i16, i32]\n");
 }
 
 // A qualifier is printed wherever a column is (J2b's binder sets it); quoted like a name.

@@ -1342,7 +1342,10 @@ above it):
   groups read ([ADR 0016](adr/0016-late-materialization.md)); `antb1 explain --analyze` shows `late=N columns`.
 
 `antb1 explain` prints the optimized plan: an `Output:` line with the result names and types, then one line per
-node from the root down, each input indented by two more spaces. Names that are not plain identifiers are
+node from the root down. Each input is the next line, linked by `├─`, or `└─` when it is the last input. Under an
+earlier input the gutter is a vertical bar followed by a space; under the last input it is two spaces, so every
+input lines up under its parent.
+Names that are not plain identifiers are
 double-quoted, and bytes outside printable ASCII are written as `\xHH`. A folded constant prints in its operand's
 type: against a DECIMAL column with the column's scale (`p <= 12.34`, `d IN (1.25, 5.00)`); a DECIMAL column compared
 in DOUBLE shows its conversion (`CAST(p AS DOUBLE) > 10`):
@@ -1350,25 +1353,25 @@ in DOUBLE shows its conversion (`CAST(p AS DOUBLE) > 10`):
 ```text
 Output: count_star():BIGINT width:HUGEINT
 Aggregate COUNT(*), SUM(ResolutionWidth)
-  Filter IsMobile = 1 AND UserAgent >= 2 AND RegionID IS NOT NULL
-    Scan table=t source=parquet(files=1, rows=10000) columns=[RegionID, UserAgent, ResolutionWidth, IsMobile]
+└─Filter IsMobile = 1 AND UserAgent >= 2 AND RegionID IS NOT NULL
+  └─Scan table=t source=parquet(files=1, rows=10000) columns=[RegionID, UserAgent, ResolutionWidth, IsMobile]
 ```
 
 ```text
 Output: RegionID:INTEGER c:BIGINT
 Project RegionID, c
-  Limit 10 OFFSET 5
-    Sort c DESC NULLS LAST, "max(EventTime)" ASC NULLS FIRST
-      GroupAggregate keys=[RegionID] COUNT(*), MAX(EventTime)
-        Scan table=t source=parquet(files=1, rows=10000) columns=[EventTime, RegionID]
+└─Limit 10 OFFSET 5
+  └─Sort c DESC NULLS LAST, "max(EventTime)" ASC NULLS FIRST
+    └─GroupAggregate keys=[RegionID] COUNT(*), MAX(EventTime)
+      └─Scan table=t source=parquet(files=1, rows=10000) columns=[EventTime, RegionID]
 ```
 
 A `Join` line shows its kind (`INNER`, `LEFT`, `SEMI`, `ANTI`, `NULL-AWARE ANTI`, `NULL-AWARE MARK`, `MARK`,
 `ONE-ROW` or `FULL`), the input it builds on, its key pairs (`a.k = b.k`, or `a.k IS NOT DISTINCT FROM b.k` for a
 NULL-equal one,
 OJ5b; `keys=[]` for a nested loop, ADR 0040, which then has its residuals alone) and, when it has any,
-its residual conditions; its left input follows, then its right input, both
-indented. A column whose binding the plan records is shown qualified, as `a.k`. It ends with `carries N of M unread
+its residual conditions; its left input follows, then its right input. A column whose binding the plan records is
+shown qualified, as `a.k`. It ends with `carries N of M unread
 above` where the join's output holds columns no node above it reads -- its own keys and residual columns, usually,
 which its inputs must carry to it and no further (ADR 0026's C8a, and the `cols_dropped` metric below is what a build
 did about it). The clause is absent where there are none, and on a plan rendered before `Optimize` has pruned it,
@@ -1376,12 +1379,13 @@ which records no such set:
 
 ```text
 Join INNER build=right keys=[a.k = b.k] residual=[(a.x < b.y)] carries 2 of 4 unread above
-  Scan table=a source=parquet(files=1, rows=1000) columns=[k, x]
-  Scan table=b source=parquet(files=1, rows=10) columns=[k, y]
+├─Scan table=a source=parquet(files=1, rows=1000) columns=[k, x]
+└─Scan table=b source=parquet(files=1, rows=10) columns=[k, y]
 ```
 
 A `UnionAll` line shows the number of its inputs and its columns, named as the first block names them -- the first
-block left, once a condition has ruled blocks out; its inputs follow in written order, indented. A CTE whose query is
+block left, once a condition has ruled blocks out; its inputs follow in written order, linked the same way. A CTE whose
+query is
 a `UNION ALL`, referenced twice with the same conditions, prints `[shared #1 of 2, ...]` on the highest node the two
 references repeat, since [ADR 0030](adr/0030-shared-sub-plans.md) finds the repeat: their `UnionAll` lines when every
 condition went into the blocks and a block is left, else the `Filter` above the union (the `FALSE` when no block is
@@ -1393,14 +1397,14 @@ materialize. Their consumers read a `Scan` marked `source=shared`.
 ```text
 Output: x:INTEGER n:BIGINT
 Project x, n
-  GroupAggregate keys=[x] COUNT(*)
-    UnionAll inputs=2 columns=[x]
-      Compute CAST(x AS INTEGER)
-        Project i16
-          Filter id < 10
-            Scan table=e source=parquet(files=1, rows=12) columns=[id, i16]
-      Project i32
-        Scan table=e source=parquet(files=1, rows=12) columns=[i32]
+└─GroupAggregate keys=[x] COUNT(*)
+  └─UnionAll inputs=2 columns=[x]
+    ├─Compute CAST(x AS INTEGER)
+    │ └─Project i16
+    │   └─Filter id < 10
+    │     └─Scan table=e source=parquet(files=1, rows=12) columns=[id, i16]
+    └─Project i32
+      └─Scan table=e source=parquet(files=1, rows=12) columns=[i32]
 ```
 
 A condition on the union goes into its blocks (above). Over three blocks tagged `'small'`, `'large'` and `'wide'`,
@@ -1410,14 +1414,14 @@ A condition on the union goes into its blocks (above). Over three blocks tagged 
 ```text
 Output: x:BIGINT tag:VARCHAR
 Project x, tag
-  UnionAll inputs=2 columns=[i32, "'large'"]
-    Filter i32 > 5
-      Compute CAST(i32 AS BIGINT)
-        Project i32, 'large'
-          Scan table=e source=parquet(files=1, rows=12) columns=[i32]
-    Filter i64 > 5
-      Project i64, 'wide'
-        Scan table=e source=parquet(files=1, rows=12) columns=[i64]
+└─UnionAll inputs=2 columns=[i32, "'large'"]
+  ├─Filter i32 > 5
+  │ └─Compute CAST(i32 AS BIGINT)
+  │   └─Project i32, 'large'
+  │     └─Scan table=e source=parquet(files=1, rows=12) columns=[i32]
+  └─Filter i64 > 5
+    └─Project i64, 'wide'
+      └─Scan table=e source=parquet(files=1, rows=12) columns=[i64]
 ```
 
 ### `explain --physical`
@@ -1443,8 +1447,11 @@ columns.
 It shows what no logical plan holds, because the physical planner is what decides it:
 
 - part pipelines and the operators that consume them (`PartUnion`, `PartAggregate`, `PartGroupAggregate`,
-  `PartGroupingSets`, `PartTopN`), and each hash join split into its `HashJoin` probe and the `HashBuild` under the
-  operator that prepares it, laid out exactly as `--analyze` lays them out; no part pipeline goes through a `UnionAll`,
+  `PartGroupingSets`, `PartTopN`), and each hash join split into its `HashJoin` probe and the `HashBuild` drawn
+  under that `HashJoin`. The left input is printed first: the `HashBuild` before the probe when the join builds
+  on the left, and the probe before the `HashBuild` when it builds on the right. A part pipeline still prepares
+  the build on the operator that runs the pipeline. `--analyze` draws the same tree. The JSON profile still lists each
+  `HashBuild` among the inputs of the operator that prepares it. No part pipeline goes through a `UnionAll`,
   so each of its inputs runs its own parts and what reads the union runs on one thread (ADR 0036);
 - a `Scan` that applies predicates of the `Filter` above it while it reads: `, N pushed predicates`
   ([ADR 0020](adr/0020-filter-pushdown.md));
@@ -1460,12 +1467,11 @@ It shows what no logical plan holds, because the physical planner is what decide
 ```text
 Output: count_star():BIGINT
 PartAggregate Aggregate COUNT(*)
-  HashJoin Join INNER build=right keys=[trips.tr_pickup = zones.zn_id] carries 4 of 5 unread above
-    Filter trips.tr_row >= 100
-      Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup], 1 pushed predicate, key filter
-      candidate on tr_pickup
-  HashBuild Join INNER build=right keys=[trips.tr_pickup = zones.zn_id] carries 4 of 5 unread above
-    Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
+└─HashJoin Join INNER build=right keys=[trips.tr_pickup = zones.zn_id] carries 4 of 5 unread above
+  ├─Filter trips.tr_row >= 100
+  │ └─Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup], 1 pushed predicate, key filter candidate on tr_pickup
+  └─HashBuild Join INNER build=right keys=[trips.tr_pickup = zones.zn_id] carries 4 of 5 unread above
+    └─Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
 ```
 
 **A candidate is not a fact, and the word is load-bearing.** Four of the conditions behind a key filter are not
@@ -1489,7 +1495,7 @@ with none of them beside it is a filter the run declined.
 only with `--analyze`); its errors and exit codes are those of `antb1 query`.
 
 - The text starts with the `Output:` line and a `Total:` line (time, result rows, peak memory, threads).
-- Then comes one line per physical operator, root first, indented as EXPLAIN: its name, its logical node's EXPLAIN
+- Then comes one line per physical operator, root first, linked as EXPLAIN: its name, its logical node's EXPLAIN
   text (without a first word that repeats the name), and in brackets:
   - `rows` and `batches` it returned;
   - its `time`, or for an operator of a part pipeline, `parts=N` and its time summed over the parts;
@@ -1502,13 +1508,14 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
 - A hash join (any `Join` the executor runs) shows two lines, each with the join's EXPLAIN text:
   - `HashJoin`, its probe, where the input it does not build on is read: in that input's part pipeline (per part),
     or over it when it is no part pipeline;
-  - `HashBuild`, its build, under the operator that prepares it: the operator that runs the probe's part pipeline
-    (after the pipeline's lines), or a `HashJoin` over its input (after that input's line). Its input follows it,
-    per part when it is a part pipeline. Its `rows` and `batches` are the rows its table holds and the table's
-    chunks, and its time includes that of the builds its input probes, which come first. The rows it holds are those
-    without a NULL in a key that compares `=` (a NULL-equal key's NULLs are held, as values), except for a join that
-    emits the build rows which did not match (below), whose build keeps the rows with one too.
-  - In the JSON, a `HashBuild` is one more entry of the `inputs` of the operator that prepares it.
+  - `HashBuild`, its build, drawn under its `HashJoin` on the left or the right so that the left input is first.
+    A part pipeline still prepares the build on the operator that runs the pipeline; only the text moves the line.
+    Its input follows it, per part when it is a part pipeline. Its `rows` and `batches` are the rows its
+    table holds and the table's chunks, and its time includes that of the builds its input probes, which come first.
+    The rows it holds are those without a NULL in a key that compares `=` (a NULL-equal key's NULLs are held, as
+    values), except for a join that emits the build rows which did not match (below), whose build keeps the rows
+    with one too.
+  - In the JSON, a `HashBuild` stays an entry of the `inputs` of the operator that prepares it.
 - Metrics:
   - `parts`, `skipped` (by statistics);
   - of a dynamic join filter on a `Scan`, where this scan is the probe side of a hash join whose build published
