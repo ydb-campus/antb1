@@ -3527,8 +3527,164 @@ LogicalNodePtr StaticGrouping(const LogicalNodePtr& node) {
   return WithInputs(*node, std::move(inputs));
 }
 
+struct JoinedBinding {
+  BoundColumn outer;
+  BoundColumn inner;
+};
+
+using JoinedBindings = std::map<ColumnId, JoinedBinding>;
+
+// Remove an arm's correlated equalities, retaining their inner columns as representatives.
+// Ordinary equality excludes NULLs on that arm before any padding or matching can happen.
+arrow::Result<LogicalNodePtr> CarryJoinedBindings(const Correlation& correlation,
+                                                  const LogicalNodePtr& input,
+                                                  JoinedBindings& bindings) {
+  const auto refuse = [&] {
+    return correlation.Refuse("whose two join inputs need the same plain binding keys");
+  };
+  LogicalNodePtr declined;
+  const auto spine = Descend(Mode::kLift, input, &declined, correlation.outer);
+  if (!spine || !FreeVariables(*spine->below).empty() ||
+      FirstUnsafeInnerNode(spine->below, true) != nullptr) {
+    return refuse();
+  }
+  const auto available = OutputIds(*spine->below);
+  ARROW_ASSIGN_OR_RAISE(const auto conjuncts, ConjunctsOf(correlation, *spine));
+  std::vector<Predicate> filters;
+  for (const ExprPtr* conjunct : conjuncts) {
+    const auto key = AsKey(**conjunct, correlation.outer);
+    if (!key || key->inner_type != key->outer_type ||
+        !std::ranges::contains(available, key->inner.id)) {
+      return refuse();
+    }
+    JoinedBinding binding{
+        .outer = {.id = key->outer.id, .name = key->outer_name, .type = key->outer_type},
+        .inner = {.id = key->inner.id, .name = key->inner_name, .type = key->inner_type}};
+    if (!bindings.try_emplace(key->outer.id, binding).second) {
+      return refuse();
+    }
+    if (!key->null_equal) {
+      filters.push_back({.kind = Predicate::Kind::kIsNotNull, .column = binding.inner});
+    }
+  }
+  LogicalNodePtr arm = spine->below;
+  if (!filters.empty()) {
+    arm = Make(FilterNode{
+        .input = std::move(arm), .predicates = std::move(filters), .span = spine->filter->span});
+  }
+  for (const Step& step : std::ranges::reverse_view(spine->steps)) {
+    if (const auto* project = std::get_if<ProjectNode>(step.node.get())) {
+      ProjectNode out = *project;
+      out.input = std::move(arm);
+      for (const auto& [outer, binding] : bindings) {
+        if (!std::ranges::contains(out.ids, binding.inner.id)) {
+          out.ids.push_back(binding.inner.id);
+          out.columns.push_back(binding.inner);
+        }
+      }
+      if (!out.constants.empty()) {
+        out.constants.resize(out.ids.size());
+      }
+      arm = Make(std::move(out));
+    } else if (const auto* compute = std::get_if<ComputeNode>(step.node.get());
+               compute != nullptr && std::ranges::all_of(compute->exprs, [](const ExprPtr& expr) {
+                 return CanEvaluateOnUnmatchedRow(*expr, nullptr);
+               })) {
+      arm = WithInputs(*step.node, {std::move(arm)});
+    } else {
+      return refuse();
+    }
+  }
+  if (!FreeVariables(*arm).empty()) {
+    return refuse();
+  }
+  return arm;
+}
+
+// SQ10's two-input join rule. Equal binding tuples partition the inputs before the original ON
+// compares their rows. A FULL join can produce rows from either side, so use the surviving
+// representative on a padded row. Pass the resulting correlation to the ordinary lift rule.
+arrow::Result<LogicalNodePtr> LiftJoinedBindings(const Correlation& correlation,
+                                                 const LogicalNodePtr& input) {
+  if (std::holds_alternative<ProjectNode>(*input) || std::holds_alternative<ComputeNode>(*input)) {
+    const auto child = InputsOf(*input).front();
+    ARROW_ASSIGN_OR_RAISE(auto rewritten, LiftJoinedBindings(correlation, child));
+    return child == rewritten ? input : WithInputs(*input, {std::move(rewritten)});
+  }
+  if (const auto* filter = std::get_if<FilterNode>(input.get())) {
+    ARROW_ASSIGN_OR_RAISE(const auto child, LiftJoinedBindings(correlation, filter->input));
+    if (child != filter->input) {
+      return correlation.Refuse("with an additional filter above its two correlated join inputs");
+    }
+    return input;
+  }
+  const auto* join = std::get_if<JoinNode>(input.get());
+  if (join == nullptr ||
+      (join->kind != JoinKind::kInner && join->kind != JoinKind::kLeft &&
+       join->kind != JoinKind::kFull) ||
+      FreeVariables(*join->left).empty() || FreeVariables(*join->right).empty()) {
+    return input;
+  }
+  if (!std::ranges::all_of(join->residual, [](const ExprPtr& expr) {
+        return CanEvaluateOnUnmatchedRow(*expr, nullptr);
+      })) {
+    return correlation.Refuse("with a potentially failing ON over two correlated join inputs");
+  }
+  JoinedBindings left;
+  JoinedBindings right;
+  JoinNode out = *join;
+  ARROW_ASSIGN_OR_RAISE(out.left, CarryJoinedBindings(correlation, join->left, left));
+  ARROW_ASSIGN_OR_RAISE(out.right, CarryJoinedBindings(correlation, join->right, right));
+  if (left.size() != right.size() || !std::ranges::all_of(left, [&](const auto& binding) {
+        return right.contains(binding.first);
+      })) {
+    return correlation.Refuse("whose two join inputs need the same plain binding keys");
+  }
+  const auto fresh = [&] {
+    correlation.last_id = ColumnId{std::to_underlying(correlation.last_id) + 1};
+    return correlation.last_id;
+  };
+  ComputeNode full_keys{.span = join->span};
+  ComputeNode conditions{.span = join->span};
+  FilterNode filter{.span = join->span};
+  for (const auto& [id, binding] : left) {
+    BoundColumn key = binding.inner;
+    const BoundColumn& other = right.at(id).inner;
+    out.keys.push_back({.left = key, .right = other, .null_equal = true});
+    if (join->kind == JoinKind::kFull) {
+      full_keys.exprs.push_back(
+          std::make_shared<const Expr>(Expr{.node = CaseExpr{.whens = {nullptr},
+                                                             .thens = {ColumnValue(key)},
+                                                             .otherwise = ColumnValue(other)},
+                                            .type = key.type,
+                                            .name = key.name}));
+      key.id = fresh();
+      full_keys.ids.push_back(key.id);
+    }
+    conditions.exprs.push_back(ConditionOf(
+        Predicate{.kind = Predicate::Kind::kIsNotDistinct, .column = key, .other = binding.outer},
+        key));
+    const ColumnId condition = fresh();
+    conditions.ids.push_back(condition);
+    filter.predicates.push_back(
+        {.kind = Predicate::Kind::kIsTrue,
+         .column = BoundColumn{.id = condition, .type = LogicalType::kBoolean}});
+  }
+  conditions.input = Make(std::move(out));
+  if (!FreeVariables(*conditions.input).empty()) {
+    return correlation.Refuse("whose two join inputs have an enclosing reference in ON");
+  }
+  if (!full_keys.ids.empty()) {
+    full_keys.input = std::move(conditions.input);
+    conditions.input = Make(std::move(full_keys));
+  }
+  filter.input = Make(std::move(conditions));
+  return Make(std::move(filter));
+}
+
 arrow::Result<Rewritten> ExistsJoin(const Correlation& correlation) {
-  LogicalNodePtr input = StaticGrouping(correlation.join.right);
+  ARROW_ASSIGN_OR_RAISE(auto input,
+                        LiftJoinedBindings(correlation, StaticGrouping(correlation.join.right)));
   const auto* limit = std::get_if<LimitNode>(input.get());
   const int64_t offset = limit == nullptr ? 0 : limit->offset;
   if (limit != nullptr && limit->limit == 0) {
@@ -3558,7 +3714,8 @@ arrow::Result<Rewritten> ExistsJoin(const Correlation& correlation) {
 }
 
 arrow::Result<Rewritten> MembershipJoin(const Correlation& correlation) {
-  const LogicalNodePtr input = StaticGrouping(correlation.join.right);
+  ARROW_ASSIGN_OR_RAISE(auto input,
+                        LiftJoinedBindings(correlation, StaticGrouping(correlation.join.right)));
   LogicalNodePtr declined;
   if (const auto plain = Descend(Mode::kLift, input, &declined, correlation.outer)) {
     return LiftJoin(correlation, *plain);

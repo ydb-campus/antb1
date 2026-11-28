@@ -6157,6 +6157,7 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
   int mixed_positive = 0;
   int mixed_negative = 0;
   int derived = 0;
+  int joined = 0;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedIn)) {
@@ -6175,10 +6176,14 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
     if (q.features.Has(Feature::kDerivedCorrelation)) {
       ++derived;
       EXPECT_TRUE(set.where.empty());
-      ASSERT_EQ(set.from.size(), 1U);
-      const auto* input = std::get_if<sql::DerivedTable>(&set.from.front().source);
-      ASSERT_NE(input, nullptr);
-      EXPECT_EQ(input->query->where.size(), 1U);
+      const bool two_inputs = q.features.Has(Feature::kJoinedCorrelation);
+      joined += static_cast<int>(two_inputs);
+      ASSERT_EQ(set.from.size(), two_inputs ? 2U : 1U);
+      for (const auto& binding : set.from) {
+        const auto* input = std::get_if<sql::DerivedTable>(&binding.source);
+        ASSERT_NE(input, nullptr);
+        EXPECT_EQ(input->query->where.size(), 1U);
+      }
     } else {
       EXPECT_FALSE(set.where.empty());
     }
@@ -6201,6 +6206,7 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
   EXPECT_GT(mixed_negative, 0);
   EXPECT_GT(mixed_positive, 0);
   EXPECT_GT(derived, 0);
+  EXPECT_GT(joined, 0);
 }
 
 // SQ8b's seven block shapes retain SQ8a's keyed correlation and expose their feature tag.

@@ -380,3 +380,84 @@ INTEGER
 9
 10
 11
+
+# A cross join of two dependent inputs only pairs rows belonging to the same outer binding.
+query I nosort
+SELECT o.id FROM edge o WHERE o.id IN
+(SELECT r.member FROM (SELECT i.i16 FROM edge i WHERE i.id = o.id) l
+CROSS JOIN (SELECT j.id AS member FROM edge j WHERE j.id = o.id) r)
+ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+# The ON values alone would cross all bindings. Keep the original ON and add both binding keys.
+query I nosort
+SELECT o.id FROM edge o WHERE EXISTS
+(WITH l AS (SELECT 1 AS v FROM edge i WHERE (i.id = o.id AND i.i16 IS NOT DISTINCT FROM o.i16)),
+r AS (SELECT 1 AS v FROM edge j WHERE j.id = o.id AND j.i16 = o.i16)
+SELECT l.v FROM l JOIN r ON (l.v = r.v AND l.v IS NOT DISTINCT FROM r.v))
+ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+3
+4
+6
+7
+9
+10
+11
+
+# With no matching right binding, LEFT JOIN still produces the padded NULL membership item.
+query I nosort
+SELECT o.id FROM edge o WHERE o.id NOT IN
+(SELECT r.member FROM (SELECT i.id FROM edge i WHERE i.i16 IS NOT DISTINCT FROM o.i16) l
+LEFT JOIN (SELECT j.id AS member FROM edge j WHERE j.i16 = o.i16) r ON l.id = r.member)
+ORDER BY o.id
+----
+INTEGER
+
+# The FULL join keeps right-only bindings and each side's NULL-equal outer key.
+query I nosort
+SELECT o.id FROM edge o WHERE o.id IN
+(SELECT r.member FROM (SELECT i.id FROM edge i WHERE i.i16 = o.i16) l
+FULL JOIN (SELECT j.id AS member FROM edge j WHERE j.i16 IS NOT DISTINCT FROM o.i16) r
+ON l.id = r.member)
+ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+# Only the right input has rows. FULL keeps them, and its surviving key binds to the outer row.
+query I nosort
+SELECT o.id FROM edge o WHERE NOT EXISTS
+(SELECT l.v FROM (SELECT i.id AS v FROM edge i WHERE i.id = o.id AND i.id = i.i32) l
+FULL JOIN (SELECT j.id AS v FROM edge j WHERE j.id = o.id) r ON l.v = r.v)
+ORDER BY o.id
+----
+INTEGER

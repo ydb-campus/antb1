@@ -3176,20 +3176,46 @@ class Builder {
         !derived_rng.Percent(75)) {
       used_.Add(Feature::kDerivedCorrelation);
       used_.Add(Feature::kDerivedTable);
+      // The nested join belongs to this shape. The general join features describe outer FROM.
+      const bool joined =
+          allowed_.Has(Feature::kJoinedCorrelation) &&
+          (c.inner_unique ||
+           SaturatingProduct(from_->rows, SaturatingProduct(c.inner->rows, c.inner->rows)) <=
+               kMaxJoinRows) &&
+          derived_rng.Percent(50);
       Keyword("SELECT");
-      Symbol("*");
+      const std::string_view alias =
+          SameName(c.outer->name, "binding_left") ? "binding_first" : "binding_left";
+      if (joined && membership) {
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = std::string(alias)});
+        Symbol(".");
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = item->name});
+      } else {
+        Symbol("*");
+      }
       Keyword("FROM");
-      Symbol("(");
-      Keyword("SELECT");
-      InnerColumn(c, *item);
-      Keyword("FROM");
-      used_.Add(Feature::kTableName);
-      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
-      Keyword("WHERE");
-      InnerColumn(c, *c.inner_key);
-      static_cast<void>(CorrelatedKeyComparison());
-      OuterColumn(c);
-      Symbol(")");
+      const auto emit_input = [&] {
+        Symbol("(");
+        Keyword("SELECT");
+        InnerColumn(c, *item);
+        Keyword("FROM");
+        used_.Add(Feature::kTableName);
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+        Keyword("WHERE");
+        InnerColumn(c, *c.inner_key);
+        static_cast<void>(CorrelatedKeyComparison());
+        OuterColumn(c);
+        Symbol(")");
+      };
+      emit_input();
+      if (joined) {
+        used_.Add(Feature::kJoinedCorrelation);
+        Keyword("AS");
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = std::string(alias)});
+        Keyword("CROSS");
+        Keyword("JOIN");
+        emit_input();
+      }
       Symbol(")");
       return;
     }
