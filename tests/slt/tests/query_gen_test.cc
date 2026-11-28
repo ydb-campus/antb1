@@ -6055,7 +6055,9 @@ TEST(QueryGenerator, NestedCorrelationsHaveThreeQueryBlocks) {
 }
 
 TEST(QueryGenerator, MiddleEqualityExistsReachesPastTheMiddleTable) {
-  const auto features = kSupportedFeatures.Minus({Feature::kLayout, Feature::kKeywordCase});
+  const auto features =
+      kSupportedFeatures.Minus({Feature::kLayout, Feature::kKeywordCase, Feature::kIdentifierCase,
+                                Feature::kQuotedIdentifier});
   const auto gen = MakeOver(JoinTables(), 71, {.supported = features, .target_percent = 0});
   const auto control = MakeOver(
       JoinTables(), 71,
