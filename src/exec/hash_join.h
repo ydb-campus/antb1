@@ -200,6 +200,10 @@ class BuildsFirstOperator final : public Operator {
   const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override {
     return sink_->RequestPartitioning(column, request);
   }
+  [[nodiscard]] std::size_t ReadyBatches(std::size_t limit, int64_t min_rows,
+                                         int64_t max_rows) const override {
+    return sink_opened_ ? sink_->ReadyBatches(limit, min_rows, max_rows) : 0;
+  }
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override;
@@ -371,6 +375,10 @@ class HashJoinOperator final : public Operator {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
   }
+  void SetMayStopEarly() override {
+    bounded_consumer_ = true;
+    input_->SetMayStopEarly();  // The build is drained before probing.
+  }
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override;
@@ -400,6 +408,16 @@ class HashJoinOperator final : public Operator {
   // The next probe batch with selected rows and its matches (none when nothing is looked up), or
   // the end of the input.
   arrow::Status Pull();
+  // Moves first into an ordered wave when the group operator has already materialized eligible
+  // successors. On the serial path the caller retains first and the group cursor stays put.
+  arrow::Status StartReadyProbes(Batch& first);
+  arrow::Result<Batch> ProbeReady(const Batch& input) const;
+  arrow::Status FindMatches(const Batch& in, arrow::ArrayVector& keys,
+                            std::vector<JoinMatches>& matches, MemoryReservation& memory) const;
+  arrow::Result<Batch> LeftWindow(const Batch& input, int64_t begin,
+                                  std::span<const JoinMatches> matches,
+                                  std::vector<JoinRowRef>& refs, MemoryReservation& memory,
+                                  std::shared_ptr<arrow::BooleanArray> selection) const;
   // The next output of the current probe batch, by the join's kind: on the 1:1 path or the 1:N
   // path of an inner join, on the 1:1 path (NextLeftWindow) or the other one (NextPadded) of a
   // left join, of a semi, anti or null-aware anti join (NextSelected, after EvaluatePairs when it
@@ -473,7 +491,11 @@ class HashJoinOperator final : public Operator {
   arrow::Result<arrow::ArrayVector> TakeProbe(std::span<const std::uint32_t> rows);
   // The build's columns of build_rows_[0, rows).
   template <bool kWithNulls>
-  arrow::Result<arrow::ArrayVector> GatherBuild(int64_t rows);
+  arrow::Result<arrow::ArrayVector> GatherBuild(int64_t rows) const {
+    return GatherBuild<kWithNulls>(std::span(build_rows_).first(static_cast<std::size_t>(rows)));
+  }
+  template <bool kWithNulls>
+  arrow::Result<arrow::ArrayVector> GatherBuild(std::span<const JoinRowRef> refs) const;
   // The output batch of these probe and build columns.
   std::shared_ptr<arrow::RecordBatch> Assemble(const arrow::ArrayVector& probe,
                                                const arrow::ArrayVector& build, int64_t rows) const;
@@ -502,6 +524,7 @@ class HashJoinOperator final : public Operator {
   // marks and, once its input ends, emits the build rows no probe row matched through tail_rows_
   // before it releases the build (ADR 0037's OJ2).
   bool own_tail_ = false;
+  bool bounded_consumer_ = false;
   bool tailing_ = false;  // its input ended and tail_rows_ is emitting
   BuildRowEmitter tail_rows_;
   std::vector<int> pair_probe_;  // columns of the probe's output
@@ -555,6 +578,10 @@ class HashJoinOperator final : public Operator {
   std::vector<JoinRowRef> pair_builds_;    // build rows
   std::vector<std::uint32_t> pair_slots_;  // and slots (after PassingSlots: those that passed)
   MemoryReservation memory_;               // matches_ and the vectors from probe_rows_ on
+  MemoryReservation ready_memory_;         // the bounded array of batch references
+  std::vector<Batch> ready_inputs_;
+  std::size_t next_ready_ = 0;
+  std::unique_ptr<PartScheduler<Batch>> ready_probes_;  // joined before the inputs or build go
 };
 
 // A join that emits its build rows (EmitsBuildRows; ADR 0026's C2b) as the sink of its own probe

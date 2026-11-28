@@ -1,5 +1,6 @@
 #include "antb1/exec/project.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <utility>
@@ -46,6 +47,16 @@ const BatchPartition* ProjectOperator::RequestPartitioning(int column, Partition
     return nullptr;
   }
   return input_->RequestPartitioning(columns_[field], request);
+}
+
+std::size_t ProjectOperator::ReadyBatches(std::size_t limit, int64_t min_rows,
+                                          int64_t max_rows) const {
+  // An unselected input only needs its existing arrays reordered. Broadcasting a constant
+  // would allocate an array even when every input row is already materialized.
+  if (std::ranges::any_of(constants_, [](const auto& value) { return value != nullptr; })) {
+    return 0;
+  }
+  return input_->ReadyBatches(limit, min_rows, max_rows);
 }
 
 arrow::Status ProjectOperator::Open(ExecContext& ctx) {

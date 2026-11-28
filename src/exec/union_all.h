@@ -37,6 +37,11 @@ class UnionAllOperator final : public Operator {
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
   }
+  void SetMayStopEarly() override {
+    for (const auto& input : inputs_) {
+      input->SetMayStopEarly();
+    }
+  }
   // Records the context: the first Next opens input 0.
   arrow::Status Open(ExecContext& ctx) override;
   // Invalid for a batch whose column is not of the union's type at its position.

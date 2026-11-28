@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -50,6 +51,10 @@ struct ExecContext {
   std::shared_ptr<plan::ScanContext> scans = nullptr;
   // A combined equality-domain producer may only scan the union of its members' parts.
   CombinedJoinFilter join_filter = CombinedJoinFilter::kOrdinary;
+  // The caller can retry this execution with a fresh tree after an allocation failure. Set
+  // before fetching speculative probe input, including when only the backend limits allocations.
+  // A null pointer requests serial probes (the retry, or a caller without a retry boundary).
+  std::atomic<bool>* ready_probe_used = nullptr;
 };
 
 // Rows flowing from one operator to the next: the columns and, optionally, a selection. A selection
@@ -86,8 +91,18 @@ class Operator {
 
   // The schema of every batch's data. Field names are internal: the engine names the result.
   [[nodiscard]] virtual const std::shared_ptr<arrow::Schema>& output_schema() const = 0;
+  // A finite LIMIT may stop pulling after any batch. Streaming operators pass this hint to
+  // inputs they can stop early; an operator that drains its input need not pass it on.
+  virtual void SetMayStopEarly() {}
   virtual const BatchPartition* RequestPartitioning(int /*column*/, PartitionRequest /*request*/) {
     return nullptr;
+  }
+  // Up to limit consecutive already materialized, selection-free batches with min_rows to
+  // max_rows rows each (inclusive). Next() can return them without further input evaluation
+  // or allocation from the query pool. The cursor remains owned by its single consumer.
+  [[nodiscard]] virtual std::size_t ReadyBatches(std::size_t /*limit*/, int64_t /*min_rows*/,
+                                                 int64_t /*max_rows*/) const {
+    return 0;
   }
   // Prepares a (re)run; opens the inputs first.
   virtual arrow::Status Open(ExecContext& ctx) = 0;
