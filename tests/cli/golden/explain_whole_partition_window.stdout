@@ -1,5 +1,5 @@
 Output: COUNT(*) OVER ():BIGINT
 Project "COUNT(*) OVER ()"
-  Window [COUNT(*) OVER () {whole partition}]
-    PartUnion in part order
-      Scan table=edge source=parquet(files=1, rows=12) columns=[]
+└─Window [COUNT(*) OVER () {whole partition}]
+  └─PartUnion in part order
+    └─Scan table=edge source=parquet(files=1, rows=12) columns=[]

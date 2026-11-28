@@ -1,5 +1,5 @@
 Output: SUM(i32) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING):HUGEINT
 Project "SUM(i32) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING)"
-  Window [SUM(i32) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) {ROWS prefix}]
-    PartUnion in part order
-      Scan table=edge source=parquet(files=1, rows=12) columns=[id, i32]
+└─Window [SUM(i32) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) {ROWS prefix}]
+  └─PartUnion in part order
+    └─Scan table=edge source=parquet(files=1, rows=12) columns=[id, i32]

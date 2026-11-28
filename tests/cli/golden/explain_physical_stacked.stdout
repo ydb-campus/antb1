@@ -1,0 +1,9 @@
+Output: count_star():BIGINT sum(tr_fare):DECIMAL(38,2)
+PartAggregate Aggregate COUNT(*), SUM(trips.tr_fare)
+└─HashJoin Join INNER build=left keys=[zones.zn_id = trips.tr_pickup] carries 4 of 5 unread above
+  ├─HashBuild Join INNER build=left keys=[zones.zn_id = trips.tr_pickup] carries 4 of 5 unread above
+  │ └─Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
+  └─HashJoin Join INNER build=left keys=[riders.rd_id = trips.tr_rider] carries 2 of 4 unread above
+    ├─HashBuild Join INNER build=left keys=[riders.rd_id = trips.tr_rider] carries 2 of 4 unread above
+    │ └─Scan table=riders source=parquet(files=1, rows=240) columns=[rd_id]
+    └─Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_rider, tr_pickup, tr_fare], key filter candidate on tr_rider or tr_pickup

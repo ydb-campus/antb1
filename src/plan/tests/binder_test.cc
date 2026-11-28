@@ -2395,13 +2395,13 @@ TEST(BinderTest, UnionPlans) {
            Case{.sql = "SELECT i16 FROM t UNION (SELECT i16 FROM u UNION SELECT i16 FROM t)",
                 .explain = "SetOperation inputs=3 formula=(0 UNION (1 UNION 2))"},
            Case{.sql = "SELECT i16 FROM t UNION SELECT i16 FROM u UNION ALL SELECT i16 FROM t",
-                .explain = "UnionAll inputs=2 columns=[i16]\n  SetOperation inputs=2"},
+                .explain = "UnionAll inputs=2 columns=[i16]\n├─SetOperation inputs=2"},
            Case{.sql = "SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION SELECT i16 FROM t",
-                .explain = "SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n  UnionAll "
+                .explain = "SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n├─UnionAll "
                            "inputs=2"},
            Case{
                .sql = "SELECT i16 FROM t UNION (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
-               .explain = "SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n  Project i16"},
+               .explain = "SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n├─Project i16"},
        }) {
     auto plan = BindSql(c.sql, catalog);
     ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
@@ -2550,11 +2550,11 @@ TEST(BinderTest, IntersectPlans) {
                 .explain = "SetOperation inputs=3 formula=((0 INTERSECT 1) INTERSECT ALL 2)"},
            Case{.sql = "(SELECT i16 FROM t INTERSECT ALL SELECT i16 FROM u) UNION ALL SELECT i16 "
                        "FROM t",
-                .explain = "UnionAll inputs=2 columns=[i16]\n  SetOperation inputs=2 "
+                .explain = "UnionAll inputs=2 columns=[i16]\n├─SetOperation inputs=2 "
                            "formula=(0 INTERSECT ALL 1)"},
            Case{
                .sql = "SELECT i16 FROM t INTERSECT (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
-               .explain = "SetOperation inputs=2 formula=(0 INTERSECT 1) columns=[i16]\n  Project "
+               .explain = "SetOperation inputs=2 formula=(0 INTERSECT 1) columns=[i16]\n├─Project "
                           "i16"},
        }) {
     auto plan = BindSql(c.sql, catalog);
@@ -2651,7 +2651,7 @@ TEST(BinderTest, ExceptPlansAndTypes) {
                        "FROM t",
                 .explain = "SetOperation inputs=3 formula=((0 INTERSECT ALL 1) EXCEPT ALL 2)"},
            Case{.sql = "SELECT i16 FROM t UNION ALL SELECT i16 FROM u EXCEPT SELECT i16 FROM t",
-                .explain = "SetOperation inputs=2 formula=(0 EXCEPT 1) columns=[i16]\n  UnionAll "
+                .explain = "SetOperation inputs=2 formula=(0 EXCEPT 1) columns=[i16]\n├─UnionAll "
                            "inputs=2"},
        }) {
     auto plan = BindSql(c.sql, catalog);
@@ -2871,9 +2871,9 @@ TEST(BinderTest, RollupBindsToAGroupingSetsNode) {
   EXPECT_EQ(Explain(*plan),
             R"x(Output: s:VARCHAR sum(i32):HUGEINT
 Project s, "sum(i32)"
-  Filter "count_star()" > 1
-    GroupingSets keys=[s] sets=[(), (s)] SUM(i32), COUNT(*)
-      Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "Mixed Case", from]
+└─Filter "count_star()" > 1
+  └─GroupingSets keys=[s] sets=[(), (s)] SUM(i32), COUNT(*)
+    └─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "Mixed Case", from]
 )x");
 }
 
@@ -5381,8 +5381,8 @@ TEST(BinderTest, BooleanConditions) {
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
   std::string explain = Explain(*plan);
   EXPECT_NE(explain.find("Filter \"((i16 = 1) OR ((s ~~ 'a%') AND (i64 <= 3)))\"\n"
-                         "    Compute ((i16 = 1) OR ((s ~~ 'a%') AND (i64 <= 3)))\n"
-                         "      Filter i32 > 0"),
+                         "  └─Compute ((i16 = 1) OR ((s ~~ 'a%') AND (i64 <= 3)))\n"
+                         "    └─Filter i32 > 0"),
             std::string::npos)
       << explain;
   auto folded = BindSql("SELECT COUNT(*) FROM t WHERE NOT (i16 = 1.5) OR i16 + 1 > 10", catalog);
@@ -5411,8 +5411,8 @@ TEST(BinderTest, BooleanConditions) {
   ASSERT_TRUE(having.ok()) << having.status().ToString();
   explain = Explain(*having);
   EXPECT_NE(explain.find("Filter \"((n > 1) OR (NOT (min(s) ~~ 'x%')))\"\n"
-                         "    Compute ((n > 1) OR (NOT (min(s) ~~ 'x%')))\n"
-                         "      GroupAggregate"),
+                         "  └─Compute ((n > 1) OR (NOT (min(s) ~~ 'x%')))\n"
+                         "    └─GroupAggregate"),
             std::string::npos)
       << explain;
 }
@@ -6841,27 +6841,27 @@ TEST(BinderTest, HavingFiltersBeforeTheSelectListIsComputed) {
   EXPECT_EQ(optimized("SELECT i32, SUM(i16) + 1 AS s FROM t GROUP BY i32 HAVING s > 5 ORDER BY s"),
             "Output: i32:INTEGER s:HUGEINT\n"
             "Project i32, s\n"
-            "  Sort s ASC NULLS LAST\n"
-            "    Compute (sum(i16) + 1)\n"
-            "      Filter \"sum(i16)\" > 4\n"
-            "        GroupAggregate keys=[i32] SUM(i16)\n"
-            "          Scan table=t source=fake columns=[i16, i32]\n");
+            "└─Sort s ASC NULLS LAST\n"
+            "  └─Compute (sum(i16) + 1)\n"
+            "    └─Filter \"sum(i16)\" > 4\n"
+            "      └─GroupAggregate keys=[i32] SUM(i16)\n"
+            "        └─Scan table=t source=fake columns=[i16, i32]\n");
   EXPECT_EQ(
       optimized("SELECT i32, SUM(i16) + 1 AS s FROM t GROUP BY i32 HAVING s > 5 OR i32 * 2 < 0"),
       "Output: i32:INTEGER s:HUGEINT\n"
       "Project i32, s\n"
-      "  Compute (sum(i16) + 1)\n"
-      "    Filter \"((s > 5) OR ((i32 * 2) < 0))\"\n"
-      "      Compute ((s > 5) OR ((i32 * 2) < 0))\n"
-      "        GroupAggregate keys=[i32] SUM(i16)\n"
-      "          Scan table=t source=fake columns=[i16, i32]\n");
+      "└─Compute (sum(i16) + 1)\n"
+      "  └─Filter \"((s > 5) OR ((i32 * 2) < 0))\"\n"
+      "    └─Compute ((s > 5) OR ((i32 * 2) < 0))\n"
+      "      └─GroupAggregate keys=[i32] SUM(i16)\n"
+      "        └─Scan table=t source=fake columns=[i16, i32]\n");
   EXPECT_EQ(optimized("SELECT MAX(i32) * 2 FROM t HAVING MAX(i32) < 0"),
             "Output: (max(i32) * 2):INTEGER\n"
             "Project \"(max(i32) * 2)\"\n"
-            "  Compute (max(i32) * 2)\n"
-            "    Filter \"max(i32)\" < 0\n"
-            "      Aggregate MAX(i32)\n"
-            "        Scan table=t source=fake columns=[i32]\n");
+            "└─Compute (max(i32) * 2)\n"
+            "  └─Filter \"max(i32)\" < 0\n"
+            "    └─Aggregate MAX(i32)\n"
+            "      └─Scan table=t source=fake columns=[i32]\n");
 }
 
 // Every column a bound plan creates has its own id, and Bind resolves every position from the ids
@@ -7009,12 +7009,12 @@ TEST(BinderTest, AnUncorrelatedScalarSubqueryOfAnyShapeIsItsSingleValue) {
   EXPECT_EQ(Explain(Optimized(*plan)),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter i32 = i32\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Scan table=t source=fake columns=[i16, i32]\n"
-            "      Aggregate SINGLE_VALUE(i32)\n"
-            "        Project i32\n"
-            "          Scan table=u source=fake columns=[i32]\n");
+            "└─Filter i32 = i32\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Scan table=t source=fake columns=[i16, i32]\n"
+            "    └─Aggregate SINGLE_VALUE(i32)\n"
+            "      └─Project i32\n"
+            "        └─Scan table=u source=fake columns=[i32]\n");
 }
 
 // The correlated-EXISTS gate reads a name that a select alias of the block and a column of the
@@ -7655,69 +7655,69 @@ TEST(BinderTest, ASubqueryIsBoundOncePerSlot) {
                       "MIN(i16) FROM u) + 10"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter i32 <= \"(min(i16) + 10)\"\n"
-            "    Compute (min(i16) + 10)\n"
-            "      Filter i32 >= \"min(i16)\"\n"
-            "        Join ONE-ROW build=right keys=[]\n"
-            "          Scan table=t source=fake columns=[i16, i32]\n"
-            "          Aggregate MIN(i16)\n"
-            "            Scan table=u source=fake columns=[i16]\n");
+            "└─Filter i32 <= \"(min(i16) + 10)\"\n"
+            "  └─Compute (min(i16) + 10)\n"
+            "    └─Filter i32 >= \"min(i16)\"\n"
+            "      └─Join ONE-ROW build=right keys=[]\n"
+            "        ├─Scan table=t source=fake columns=[i16, i32]\n"
+            "        └─Aggregate MIN(i16)\n"
+            "          └─Scan table=u source=fake columns=[i16]\n");
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i16 IS DISTINCT FROM (SELECT MIN(i16) FROM u) AND "
                       "CASE (SELECT MIN(i16) FROM u) WHEN 1 THEN i32 ELSE 0 END > 0"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"CASE  WHEN (((SELECT MIN(i16) FROM u) = 1)) THEN (i32) ELSE 0 END\" > 0\n"
-            "    Compute CASE  WHEN (((SELECT MIN(i16) FROM u) = 1)) THEN (i32) ELSE 0 END\n"
-            "      Filter i16 IS DISTINCT FROM \"min(i16)\"\n"
-            "        Join ONE-ROW build=right keys=[]\n"
-            "          Scan table=t source=fake columns=[i16, i32]\n"
-            "          Aggregate MIN(i16)\n"
-            "            Scan table=u source=fake columns=[i16]\n");
+            "└─Filter \"CASE  WHEN (((SELECT MIN(i16) FROM u) = 1)) THEN (i32) ELSE 0 END\" > 0\n"
+            "  └─Compute CASE  WHEN (((SELECT MIN(i16) FROM u) = 1)) THEN (i32) ELSE 0 END\n"
+            "    └─Filter i16 IS DISTINCT FROM \"min(i16)\"\n"
+            "      └─Join ONE-ROW build=right keys=[]\n"
+            "        ├─Scan table=t source=fake columns=[i16, i32]\n"
+            "        └─Aggregate MIN(i16)\n"
+            "          └─Scan table=u source=fake columns=[i16]\n");
   EXPECT_EQ(
       optimized("SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 > (SELECT MIN(i16) FROM "
                 "ok) WHERE u.i32 + 1 > (SELECT MIN(i16) FROM ok) OR t.i64 < 0"),
       "Output: i16:SMALLINT\n"
       "Project t.i16\n"
-      "  Filter \"(((u.i32 + 1) > (SELECT MIN(i16) FROM ok)) OR (t.i64 < 0))\"\n"
-      "    Compute (((u.i32 + 1) > (SELECT MIN(i16) FROM ok)) OR (t.i64 < 0))\n"
-      "      Filter t.i32 > \"min(i16)\"\n"
-      "        Join ONE-ROW build=right keys=[] carries 1 of 6 unread above\n"
-      "          Join INNER build=right keys=[u.i16 = t.i16] carries 1 of 5 unread above\n"
-      "            Scan table=u source=fake columns=[i16, i32]\n"
-      "            Scan table=t source=fake columns=[i16, i32, i64]\n"
-      "          Aggregate MIN(i16)\n"
-      "            Scan table=ok source=fake columns=[i16]\n");
+      "└─Filter \"(((u.i32 + 1) > (SELECT MIN(i16) FROM ok)) OR (t.i64 < 0))\"\n"
+      "  └─Compute (((u.i32 + 1) > (SELECT MIN(i16) FROM ok)) OR (t.i64 < 0))\n"
+      "    └─Filter t.i32 > \"min(i16)\"\n"
+      "      └─Join ONE-ROW build=right keys=[] carries 1 of 6 unread above\n"
+      "        ├─Join INNER build=right keys=[u.i16 = t.i16] carries 1 of 5 unread above\n"
+      "        │ ├─Scan table=u source=fake columns=[i16, i32]\n"
+      "        │ └─Scan table=t source=fake columns=[i16, i32, i64]\n"
+      "        └─Aggregate MIN(i16)\n"
+      "          └─Scan table=ok source=fake columns=[i16]\n");
   // IS DISTINCT FROM's lowering, which a constant side makes (x <> 5 OR x IS NULL), and a
   // comparison whose constant moves across the value both read the one join.
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) IS DISTINCT FROM 5 AND "
                       "(SELECT MIN(i16) FROM u) + 1 > 5"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"min(i16)\" > 4\n"
-            "    Filter \"((SELECT MIN(i16) FROM u) IS DISTINCT FROM 5)\"\n"
-            "      Compute ((SELECT MIN(i16) FROM u) IS DISTINCT FROM 5)\n"
-            "        Join ONE-ROW build=right keys=[]\n"
-            "          Scan table=t source=fake columns=[i16]\n"
-            "          Aggregate MIN(i16)\n"
-            "            Scan table=u source=fake columns=[i16]\n");
+            "└─Filter \"min(i16)\" > 4\n"
+            "  └─Filter \"((SELECT MIN(i16) FROM u) IS DISTINCT FROM 5)\"\n"
+            "    └─Compute ((SELECT MIN(i16) FROM u) IS DISTINCT FROM 5)\n"
+            "      └─Join ONE-ROW build=right keys=[]\n"
+            "        ├─Scan table=t source=fake columns=[i16]\n"
+            "        └─Aggregate MIN(i16)\n"
+            "          └─Scan table=u source=fake columns=[i16]\n");
   // Top-level comparisons and EXISTS conjuncts written alike read one join each, too.
   EXPECT_EQ(
       optimized("SELECT i16 FROM t WHERE i32 > (SELECT MIN(i16) FROM u) AND i16 < (SELECT "
                 "MIN(i16) FROM u) AND EXISTS (SELECT 1 FROM ok) AND EXISTS (SELECT 1 FROM ok)"),
       "Output: i16:SMALLINT\n"
       "Project i16\n"
-      "  Filter \"count_star()\" = 1\n"
-      "    Filter \"count_star()\" = 1\n"
-      "      Join ONE-ROW build=right keys=[] carries 2 of 4 unread above\n"
-      "        Filter i16 < \"min(i16)\"\n"
-      "          Filter i32 > \"min(i16)\"\n"
-      "            Join ONE-ROW build=right keys=[]\n"
-      "              Scan table=t source=fake columns=[i16, i32]\n"
-      "              Aggregate MIN(i16)\n"
-      "                Scan table=u source=fake columns=[i16]\n"
-      "        Aggregate COUNT(*)\n"
-      "          Limit 1\n"
-      "            Scan table=ok source=fake columns=[]\n");
+      "└─Filter \"count_star()\" = 1\n"
+      "  └─Filter \"count_star()\" = 1\n"
+      "    └─Join ONE-ROW build=right keys=[] carries 2 of 4 unread above\n"
+      "      ├─Filter i16 < \"min(i16)\"\n"
+      "      │ └─Filter i32 > \"min(i16)\"\n"
+      "      │   └─Join ONE-ROW build=right keys=[]\n"
+      "      │     ├─Scan table=t source=fake columns=[i16, i32]\n"
+      "      │     └─Aggregate MIN(i16)\n"
+      "      │       └─Scan table=u source=fake columns=[i16]\n"
+      "      └─Aggregate COUNT(*)\n"
+      "        └─Limit 1\n"
+      "          └─Scan table=ok source=fake columns=[]\n");
 }
 
 // OR factoring's dropped branch binds as a dry run (ADR 0041's decision 10): its subquery plants no
@@ -7736,8 +7736,8 @@ TEST(BinderTest, ADroppedOrBranchPlansNoJoinButKeepsItsBindErrors) {
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (i32 = 2 AND i32 > (SELECT i16 FROM u)) OR i32 = 2"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter i32 = 2\n"
-            "    Scan table=t source=fake columns=[i16, i32]\n");
+            "└─Filter i32 = 2\n"
+            "  └─Scan table=t source=fake columns=[i16, i32]\n");
   auto error = BindSql(
       "SELECT i16 FROM t WHERE (i32 = 2 AND i32 > (SELECT nope FROM u)) OR i32 = 2", catalog);
   ASSERT_FALSE(error.ok());
@@ -7761,37 +7761,37 @@ TEST(BinderTest, TheSlotsStandWhereDecisionNinePutsThem) {
       Explain(*plan),
       "Output: i16:SMALLINT\n"
       "Project i16\n"
-      "  DependentJoin SEMI\n"
-      "    Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", "
+      "└─DependentJoin SEMI\n"
+      "  ├─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", "
       "from]\n"
-      "    Project 1\n"
-      "      Filter \"(u.i16 = t.i16)\" AND \"(t.i64 > (SELECT MIN(ok.i16) FROM ok))\"\n"
-      "        Compute (u.i16 = t.i16), (t.i64 > (SELECT MIN(ok.i16) FROM ok))\n"
-      "          Filter i32 > \"(max(ok.i16) + 1)\"\n"
-      "            Compute (max(ok.i16) + 1)\n"
-      "              Join ONE-ROW build=right keys=[]\n"
-      "                Join ONE-ROW build=right keys=[]\n"
-      "                  Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+      "  └─Project 1\n"
+      "    └─Filter \"(u.i16 = t.i16)\" AND \"(t.i64 > (SELECT MIN(ok.i16) FROM ok))\"\n"
+      "      └─Compute (u.i16 = t.i16), (t.i64 > (SELECT MIN(ok.i16) FROM ok))\n"
+      "        └─Filter i32 > \"(max(ok.i16) + 1)\"\n"
+      "          └─Compute (max(ok.i16) + 1)\n"
+      "            └─Join ONE-ROW build=right keys=[]\n"
+      "              ├─Join ONE-ROW build=right keys=[]\n"
+      "              │ ├─Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
       "\"Mixed Case\", from]\n"
-      "                  Aggregate MIN(i16)\n"
-      "                    Scan table=ok source=fake columns=[i16, s]  [shared #1 of 2, 2 fields]\n"
-      "                Aggregate MAX(i16)\n"
-      "                  Scan table=ok source=fake columns=[i16, s]  [shared #1 of 2, 2 fields]\n");
+      "              │ └─Aggregate MIN(i16)\n"
+      "              │   └─Scan table=ok source=fake columns=[i16, s]  [shared #1 of 2, 2 fields]\n"
+      "              └─Aggregate MAX(i16)\n"
+      "                └─Scan table=ok source=fake columns=[i16, s]  [shared #1 of 2, 2 fields]\n");
   EXPECT_EQ(Explain(Optimized(*plan)),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Join SEMI build=right keys=[\"t.i16\" = \"u.i16\"] residual=[(t.i64 > (SELECT "
+            "└─Join SEMI build=right keys=[\"t.i16\" = \"u.i16\"] residual=[(t.i64 > (SELECT "
             "MIN(ok.i16) FROM ok))] carries 1 of 2 unread above\n"
-            "    Scan table=t source=fake columns=[i16, i64]\n"
-            "    Filter i32 > \"(max(ok.i16) + 1)\"\n"
-            "      Compute (max(ok.i16) + 1)\n"
-            "        Join ONE-ROW build=right keys=[]\n"
-            "          Join ONE-ROW build=right keys=[]\n"
-            "            Scan table=u source=fake columns=[i16, i32]\n"
-            "            Aggregate MIN(i16)\n"
-            "              Scan table=ok source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
-            "          Aggregate MAX(i16)\n"
-            "            Scan table=ok source=fake columns=[i16]  [shared #1 of 2, 1 field]\n");
+            "  ├─Scan table=t source=fake columns=[i16, i64]\n"
+            "  └─Filter i32 > \"(max(ok.i16) + 1)\"\n"
+            "    └─Compute (max(ok.i16) + 1)\n"
+            "      └─Join ONE-ROW build=right keys=[]\n"
+            "        ├─Join ONE-ROW build=right keys=[]\n"
+            "        │ ├─Scan table=u source=fake columns=[i16, i32]\n"
+            "        │ └─Aggregate MIN(i16)\n"
+            "        │   └─Scan table=ok source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
+            "        └─Aggregate MAX(i16)\n"
+            "          └─Scan table=ok source=fake columns=[i16]  [shared #1 of 2, 1 field]\n");
 }
 
 // An inner ON inside a FULL JOIN's left input has that input's own slot, below the FULL JOIN, which
@@ -7811,16 +7811,16 @@ TEST(BinderTest, AFullJoinsLeftInputHasASlotOfItsOwn) {
                       "FROM ok) + 2 FULL JOIN dec ON u.i32 = dec.i"),
             "Output: count_star():BIGINT\n"
             "Aggregate COUNT(*)\n"
-            "  Join FULL build=right keys=[u.i32 = dec.i]\n"
-            "    Filter t.i32 < \"(min(i16) + 2)\"\n"
-            "      Compute (min(i16) + 2)\n"
-            "        Join ONE-ROW build=right keys=[] carries 2 of 5 unread above\n"
-            "          Join INNER build=right keys=[u.i16 = t.i16] carries 2 of 4 unread above\n"
-            "            Scan table=u source=fake columns=[i16, i32]\n"
-            "            Scan table=t source=fake columns=[i16, i32]\n"
-            "          Aggregate MIN(i16)\n"
-            "            Scan table=ok source=fake columns=[i16]\n"
-            "    Scan table=dec source=fake columns=[i]\n");
+            "└─Join FULL build=right keys=[u.i32 = dec.i]\n"
+            "  ├─Filter t.i32 < \"(min(i16) + 2)\"\n"
+            "  │ └─Compute (min(i16) + 2)\n"
+            "  │   └─Join ONE-ROW build=right keys=[] carries 2 of 5 unread above\n"
+            "  │     ├─Join INNER build=right keys=[u.i16 = t.i16] carries 2 of 4 unread above\n"
+            "  │     │ ├─Scan table=u source=fake columns=[i16, i32]\n"
+            "  │     │ └─Scan table=t source=fake columns=[i16, i32]\n"
+            "  │     └─Aggregate MIN(i16)\n"
+            "  │       └─Scan table=ok source=fake columns=[i16]\n"
+            "  └─Scan table=dec source=fake columns=[i]\n");
 }
 
 // An uncorrelated EXISTS is COUNT(*) over LIMIT 1 of its block under a one-row join, compared with
@@ -7844,50 +7844,50 @@ TEST(BinderTest, AnUncorrelatedExistsIsACountOverLimitOne) {
                       "BY s)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"count_star()\" = 1\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "      Aggregate COUNT(*)\n"
-            "        Limit 1\n"
-            "          Sort s ASC NULLS LAST\n"
-            "            Filter i64 > 0\n"
-            "              Scan table=u source=fake columns=[i64, s]\n");
+            "└─Filter \"count_star()\" = 1\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Scan table=t source=fake columns=[i16]\n"
+            "    └─Aggregate COUNT(*)\n"
+            "      └─Limit 1\n"
+            "        └─Sort s ASC NULLS LAST\n"
+            "          └─Filter i64 > 0\n"
+            "            └─Scan table=u source=fake columns=[i64, s]\n");
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE NOT EXISTS (SELECT * FROM u)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"count_star()\" = 0\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "      Aggregate COUNT(*)\n"
-            "        Limit 1\n"
-            "          Scan table=u source=fake columns=[]\n");
+            "└─Filter \"count_star()\" = 0\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Scan table=t source=fake columns=[i16]\n"
+            "    └─Aggregate COUNT(*)\n"
+            "      └─Limit 1\n"
+            "        └─Scan table=u source=fake columns=[]\n");
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT i32 + 1, s FROM u ORDER BY i32 "
                       "LIMIT 2 OFFSET 3)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"count_star()\" = 1\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "      Aggregate COUNT(*)\n"
-            "        Limit 1\n"
-            "          Limit 2 OFFSET 3\n"
-            "            Sort i32 ASC NULLS LAST\n"
-            "              Scan table=u source=fake columns=[i32]\n");
+            "└─Filter \"count_star()\" = 1\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Scan table=t source=fake columns=[i16]\n"
+            "    └─Aggregate COUNT(*)\n"
+            "      └─Limit 1\n"
+            "        └─Limit 2 OFFSET 3\n"
+            "          └─Sort i32 ASC NULLS LAST\n"
+            "            └─Scan table=u source=fake columns=[i32]\n");
   // Under a DISTINCT the select list is the rows: it stays, and so does the Project its Sort reads.
   // A DISTINCT star expands, its columns being the rows: over every column of `ok`, and a column of
   // no engine type is then refused, as in any select list.
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT DISTINCT * FROM ok OFFSET 1)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"count_star()\" = 1\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "      Aggregate COUNT(*)\n"
-            "        Limit 1\n"
-            "          Limit ALL OFFSET 1\n"
-            "            GroupAggregate keys=[i16, s]\n"
-            "              Project i16, s\n"
-            "                Scan table=ok source=fake columns=[i16, s]\n");
+            "└─Filter \"count_star()\" = 1\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Scan table=t source=fake columns=[i16]\n"
+            "    └─Aggregate COUNT(*)\n"
+            "      └─Limit 1\n"
+            "        └─Limit ALL OFFSET 1\n"
+            "          └─GroupAggregate keys=[i16, s]\n"
+            "            └─Project i16, s\n"
+            "              └─Scan table=ok source=fake columns=[i16, s]\n");
   {
     const auto refused =
         BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT DISTINCT * FROM u)", catalog);
@@ -7899,56 +7899,56 @@ TEST(BinderTest, AnUncorrelatedExistsIsACountOverLimitOne) {
                       "BY x)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"count_star()\" = 1\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "      Aggregate COUNT(*)\n"
-            "        Limit 1\n"
-            "          Sort x ASC NULLS LAST\n"
-            "            GroupAggregate keys=[x]\n"
-            "              Project x\n"
-            "                Compute (i32 + 1)\n"
-            "                  Scan table=u source=fake columns=[i32]\n");
+            "└─Filter \"count_star()\" = 1\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Scan table=t source=fake columns=[i16]\n"
+            "    └─Aggregate COUNT(*)\n"
+            "      └─Limit 1\n"
+            "        └─Sort x ASC NULLS LAST\n"
+            "          └─GroupAggregate keys=[x]\n"
+            "            └─Project x\n"
+            "              └─Compute (i32 + 1)\n"
+            "                └─Scan table=u source=fake columns=[i32]\n");
   EXPECT_EQ(optimized("SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING EXISTS (SELECT i16 FROM u "
                       "GROUP BY i16 HAVING COUNT(*) > 1)"),
             "Output: i16:SMALLINT count_star():BIGINT\n"
             "Project i16, \"count_star()\"\n"
-            "  Filter \"count_star()\" = 1\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      GroupAggregate keys=[i16] COUNT(*)\n"
-            "        Scan table=t source=fake columns=[i16]\n"
-            "      Aggregate COUNT(*)\n"
-            "        Limit 1\n"
-            "          Filter \"count_star()\" > 1\n"
-            "            GroupAggregate keys=[i16] COUNT(*)\n"
-            "              Scan table=u source=fake columns=[i16]\n");
+            "└─Filter \"count_star()\" = 1\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─GroupAggregate keys=[i16] COUNT(*)\n"
+            "    │ └─Scan table=t source=fake columns=[i16]\n"
+            "    └─Aggregate COUNT(*)\n"
+            "      └─Limit 1\n"
+            "        └─Filter \"count_star()\" > 1\n"
+            "          └─GroupAggregate keys=[i16] COUNT(*)\n"
+            "            └─Scan table=u source=fake columns=[i16]\n");
   EXPECT_EQ(optimized("SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND NOT EXISTS (SELECT 1 "
                       "FROM u)"),
             "Output: i16:SMALLINT\n"
             "Project t.i16\n"
-            "  Filter \"count_star()\" = 0\n"
-            "    Join ONE-ROW build=right keys=[] carries 1 of 3 unread above\n"
-            "      Join INNER build=right keys=[t.i16 = ok.i16] carries 1 of 2 unread above\n"
-            "        Scan table=t source=fake columns=[i16]\n"
-            "        Scan table=ok source=fake columns=[i16]\n"
-            "      Aggregate COUNT(*)\n"
-            "        Limit 1\n"
-            "          Scan table=u source=fake columns=[]\n");
+            "└─Filter \"count_star()\" = 0\n"
+            "  └─Join ONE-ROW build=right keys=[] carries 1 of 3 unread above\n"
+            "    ├─Join INNER build=right keys=[t.i16 = ok.i16] carries 1 of 2 unread above\n"
+            "    │ ├─Scan table=t source=fake columns=[i16]\n"
+            "    │ └─Scan table=ok source=fake columns=[i16]\n"
+            "    └─Aggregate COUNT(*)\n"
+            "      └─Limit 1\n"
+            "        └─Scan table=u source=fake columns=[]\n");
   // A set operation as its query (ADR 0036's X6): its arms bound and typed as any set operation's.
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u UNION SELECT i32 FROM u)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"count_star()\" = 1\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "      Aggregate COUNT(*)\n"
-            "        Limit 1\n"
-            "          SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n"
-            "            Compute CAST(i16 AS INTEGER)\n"
-            "              Project i16\n"
-            "                Scan table=u source=fake columns=[i16]\n"
-            "            Project i32\n"
-            "              Scan table=u source=fake columns=[i32]\n");
+            "└─Filter \"count_star()\" = 1\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Scan table=t source=fake columns=[i16]\n"
+            "    └─Aggregate COUNT(*)\n"
+            "      └─Limit 1\n"
+            "        └─SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n"
+            "          ├─Compute CAST(i16 AS INTEGER)\n"
+            "          │ └─Project i16\n"
+            "          │   └─Scan table=u source=fake columns=[i16]\n"
+            "          └─Project i32\n"
+            "            └─Scan table=u source=fake columns=[i32]\n");
 }
 
 // A BETWEEN with a subquery bound is its two comparisons (ADR 0041's decision 6), each a conjunct
@@ -7974,58 +7974,58 @@ TEST(BinderTest, ABetweenWithASubqueryBoundIsItsTwoComparisons) {
                       "i32 FROM u LIMIT 1)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter i32 <= i32\n"
-            "    Filter i32 >= \"min(i32)\"\n"
-            "      Join ONE-ROW build=right keys=[]\n"
-            "        Join ONE-ROW build=right keys=[]\n"
-            "          Scan table=t source=fake columns=[i16, i32]\n"
-            "          Aggregate MIN(i32)\n"
-            "            Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n"
-            "        Aggregate SINGLE_VALUE(i32)\n"
-            "          Project i32\n"
-            "            Limit 1\n"
-            "              Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n");
+            "└─Filter i32 <= i32\n"
+            "  └─Filter i32 >= \"min(i32)\"\n"
+            "    └─Join ONE-ROW build=right keys=[]\n"
+            "      ├─Join ONE-ROW build=right keys=[]\n"
+            "      │ ├─Scan table=t source=fake columns=[i16, i32]\n"
+            "      │ └─Aggregate MIN(i32)\n"
+            "      │   └─Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n"
+            "      └─Aggregate SINGLE_VALUE(i32)\n"
+            "        └─Project i32\n"
+            "          └─Limit 1\n"
+            "            └─Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n");
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE dt BETWEEN (SELECT MIN(dt) FROM u) AND "
                       "'2020-01-01'"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter dt >= \"min(dt)\"\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Filter dt <= DATE '2020-01-01'\n"
-            "        Scan table=t source=fake columns=[i16, dt]\n"
-            "      Aggregate MIN(dt)\n"
-            "        Scan table=u source=fake columns=[dt]\n");
+            "└─Filter dt >= \"min(dt)\"\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Filter dt <= DATE '2020-01-01'\n"
+            "    │ └─Scan table=t source=fake columns=[i16, dt]\n"
+            "    └─Aggregate MIN(dt)\n"
+            "      └─Scan table=u source=fake columns=[dt]\n");
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i32 + 1 BETWEEN (SELECT MIN(d) FROM u) AND 100"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"(i32 + 1)\" >= \"min(d)\"\n"
-            "    Compute (i32 + 1)\n"
-            "      Join ONE-ROW build=right keys=[]\n"
-            "        Filter i32 <= 99\n"
-            "          Scan table=t source=fake columns=[i16, i32]\n"
-            "        Aggregate MIN(d)\n"
-            "          Scan table=u source=fake columns=[d]\n");
+            "└─Filter \"(i32 + 1)\" >= \"min(d)\"\n"
+            "  └─Compute (i32 + 1)\n"
+            "    └─Join ONE-ROW build=right keys=[]\n"
+            "      ├─Filter i32 <= 99\n"
+            "      │ └─Scan table=t source=fake columns=[i16, i32]\n"
+            "      └─Aggregate MIN(d)\n"
+            "        └─Scan table=u source=fake columns=[d]\n");
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i32 + 1 BETWEEN (SELECT MIN(i32) FROM u) AND 100"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"(i32 + 1)\" >= \"min(i32)\"\n"
-            "    Compute (i32 + 1)\n"
-            "      Join ONE-ROW build=right keys=[]\n"
-            "        Filter i32 <= 99\n"
-            "          Scan table=t source=fake columns=[i16, i32]\n"
-            "        Aggregate MIN(i32)\n"
-            "          Scan table=u source=fake columns=[i32]\n");
+            "└─Filter \"(i32 + 1)\" >= \"min(i32)\"\n"
+            "  └─Compute (i32 + 1)\n"
+            "    └─Join ONE-ROW build=right keys=[]\n"
+            "      ├─Filter i32 <= 99\n"
+            "      │ └─Scan table=t source=fake columns=[i16, i32]\n"
+            "      └─Aggregate MIN(i32)\n"
+            "        └─Scan table=u source=fake columns=[i32]\n");
   EXPECT_EQ(optimized("SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) BETWEEN (SELECT "
                       "MIN(i16) FROM u) AND 10"),
             "Output: i16:SMALLINT count_star():BIGINT\n"
             "Project i16, \"count_star()\"\n"
-            "  Filter \"count_star()\" >= \"min(i16)\"\n"
-            "    Join ONE-ROW build=right keys=[]\n"
-            "      Filter \"count_star()\" <= 10\n"
-            "        GroupAggregate keys=[i16] COUNT(*)\n"
-            "          Scan table=t source=fake columns=[i16]\n"
-            "      Aggregate MIN(i16)\n"
-            "        Scan table=u source=fake columns=[i16]\n");
+            "└─Filter \"count_star()\" >= \"min(i16)\"\n"
+            "  └─Join ONE-ROW build=right keys=[]\n"
+            "    ├─Filter \"count_star()\" <= 10\n"
+            "    │ └─GroupAggregate keys=[i16] COUNT(*)\n"
+            "    │   └─Scan table=t source=fake columns=[i16]\n"
+            "    └─Aggregate MIN(i16)\n"
+            "      └─Scan table=u source=fake columns=[i16]\n");
 }
 
 // A correlated scalar subquery binds to a DependentJoin (ADR 0023's U1), which the unnesting pass
@@ -8062,14 +8062,14 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
   EXPECT_EQ(Explain(*plan),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter i32 = \"min(u.i32)\"\n"
-            "    DependentJoin ONE-ROW\n"
-            "      Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+            "└─Filter i32 = \"min(u.i32)\"\n"
+            "  └─DependentJoin ONE-ROW\n"
+            "    ├─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
             "Case\", from]\n"
-            "      Aggregate MIN(i32)\n"
-            "        Filter \"(u.i64 = t.i64)\"\n"
-            "          Compute (u.i64 = t.i64)\n"
-            "            Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "    └─Aggregate MIN(i32)\n"
+            "      └─Filter \"(u.i64 = t.i64)\"\n"
+            "        └─Compute (u.i64 = t.i64)\n"
+            "          └─Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
             "\"Mixed Case\", from]\n");
   EXPECT_EQ(dependent->kind, JoinKind::kOneRow) << "a scalar subquery appends its single value";
   EXPECT_EQ(dependent->mark, kNoColumnId) << "no kind defines a marker yet";
@@ -8084,13 +8084,11 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
   EXPECT_EQ(Explain(*optimized),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter i32 = \"min(u.i32)\"\n"
-            // The join carries t.i64 and u.i64 -- its own keys -- past itself, which nothing
-            // above reads: the Filter reads i32 and the min, the Project i16.
-            "    Join INNER build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 5 unread above\n"
-            "      Scan table=t source=fake columns=[i16, i32, i64]\n"
-            "      GroupAggregate keys=[\"u.i64\"] MIN(i32)\n"
-            "        Scan table=u source=fake columns=[i32, i64]\n");
+            "└─Filter i32 = \"min(u.i32)\"\n"
+            "  └─Join INNER build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 5 unread above\n"
+            "    ├─Scan table=t source=fake columns=[i16, i32, i64]\n"
+            "    └─GroupAggregate keys=[\"u.i64\"] MIN(i32)\n"
+            "      └─Scan table=u source=fake columns=[i32, i64]\n");
 
   // An uncorrelated scalar subquery keeps ADR 0022's direct one-row join.
   auto plain = BindSql("SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i32) FROM u)", catalog);
@@ -8238,13 +8236,12 @@ TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
       // the subquery, and they read the same field (docs/adr/0030-shared-sub-plans.md).
       "Output: count_star():BIGINT\n"
       "Aggregate COUNT(*)\n"
-      "  Join INNER build=right keys=[t.i16 = ok.i16]\n"
-      "    Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
-      R"(    Join SEMI build=left keys=["ok.i16" = i16])"
-      "\n"
-      "      Scan table=ok source=fake columns=[i16]\n"
-      "      Project i16\n"
-      "        Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n");
+      "└─Join INNER build=right keys=[t.i16 = ok.i16]\n"
+      "  ├─Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
+      "  └─Join SEMI build=left keys=[\"ok.i16\" = i16]\n"
+      "    ├─Scan table=ok source=fake columns=[i16]\n"
+      "    └─Project i16\n"
+      "      └─Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n");
   // A subquery join above every join of its block renders before the INNER join; one on a branch
   // renders after it.
   const auto on_top = [&plan_of](std::string_view sql) {
@@ -8312,17 +8309,15 @@ TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
                     "FROM t) AND ok.i16 IN (SELECT s16 FROM dec)"),
             "Output: count_star():BIGINT\n"
             "Aggregate COUNT(*)\n"
-            "  Join INNER build=right keys=[t.i16 = ok.i16]\n"
-            "    Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
-            R"(    Join SEMI build=left keys=["ok.i16" = s16])"
-            "\n"
-            R"(      Join SEMI build=left keys=["ok.i16" = i16])"
-            "\n"
-            "        Scan table=ok source=fake columns=[i16]\n"
-            "        Project i16\n"
-            "          Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
-            "      Project s16\n"
-            "        Scan table=dec source=fake columns=[s16]\n");
+            "└─Join INNER build=right keys=[t.i16 = ok.i16]\n"
+            "  ├─Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
+            "  └─Join SEMI build=left keys=[\"ok.i16\" = s16]\n"
+            "    ├─Join SEMI build=left keys=[\"ok.i16\" = i16]\n"
+            "    │ ├─Scan table=ok source=fake columns=[i16]\n"
+            "    │ └─Project i16\n"
+            "    │   └─Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
+            "    └─Project s16\n"
+            "      └─Scan table=dec source=fake columns=[s16]\n");
 }
 
 // ---- ADR 0041's SQ7a: IN and NOT IN inside a condition, through a null-aware mark join ----
@@ -8415,14 +8410,14 @@ TEST(BinderTest, AnInUnderOrIsAMarkJoin) {
   EXPECT_EQ(Explain(Optimized(*plan)),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Filter \"((i16 < 10) OR i16 IN (SELECT i64 FROM u))\"\n"
-            "    Compute ((i16 < 10) OR i16 IN (SELECT i64 FROM u))\n"
-            "      Join NULL-AWARE MARK build=right keys=[\"CAST(i16 AS BIGINT)\" = i64] carries 1 "
+            "└─Filter \"((i16 < 10) OR i16 IN (SELECT i64 FROM u))\"\n"
+            "  └─Compute ((i16 < 10) OR i16 IN (SELECT i64 FROM u))\n"
+            "    └─Join NULL-AWARE MARK build=right keys=[\"CAST(i16 AS BIGINT)\" = i64] carries 1 "
             "of 3 unread above\n"
-            "        Compute CAST(i16 AS BIGINT)\n"
-            "          Scan table=t source=fake columns=[i16]\n"
-            "        Project i64\n"
-            "          Scan table=u source=fake columns=[i64]\n");
+            "      ├─Compute CAST(i16 AS BIGINT)\n"
+            "      │ └─Scan table=t source=fake columns=[i16]\n"
+            "      └─Project i64\n"
+            "        └─Scan table=u source=fake columns=[i64]\n");
 }
 
 // One slot binds one mark per set and probe: IN and NOT IN share it, a select item reads a GROUP
@@ -8474,24 +8469,24 @@ TEST(BinderTest, ASharedInUnderOrIsASemiJoin) {
     EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
     return Explain(Optimized(*plan));
   };
-  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (i16 > 0 AND i32 IN (SELECT i16 FROM u)) OR (i16 < "
-                      "-5 AND i32 IN (SELECT i16 FROM u))"),
-            "Output: i16:SMALLINT\n"
-            "Project i16\n"
-            "  Join SEMI build=right keys=[i32 = \"CAST(i16 AS INTEGER)\"] carries 2 of 3 unread "
-            "above\n"
-            "    Filter \"((i16 > 0) OR (i16 < -5))\"\n"
-            "      Compute ((i16 > 0) OR (i16 < -5))\n"
-            "        Scan table=t source=fake columns=[i16, i32]\n"
-            "    Compute CAST(i16 AS INTEGER)\n"
-            "      Project i16\n"
-            "        Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(
+      optimized("SELECT i16 FROM t WHERE (i16 > 0 AND i32 IN (SELECT i16 FROM u)) OR (i16 < "
+                "-5 AND i32 IN (SELECT i16 FROM u))"),
+      "Output: i16:SMALLINT\n"
+      "Project i16\n"
+      "└─Join SEMI build=right keys=[i32 = \"CAST(i16 AS INTEGER)\"] carries 2 of 3 unread above\n"
+      "  ├─Filter \"((i16 > 0) OR (i16 < -5))\"\n"
+      "  │ └─Compute ((i16 > 0) OR (i16 < -5))\n"
+      "  │   └─Scan table=t source=fake columns=[i16, i32]\n"
+      "  └─Compute CAST(i16 AS INTEGER)\n"
+      "    └─Project i16\n"
+      "      └─Scan table=u source=fake columns=[i16]\n");
   EXPECT_EQ(
       optimized("SELECT i16 FROM t WHERE (i16 = 2 AND i32 IN (SELECT i16 FROM u)) OR i16 = 2"),
       "Output: i16:SMALLINT\n"
       "Project i16\n"
-      "  Filter i16 = 2\n"
-      "    Scan table=t source=fake columns=[i16]\n");
+      "└─Filter i16 = 2\n"
+      "  └─Scan table=t source=fake columns=[i16]\n");
   constexpr std::string_view kDropped =
       "SELECT i16 FROM t WHERE (i16 = 2 AND i32 IN (SELECT nope FROM u)) OR i16 = 2";
   auto error = BindSql(kDropped, catalog);
@@ -8561,34 +8556,34 @@ TEST(BinderTest, InProbesAndSetsOfSq7b) {
   EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE 2 IN (SELECT i16 FROM u)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Join SEMI build=right keys=[\"2\" = \"CAST(i16 AS INTEGER)\"] carries 1 of 2 unread "
+            "└─Join SEMI build=right keys=[\"2\" = \"CAST(i16 AS INTEGER)\"] carries 1 of 2 unread "
             "above\n"
-            "    Compute 2\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "    Compute CAST(i16 AS INTEGER)\n"
-            "      Project i16\n"
-            "        Scan table=u source=fake columns=[i16]\n");
+            "  ├─Compute 2\n"
+            "  │ └─Scan table=t source=fake columns=[i16]\n"
+            "  └─Compute CAST(i16 AS INTEGER)\n"
+            "    └─Project i16\n"
+            "      └─Scan table=u source=fake columns=[i16]\n");
   EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE '2027-01-05' IN (SELECT dt FROM u)"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Join SEMI build=right keys=[\"'2027-01-05'\" = dt] carries 1 of 2 unread above\n"
-            "    Compute '2027-01-05'\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "    Project dt\n"
-            "      Scan table=u source=fake columns=[dt]\n");
-  EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i64 FROM u)"),
-            "Output: i16:SMALLINT\n"
-            "Project i16\n"
-            "  Join SEMI build=right keys=[\"CAST(i16 AS BIGINT)\" = i16] carries 1 of 2 unread "
-            "above\n"
-            "    Compute CAST(i16 AS BIGINT)\n"
-            "      Scan table=t source=fake columns=[i16]\n"
-            "    SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n"
-            "      Compute CAST(i16 AS BIGINT)\n"
-            "        Project i16\n"
-            "          Scan table=u source=fake columns=[i16]\n"
-            "      Project i64\n"
-            "        Scan table=u source=fake columns=[i64]\n");
+            "└─Join SEMI build=right keys=[\"'2027-01-05'\" = dt] carries 1 of 2 unread above\n"
+            "  ├─Compute '2027-01-05'\n"
+            "  │ └─Scan table=t source=fake columns=[i16]\n"
+            "  └─Project dt\n"
+            "    └─Scan table=u source=fake columns=[dt]\n");
+  EXPECT_EQ(
+      plan_of("SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i64 FROM u)"),
+      "Output: i16:SMALLINT\n"
+      "Project i16\n"
+      "└─Join SEMI build=right keys=[\"CAST(i16 AS BIGINT)\" = i16] carries 1 of 2 unread above\n"
+      "  ├─Compute CAST(i16 AS BIGINT)\n"
+      "  │ └─Scan table=t source=fake columns=[i16]\n"
+      "  └─SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n"
+      "    ├─Compute CAST(i16 AS BIGINT)\n"
+      "    │ └─Project i16\n"
+      "    │   └─Scan table=u source=fake columns=[i16]\n"
+      "    └─Project i64\n"
+      "      └─Scan table=u source=fake columns=[i64]\n");
   for (const char* sql : {
            "SELECT i16 FROM t WHERE i16 < 0 OR 2 NOT IN (SELECT i16 FROM u)",
            "SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM ok) + i16 IN (SELECT i32 FROM u)",
@@ -8623,40 +8618,38 @@ TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
               "WHERE i16 > (SELECT MIN(i16) FROM ok)"),
       "Output: sum(CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END):HUGEINT\n"
       "Aggregate SUM(\"CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\")\n"
-      "  Compute CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
-      "    Join NULL-AWARE MARK build=right keys=[\"(i32 + 1)\" = \"CAST(i16 AS INTEGER)\"]\n"
-      "      Compute (i32 + 1)\n"
-      "        Filter i16 > \"min(i16)\"\n"
-      "          Join ONE-ROW build=right keys=[]\n"
-      "            Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "└─Compute CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
+      "  └─Join NULL-AWARE MARK build=right keys=[\"(i32 + 1)\" = \"CAST(i16 AS INTEGER)\"]\n"
+      "    ├─Compute (i32 + 1)\n"
+      "    │ └─Filter i16 > \"min(i16)\"\n"
+      "    │   └─Join ONE-ROW build=right keys=[]\n"
+      "    │     ├─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
       "Case\", from]\n"
-      "            Aggregate MIN(i16)\n"
-      "              Scan table=ok source=fake columns=[i16, s]\n"
-      "      Compute CAST(i16 AS INTEGER)\n"
-      "        Project i16\n"
-      "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "    │     └─Aggregate MIN(i16)\n"
+      "    │       └─Scan table=ok source=fake columns=[i16, s]\n"
+      "    └─Compute CAST(i16 AS INTEGER)\n"
+      "      └─Project i16\n"
+      "        └─Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
       "Case\", from]\n");
   EXPECT_EQ(
       plan_of("SELECT i16, CASE WHEN MAX(i32) + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END "
               "FROM t GROUP BY i16 HAVING i16 > (SELECT MIN(i16) FROM ok)"),
       "Output: i16:SMALLINT CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 "
       "END:INTEGER\n"
-      "Project i16, \"CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 "
-      "END\"\n"
-      "  Compute CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
-      "    Join NULL-AWARE MARK build=right keys=[\"(max(i32) + 1)\" = \"CAST(i16 AS "
-      "INTEGER)\"]\n"
-      "      Compute (max(i32) + 1)\n"
-      "        Filter i16 > \"min(i16)\"\n"
-      "          Join ONE-ROW build=right keys=[]\n"
-      "            GroupAggregate keys=[i16] MAX(i32)\n"
-      "              Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+      "Project i16, \"CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\"\n"
+      "└─Compute CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
+      "  └─Join NULL-AWARE MARK build=right keys=[\"(max(i32) + 1)\" = \"CAST(i16 AS INTEGER)\"]\n"
+      "    ├─Compute (max(i32) + 1)\n"
+      "    │ └─Filter i16 > \"min(i16)\"\n"
+      "    │   └─Join ONE-ROW build=right keys=[]\n"
+      "    │     ├─GroupAggregate keys=[i16] MAX(i32)\n"
+      "    │     │ └─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
       "\"Mixed Case\", from]\n"
-      "            Aggregate MIN(i16)\n"
-      "              Scan table=ok source=fake columns=[i16, s]\n"
-      "      Compute CAST(i16 AS INTEGER)\n"
-      "        Project i16\n"
-      "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "    │     └─Aggregate MIN(i16)\n"
+      "    │       └─Scan table=ok source=fake columns=[i16, s]\n"
+      "    └─Compute CAST(i16 AS INTEGER)\n"
+      "      └─Project i16\n"
+      "        └─Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
       "Case\", from]\n");
   // WHERE reads the select list's mark: it stands where WHERE's conjunct binds, after the filter
   // of the conjunct written before it, and is one join.
@@ -8665,19 +8658,19 @@ TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
                     "i64 < 0)"),
             "Output: sum(CASE  WHEN (i32 IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END):HUGEINT\n"
             "Aggregate SUM(\"CASE  WHEN (i32 IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\")\n"
-            "  Compute CASE  WHEN (i32 IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
-            "    Filter \"(i32 IN (SELECT i16 FROM u) OR (i64 < 0))\"\n"
-            "      Compute (i32 IN (SELECT i16 FROM u) OR (i64 < 0))\n"
-            "        Join NULL-AWARE MARK build=right keys=[i32 = \"CAST(i16 AS INTEGER)\"]\n"
-            "          Filter i16 > \"min(i16)\"\n"
-            "            Join ONE-ROW build=right keys=[]\n"
-            "              Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "└─Compute CASE  WHEN (i32 IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
+            "  └─Filter \"(i32 IN (SELECT i16 FROM u) OR (i64 < 0))\"\n"
+            "    └─Compute (i32 IN (SELECT i16 FROM u) OR (i64 < 0))\n"
+            "      └─Join NULL-AWARE MARK build=right keys=[i32 = \"CAST(i16 AS INTEGER)\"]\n"
+            "        ├─Filter i16 > \"min(i16)\"\n"
+            "        │ └─Join ONE-ROW build=right keys=[]\n"
+            "        │   ├─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
             "\"Mixed Case\", from]\n"
-            "              Aggregate MIN(i16)\n"
-            "                Scan table=ok source=fake columns=[i16, s]\n"
-            "          Compute CAST(i16 AS INTEGER)\n"
-            "            Project i16\n"
-            "              Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "        │   └─Aggregate MIN(i16)\n"
+            "        │     └─Scan table=ok source=fake columns=[i16, s]\n"
+            "        └─Compute CAST(i16 AS INTEGER)\n"
+            "          └─Project i16\n"
+            "            └─Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
             "\"Mixed Case\", from]\n");
 }
 
@@ -8899,34 +8892,34 @@ TEST(BinderTest, ACorrelatedValueInTheSelectListStandsInTheTail) {
               "(SELECT MIN(i16) FROM ok)"),
       "Output: sum((i32 * (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64))):HUGEINT\n"
       "Aggregate SUM(\"(i32 * count_star())\")\n"
-      "  Compute (i32 * count_star())\n"
-      "    DependentJoin ONE-ROW\n"
-      "      Filter i16 > \"min(i16)\"\n"
-      "        Join ONE-ROW build=right keys=[]\n"
-      "          Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "└─Compute (i32 * count_star())\n"
+      "  └─DependentJoin ONE-ROW\n"
+      "    ├─Filter i16 > \"min(i16)\"\n"
+      "    │ └─Join ONE-ROW build=right keys=[]\n"
+      "    │   ├─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
       "Case\", from]\n"
-      "          Aggregate MIN(i16)\n"
-      "            Scan table=ok source=fake columns=[i16, s]\n"
-      "      Aggregate COUNT(*)\n"
-      "        Filter \"(u.i64 = t.i64)\"\n"
-      "          Compute (u.i64 = t.i64)\n"
-      "            Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "    │   └─Aggregate MIN(i16)\n"
+      "    │     └─Scan table=ok source=fake columns=[i16, s]\n"
+      "    └─Aggregate COUNT(*)\n"
+      "      └─Filter \"(u.i64 = t.i64)\"\n"
+      "        └─Compute (u.i64 = t.i64)\n"
+      "          └─Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
       "Case\", from]\n");
   EXPECT_EQ(plan_of("SELECT i16, (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) FROM t WHERE i16 > "
                     "(SELECT MIN(i16) FROM ok)"),
             "Output: i16:SMALLINT (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64):BIGINT\n"
             "Project i16, \"(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)\"\n"
-            "  DependentJoin ONE-ROW\n"
-            "    Filter i16 > \"min(i16)\"\n"
-            "      Join ONE-ROW build=right keys=[]\n"
-            "        Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "└─DependentJoin ONE-ROW\n"
+            "  ├─Filter i16 > \"min(i16)\"\n"
+            "  │ └─Join ONE-ROW build=right keys=[]\n"
+            "  │   ├─Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
             "\"Mixed Case\", from]\n"
-            "        Aggregate MIN(i16)\n"
-            "          Scan table=ok source=fake columns=[i16, s]\n"
-            "    Aggregate COUNT(*)\n"
-            "      Filter \"(u.i64 = t.i64)\"\n"
-            "        Compute (u.i64 = t.i64)\n"
-            "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "  │   └─Aggregate MIN(i16)\n"
+            "  │     └─Scan table=ok source=fake columns=[i16, s]\n"
+            "  └─Aggregate COUNT(*)\n"
+            "    └─Filter \"(u.i64 = t.i64)\"\n"
+            "      └─Compute (u.i64 = t.i64)\n"
+            "        └─Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
             "\"Mixed Case\", from]\n");
 }
 

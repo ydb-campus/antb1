@@ -318,19 +318,35 @@ SharedNotes NotesOf(const LogicalPlan& plan) {
   return notes;
 }
 
-void Render(const LogicalNode& node, std::size_t depth, const SharedNotes& notes,
-            std::string& out) {
-  out += std::string(2 * depth, ' ') + std::visit(NodeLine{}, node);
+// `prefix` is the gutter of this node's children (empty at the root). A child draws `prefix`, then
+// `└─` when it is the last input and `├─` otherwise; its own children continue that gutter with
+// two spaces under a last input and `│ ` under any earlier one, so every input lines up under its
+// parent.
+void Render(const LogicalNode& node, std::string_view prefix, bool last, bool root,
+            const SharedNotes& notes, std::string& out) {
+  if (!root) {
+    out += prefix;
+    out += last ? "└─" : "├─";
+  }
+  out += std::visit(NodeLine{}, node);
   if (const auto note = notes.find(&node); note != notes.end()) {
     out += note->second;
   }
   out += '\n';
-  // A Join's left input, then its right one; a UnionAll's and a SetOperation's inputs in the order
-  // written.
+  std::string child_prefix(prefix);
+  if (!root) {
+    child_prefix += last ? "  " : "│ ";
+  }
+  std::vector<const LogicalNode*> inputs;
   for (const LogicalNodePtr& input : InputsOf(node)) {
     if (input != nullptr) {
-      Render(*input, depth + 1, notes, out);
+      inputs.push_back(input.get());
     }
+  }
+  // A Join's left input, then its right one; a UnionAll's and a SetOperation's inputs in the order
+  // written.
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    Render(*inputs[i], child_prefix, i + 1 == inputs.size(), false, notes, out);
   }
 }
 
@@ -349,7 +365,7 @@ std::string ExplainOutput(const LogicalPlan& plan) {
 std::string Explain(const LogicalPlan& plan) {
   std::string out = ExplainOutput(plan) + '\n';
   if (plan.root != nullptr) {
-    Render(*plan.root, 0, NotesOf(plan), out);
+    Render(*plan.root, "", false, true, NotesOf(plan), out);
   }
   return out;
 }

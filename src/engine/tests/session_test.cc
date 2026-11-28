@@ -658,8 +658,8 @@ TEST_F(SessionTest, ExplainShowsTheOptimizedPlan) {
   EXPECT_EQ(*text,
             "Output: first:DATE sum(advengineid):HUGEINT\n"
             "Aggregate MIN(EventDate), SUM(AdvEngineID)\n"
-            "  Filter AdvEngineID >= 1 AND EventDate < DATE '2013-07-16'\n"
-            "    Scan table=t source=parquet(files=1, rows=10) columns=[AdvEngineID, EventDate]\n");
+            "└─Filter AdvEngineID >= 1 AND EventDate < DATE '2013-07-16'\n"
+            "  └─Scan table=t source=parquet(files=1, rows=10) columns=[AdvEngineID, EventDate]\n");
 }
 
 // The rows of a result as canonical text (engine::FormatValue), one vector per row.

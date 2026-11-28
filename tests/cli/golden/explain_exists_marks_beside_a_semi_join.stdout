@@ -1,12 +1,12 @@
 Output: ct_id:SMALLINT
 Project ct_id
-  Sort ct_id ASC NULLS LAST
-    Filter "(EXISTS (SELECT 1 FROM riders AS ""r"" WHERE r.rd_city = c.ct_id) OR EXISTS (SELECT 1 FROM drivers AS ""d"" WHERE d.dv_city = c.ct_id))"
-      Compute (EXISTS (SELECT 1 FROM riders AS "r" WHERE r.rd_city = c.ct_id) OR EXISTS (SELECT 1 FROM drivers AS "d" WHERE d.dv_city = c.ct_id))
-        Join MARK build=right keys=["c.ct_id" = "d.dv_city"]
-          Join MARK build=right keys=["c.ct_id" = "r.rd_city"]
-            Join SEMI build=left keys=["c.ct_id" = "z.zn_city"]
-              Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]
-              Scan table=zones source=parquet(files=1, rows=40) columns=[zn_city]
-            Scan table=riders source=parquet(files=1, rows=240) columns=[rd_city]
-          Scan table=drivers source=parquet(files=1, rows=97) columns=[dv_city]
+└─Sort ct_id ASC NULLS LAST
+  └─Filter "(EXISTS (SELECT 1 FROM riders AS ""r"" WHERE r.rd_city = c.ct_id) OR EXISTS (SELECT 1 FROM drivers AS ""d"" WHERE d.dv_city = c.ct_id))"
+    └─Compute (EXISTS (SELECT 1 FROM riders AS "r" WHERE r.rd_city = c.ct_id) OR EXISTS (SELECT 1 FROM drivers AS "d" WHERE d.dv_city = c.ct_id))
+      └─Join MARK build=right keys=["c.ct_id" = "d.dv_city"]
+        ├─Join MARK build=right keys=["c.ct_id" = "r.rd_city"]
+        │ ├─Join SEMI build=left keys=["c.ct_id" = "z.zn_city"]
+        │ │ ├─Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]
+        │ │ └─Scan table=zones source=parquet(files=1, rows=40) columns=[zn_city]
+        │ └─Scan table=riders source=parquet(files=1, rows=240) columns=[rd_city]
+        └─Scan table=drivers source=parquet(files=1, rows=97) columns=[dv_city]

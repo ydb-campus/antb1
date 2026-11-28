@@ -434,6 +434,25 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# Two joins in one part pipeline. The planner prepares both HashBuilds on the aggregate, outermost
+# first, and the text claims each one onto its HashJoin. zones and riders are the left inputs, so
+# each HashBuild is printed before the trips probe.
+antb1_add_cli_golden(
+  explain_physical_stacked
+  ARGS
+    explain
+    --physical
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM zones, riders, trips WHERE tr_pickup = zn_id AND tr_rider = rd_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
 # --physical and --analyze are the same plan, so they cannot both be asked for. The message is
 # pinned, not just the exit code: a usage error for another reason would also exit 2.
 antb1_add_cli_golden(
@@ -1615,9 +1634,9 @@ string(
   "^Output: RegionID:INTEGER c:BIGINT\n"
   "Total: time=${_d} rows=3 peak_memory=${_mem} threads=4\n"
   "Project RegionID, c  [[]rows=3 batches=1 time=${_d} self=${_d}[]]\n"
-  "  TopN Sort c DESC NULLS LAST, RegionID ASC NULLS LAST Limit 3  "
+  "└─TopN Sort c DESC NULLS LAST, RegionID ASC NULLS LAST Limit 3  "
   "[[]rows=3 batches=1 time=${_d} self=${_d} sort=${_d}[]]\n"
-  "    PartGroupAggregate GroupAggregate keys=[[]RegionID[]] COUNT[(][*][)] top-N per partition keep=3  "
+  "  └─PartGroupAggregate GroupAggregate keys=[[]RegionID[]] COUNT[(][*][)] top-N per partition keep=3  "
   # rows is keep=3 per partition, so it tracks GroupTable::kPartitions: 96 at 32, 192 at 64.
   "[[]rows=96 batches=[0-9]+ time=${_d} parts=11 skipped=0 part_time=${_d} wait=${_d} "
   # local_groups is each part's own group count summed, so it exceeds `groups`, the distinct
@@ -1625,12 +1644,12 @@ string(
   # routed_path is absent here because no part of this fixture routes (no raw_parts either).
   "lanes_tail=${_d} build=${_d} groups=4357 local_groups=[0-9]+ local_path=${_d} "
   "local_rows=[0-9]+ narrow_scan_parts=1 wide_scan_parts=10[]]\n"
-  "      Filter IsMobile = 1  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
+  "    └─Filter IsMobile = 1  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
   "self=${_d}[]]\n"
   # cols_filter_only: IsMobile is read so that the pushed predicate can be applied and by nothing
   # above the scan, so no batch carries it (ADR 0020). Asserted here rather than read by hand,
   # because a scan that stops doing it answers exactly the same.
-  "        Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID, IsMobile[]], "
+  "      └─Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID, IsMobile[]], "
   "1 pushed predicate  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
   "cols_filter_only=1[]]$"
 )
@@ -1651,7 +1670,7 @@ antb1_add_cli_golden(
 antb1_add_cli_golden(
   explain_analyze_between
   STDOUT_REGEX
-    "Filter RegionID >= 100 AND RegionID <= 200  [[][^]]*[]]\n +Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID[]], 2 pushed predicates  [[]rows=[0-9]+ "
+    "Filter RegionID >= 100 AND RegionID <= 200  [[][^]]*[]]\n[^\n]*└─Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID[]], 2 pushed predicates  [[]rows=[0-9]+ "
   ARGS explain --analyze --threads 4 -c "SELECT COUNT(*) FROM t WHERE RegionID BETWEEN 100 AND 200" --table "${_split}"
 )
 set(_n "[0-9]+")

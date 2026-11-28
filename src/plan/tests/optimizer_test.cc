@@ -323,10 +323,10 @@ TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
   EXPECT_EQ(Explain(plan),
             "Output: (i16 + 1):SMALLINT\n"
             "Project \"(i16 + 1)\"\n"
-            "  Compute (i16 + 1)\n"
-            "    Filter \"(i32 // 2)\" > 0\n"
-            "      Compute (i32 // 2)\n"
-            "        Scan table=t source=fake columns=[i16, i32]\n");
+            "└─Compute (i16 + 1)\n"
+            "  └─Filter \"(i32 // 2)\" > 0\n"
+            "    └─Compute (i32 // 2)\n"
+            "      └─Scan table=t source=fake columns=[i16, i32]\n");
   // The input: Scan(i16, i32) <- Compute(i16 + 1, i32 + 2); only i16 and i16 + 1 are used above.
   const auto catalog = testing::MakeCatalog();
   auto bound = BindSql("SELECT i16, i16 + 1 FROM t", catalog);
@@ -347,8 +347,8 @@ TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
   EXPECT_EQ(Explain(pruned),
             "Output: i16:SMALLINT (i16 + 1):SMALLINT\n"
             "Project i16, \"(i16 + 1)\"\n"
-            "  Compute (i16 + 1)\n"
-            "    Scan table=t source=fake columns=[i16]\n");
+            "└─Compute (i16 + 1)\n"
+            "  └─Scan table=t source=fake columns=[i16]\n");
   ProjectNode columns_only = project;
   columns_only.columns.pop_back();
   columns_only.ids.pop_back();
@@ -358,7 +358,7 @@ TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
   EXPECT_EQ(Explain(dropped),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
-            "  Scan table=t source=fake columns=[i16]\n");
+            "└─Scan table=t source=fake columns=[i16]\n");
 }
 
 // A Limit moves below a Compute too: only the rows kept are computed.
@@ -367,17 +367,17 @@ TEST(OptimizerTest, LimitMovesBelowCompute) {
   EXPECT_EQ(Explain(plan),
             "Output: (i32 * 2):INTEGER\n"
             "Project \"(i32 * 2)\"\n"
-            "  Limit 3\n"
-            "    Sort i32 ASC NULLS LAST\n"
-            "      Compute (i32 * 2)\n"
-            "        Scan table=t source=fake columns=[i32]\n");
+            "└─Limit 3\n"
+            "  └─Sort i32 ASC NULLS LAST\n"
+            "    └─Compute (i32 * 2)\n"
+            "      └─Scan table=t source=fake columns=[i32]\n");
   const LogicalPlan unordered = Optimized("SELECT i32 * 2 FROM t LIMIT 3");
   EXPECT_EQ(Explain(unordered),
             "Output: (i32 * 2):INTEGER\n"
             "Project \"(i32 * 2)\"\n"
-            "  Compute (i32 * 2)\n"
-            "    Limit 3\n"
-            "      Scan table=t source=fake columns=[i32]\n");
+            "└─Compute (i32 * 2)\n"
+            "  └─Limit 3\n"
+            "    └─Scan table=t source=fake columns=[i32]\n");
 }
 
 TEST(OptimizerTest, SelectStarKeepsEveryField) {
@@ -413,42 +413,42 @@ TEST(OptimizerTest, GroupsByTheKeysThatDetermineTheOthers) {
   EXPECT_EQ(Explain(plan),
             "Output: i32:INTEGER (i32 - 1):INTEGER (i32 * 2):INTEGER count_star():BIGINT\n"
             "Project i32, \"(i32 - 1)\", \"(i32 * 2)\", \"count_star()\"\n"
-            "  Project i32, \"(i32 - 1)\", \"(i32 * 2)\", \"COUNT(*)\"\n"
-            "    Compute (i32 - 1), (i32 * 2)\n"
-            "      GroupAggregate keys=[i32] COUNT(*)\n"
-            "        Scan table=t source=fake columns=[i32]\n");
+            "└─Project i32, \"(i32 - 1)\", \"(i32 * 2)\", \"COUNT(*)\"\n"
+            "  └─Compute (i32 - 1), (i32 * 2)\n"
+            "    └─GroupAggregate keys=[i32] COUNT(*)\n"
+            "      └─Scan table=t source=fake columns=[i32]\n");
   // Under ORDER BY ... LIMIT the Limit stays right above the Sort (top-N).
   const LogicalPlan top = Optimized(
       "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3");
   EXPECT_EQ(Explain(top),
             "Output: (i32 - 1):INTEGER c:BIGINT\n"
             "Project \"(i32 - 1)\", c\n"
-            "  Limit 3\n"
-            "    Sort c DESC NULLS LAST\n"
-            "      Project i32, \"(i32 - 1)\", \"COUNT(*)\"\n"
-            "        Compute (i32 - 1)\n"
-            "          GroupAggregate keys=[i32] COUNT(*)\n"
-            "            Scan table=t source=fake columns=[i32]\n");
+            "└─Limit 3\n"
+            "  └─Sort c DESC NULLS LAST\n"
+            "    └─Project i32, \"(i32 - 1)\", \"COUNT(*)\"\n"
+            "      └─Compute (i32 - 1)\n"
+            "        └─GroupAggregate keys=[i32] COUNT(*)\n"
+            "          └─Scan table=t source=fake columns=[i32]\n");
   // A VARCHAR key, HAVING on the dependent key, and a key that is not the first one.
   const LogicalPlan having =
       Optimized("SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1");
   EXPECT_EQ(Explain(having),
             "Output: s:VARCHAR strlen(s):BIGINT sum(i16):HUGEINT\n"
             "Project s, \"strlen(s)\", \"sum(i16)\"\n"
-            "  Filter \"strlen(s)\" > 1\n"
-            "    Project s, \"strlen(s)\", \"SUM(i16)\"\n"
-            "      Compute strlen(s)\n"
-            "        GroupAggregate keys=[s] SUM(i16)\n"
-            "          Scan table=t source=fake columns=[i16, s]\n");
+            "└─Filter \"strlen(s)\" > 1\n"
+            "  └─Project s, \"strlen(s)\", \"SUM(i16)\"\n"
+            "    └─Compute strlen(s)\n"
+            "      └─GroupAggregate keys=[s] SUM(i16)\n"
+            "        └─Scan table=t source=fake columns=[i16, s]\n");
   const LogicalPlan second =
       Optimized("SELECT i32, i16 + 1, COUNT(*) FROM t GROUP BY i32, i16, i16 + 1");
   EXPECT_EQ(Explain(second),
             "Output: i32:INTEGER (i16 + 1):SMALLINT count_star():BIGINT\n"
             "Project i32, \"(i16 + 1)\", \"count_star()\"\n"
-            "  Project i32, i16, \"(i16 + 1)\", \"COUNT(*)\"\n"
-            "    Compute (i16 + 1)\n"
-            "      GroupAggregate keys=[i32, i16] COUNT(*)\n"
-            "        Scan table=t source=fake columns=[i16, i32]\n");
+            "└─Project i32, i16, \"(i16 + 1)\", \"COUNT(*)\"\n"
+            "  └─Compute (i16 + 1)\n"
+            "    └─GroupAggregate keys=[i32, i16] COUNT(*)\n"
+            "      └─Scan table=t source=fake columns=[i16, i32]\n");
 }
 
 // Every rule keeps the column ids (ADR 0022): those of the output, those that the nodes above a
@@ -770,27 +770,27 @@ TEST(OptimizerTest, AConditionOnAUnionGoesIntoItsBranchesAndDropsTheOnesItRulesO
   constexpr std::string_view kFirst =
       "Output: x:INTEGER\n"
       "Project x\n"
-      "  UnionAll inputs=1 columns=[x, tag]\n"
-      "    Compute CAST(x AS INTEGER)\n"
-      "      Project i16, 'a'\n"
-      "        Scan table=t source=fake columns=[i16]\n";
+      "└─UnionAll inputs=1 columns=[x, tag]\n"
+      "  └─Compute CAST(x AS INTEGER)\n"
+      "    └─Project i16, 'a'\n"
+      "      └─Scan table=t source=fake columns=[i16]\n";
   for (const std::string_view where : {"tag = 'a'", "tag IN ('a', 'c')", "tag < 'b'"}) {
     EXPECT_EQ(Explain(Optimized(Tagged(where))), kFirst) << where;
   }
   EXPECT_EQ(Explain(Optimized(Tagged("tag = 'a' AND x > 3"))),
             "Output: x:INTEGER\n"
             "Project x\n"
-            "  UnionAll inputs=1 columns=[x, tag]\n"
-            "    Filter x > 3\n"
-            "      Compute CAST(x AS INTEGER)\n"
-            "        Project i16, 'a'\n"
-            "          Scan table=t source=fake columns=[i16]\n");
+            "└─UnionAll inputs=1 columns=[x, tag]\n"
+            "  └─Filter x > 3\n"
+            "    └─Compute CAST(x AS INTEGER)\n"
+            "      └─Project i16, 'a'\n"
+            "        └─Scan table=t source=fake columns=[i16]\n");
   EXPECT_EQ(Explain(Optimized(Tagged("tag NOT IN ('a', 'c')"))),
             "Output: x:INTEGER\n"
             "Project x\n"
-            "  UnionAll inputs=1 columns=[x, tag]\n"
-            "    Project i32, 'b'\n"
-            "      Scan table=u source=fake columns=[i32]\n");
+            "└─UnionAll inputs=1 columns=[x, tag]\n"
+            "  └─Project i32, 'b'\n"
+            "    └─Scan table=u source=fake columns=[i32]\n");
 }
 
 // Conditions the constants make always true are dropped from every branch, and the union keeps
@@ -800,12 +800,12 @@ TEST(OptimizerTest, AConditionTheConstantsOfEveryBranchMeetIsDropped) {
     EXPECT_EQ(Explain(Optimized(Tagged(where))),
               "Output: x:INTEGER\n"
               "Project x\n"
-              "  UnionAll inputs=2 columns=[x, tag]\n"
-              "    Compute CAST(x AS INTEGER)\n"
-              "      Project i16, 'a'\n"
-              "        Scan table=t source=fake columns=[i16]\n"
-              "    Project i32, 'b'\n"
-              "      Scan table=u source=fake columns=[i32]\n")
+              "└─UnionAll inputs=2 columns=[x, tag]\n"
+              "  ├─Compute CAST(x AS INTEGER)\n"
+              "  │ └─Project i16, 'a'\n"
+              "  │   └─Scan table=t source=fake columns=[i16]\n"
+              "  └─Project i32, 'b'\n"
+              "    └─Scan table=u source=fake columns=[i32]\n")
         << where;
   }
 }
@@ -817,11 +817,11 @@ TEST(OptimizerTest, AUnionWhoseEveryBranchIsRuledOutKeepsItsFirstUnderFalse) {
     EXPECT_EQ(Explain(Optimized(Tagged(where))),
               "Output: x:INTEGER\n"
               "Project x\n"
-              "  Filter FALSE\n"
-              "    UnionAll inputs=1 columns=[x, tag]\n"
-              "      Compute CAST(x AS INTEGER)\n"
-              "        Project i16, 'a'\n"
-              "          Scan table=t source=fake columns=[i16]\n")
+              "└─Filter FALSE\n"
+              "  └─UnionAll inputs=1 columns=[x, tag]\n"
+              "    └─Compute CAST(x AS INTEGER)\n"
+              "      └─Project i16, 'a'\n"
+              "        └─Scan table=t source=fake columns=[i16]\n")
         << where;
   }
 }
@@ -831,13 +831,13 @@ TEST(OptimizerTest, AFalseConditionAboveAUnionStaysAsItIs) {
   EXPECT_EQ(Explain(Optimized(Tagged("x = 1.5"))),
             "Output: x:INTEGER\n"
             "Project x\n"
-            "  Filter FALSE\n"
-            "    UnionAll inputs=2 columns=[x, tag]\n"
-            "      Compute CAST(x AS INTEGER)\n"
-            "        Project i16, 'a'\n"
-            "          Scan table=t source=fake columns=[i16]\n"
-            "      Project i32, 'b'\n"
-            "        Scan table=u source=fake columns=[i32]\n");
+            "└─Filter FALSE\n"
+            "  └─UnionAll inputs=2 columns=[x, tag]\n"
+            "    ├─Compute CAST(x AS INTEGER)\n"
+            "    │ └─Project i16, 'a'\n"
+            "    │   └─Scan table=t source=fake columns=[i16]\n"
+            "    └─Project i32, 'b'\n"
+            "      └─Scan table=u source=fake columns=[i32]\n");
 }
 
 // A condition above a UNION stays above its set operation (divergence D27's extension, ADR 0039),
@@ -847,7 +847,7 @@ TEST(OptimizerTest, AConditionAboveAUnionStaysAboveItsSetOperation) {
       "SELECT x FROM (SELECT i16 AS x, 'a' AS tag FROM t UNION SELECT i32 AS x, 'b' AS tag FROM u) "
       "AS v WHERE tag = 'a'";
   const std::string explain = Explain(Optimized(sql));
-  EXPECT_TRUE(explain.contains("Filter tag = 'a'\n    SetOperation inputs=2")) << explain;
+  EXPECT_TRUE(explain.contains("Filter tag = 'a'\n  └─SetOperation inputs=2")) << explain;
   EXPECT_TRUE(explain.contains("Scan table=u")) << "no input ruled out\n" << explain;
 }
 
@@ -859,32 +859,32 @@ TEST(OptimizerTest, UnionBranchesDecideThroughTheirWideningCasts) {
   EXPECT_EQ(Explain(Optimized(std::string(kWide) + "x = 1")),
             "Output: x:BIGINT\n"
             "Project x\n"
-            "  UnionAll inputs=1 columns=[x]\n"
-            "    Compute CAST(x AS BIGINT)\n"
-            "      Project 1\n"
-            "        Scan table=t source=fake columns=[]\n");
+            "└─UnionAll inputs=1 columns=[x]\n"
+            "  └─Compute CAST(x AS BIGINT)\n"
+            "    └─Project 1\n"
+            "      └─Scan table=t source=fake columns=[]\n");
   EXPECT_EQ(Explain(Optimized(std::string(kWide) + "x = 3000000000")),
             "Output: x:BIGINT\n"
             "Project x\n"
-            "  UnionAll inputs=1 columns=[x]\n"
-            "    Project 3000000000\n"
-            "      Scan table=u source=fake columns=[]\n");
+            "└─UnionAll inputs=1 columns=[x]\n"
+            "  └─Project 3000000000\n"
+            "    └─Scan table=u source=fake columns=[]\n");
   EXPECT_EQ(Explain(Optimized("SELECT x FROM (SELECT 1 AS x FROM t UNION ALL SELECT 1.50 AS x "
                               "FROM u) AS v WHERE x = 1")),
             "Output: x:DECIMAL(12,2)\n"
             "Project x\n"
-            "  UnionAll inputs=1 columns=[x]\n"
-            "    Compute CAST(x AS DECIMAL(12,2))\n"
-            "      Project 1\n"
-            "        Scan table=t source=fake columns=[]\n");
+            "└─UnionAll inputs=1 columns=[x]\n"
+            "  └─Compute CAST(x AS DECIMAL(12,2))\n"
+            "    └─Project 1\n"
+            "      └─Scan table=t source=fake columns=[]\n");
   EXPECT_EQ(Explain(Optimized("SELECT x FROM (SELECT 1.5 AS x FROM t UNION ALL SELECT 2.25 AS x "
                               "FROM u) AS v WHERE x < 2")),
             "Output: x:DECIMAL(3,2)\n"
             "Project x\n"
-            "  UnionAll inputs=1 columns=[x]\n"
-            "    Compute CAST(x AS DECIMAL(3,2))\n"
-            "      Project 1.5\n"
-            "        Scan table=t source=fake columns=[]\n");
+            "└─UnionAll inputs=1 columns=[x]\n"
+            "  └─Compute CAST(x AS DECIMAL(3,2))\n"
+            "    └─Project 1.5\n"
+            "      └─Scan table=t source=fake columns=[]\n");
 }
 
 // A comparison of two columns that are both constants in a branch is decided there, an INTEGER
@@ -894,9 +894,9 @@ TEST(OptimizerTest, UnionBranchesCompareTwoConstantColumns) {
                               "x, 1.5 AS y FROM u) AS v WHERE x < y")),
             "Output: x:INTEGER\n"
             "Project x\n"
-            "  UnionAll inputs=1 columns=[x, y]\n"
-            "    Project 1, 1.5\n"
-            "      Scan table=t source=fake columns=[]\n");
+            "└─UnionAll inputs=1 columns=[x, y]\n"
+            "  └─Project 1, 1.5\n"
+            "    └─Scan table=t source=fake columns=[]\n");
 }
 
 // What a branch's constants cannot decide exactly goes on top of the branch: a column that is not
@@ -905,49 +905,49 @@ TEST(OptimizerTest, UnionBranchesPushWhatTheirConstantsCannotDecide) {
   EXPECT_EQ(Explain(Optimized(Tagged("x > 3"))),
             "Output: x:INTEGER\n"
             "Project x\n"
-            "  UnionAll inputs=2 columns=[x, tag]\n"
-            "    Filter x > 3\n"
-            "      Compute CAST(x AS INTEGER)\n"
-            "        Project i16, 'a'\n"
-            "          Scan table=t source=fake columns=[i16]\n"
-            "    Filter x > 3\n"
-            "      Project i32, 'b'\n"
-            "        Scan table=u source=fake columns=[i32]\n");
+            "└─UnionAll inputs=2 columns=[x, tag]\n"
+            "  ├─Filter x > 3\n"
+            "  │ └─Compute CAST(x AS INTEGER)\n"
+            "  │   └─Project i16, 'a'\n"
+            "  │     └─Scan table=t source=fake columns=[i16]\n"
+            "  └─Filter x > 3\n"
+            "    └─Project i32, 'b'\n"
+            "      └─Scan table=u source=fake columns=[i32]\n");
   EXPECT_EQ(Explain(Optimized(Tagged("tag LIKE 'a%'"))),
             "Output: x:INTEGER\n"
             "Project x\n"
-            "  UnionAll inputs=2 columns=[x, tag]\n"
-            "    Filter tag LIKE 'a%'\n"
-            "      Compute CAST(x AS INTEGER)\n"
-            "        Project i16, 'a'\n"
-            "          Scan table=t source=fake columns=[i16]\n"
-            "    Filter tag LIKE 'a%'\n"
-            "      Project i32, 'b'\n"
-            "        Scan table=u source=fake columns=[i32]\n");
+            "└─UnionAll inputs=2 columns=[x, tag]\n"
+            "  ├─Filter tag LIKE 'a%'\n"
+            "  │ └─Compute CAST(x AS INTEGER)\n"
+            "  │   └─Project i16, 'a'\n"
+            "  │     └─Scan table=t source=fake columns=[i16]\n"
+            "  └─Filter tag LIKE 'a%'\n"
+            "    └─Project i32, 'b'\n"
+            "      └─Scan table=u source=fake columns=[i32]\n");
   EXPECT_EQ(Explain(Optimized("SELECT x FROM (SELECT i16 AS x, i32 AS y FROM t UNION ALL SELECT "
                               "i32 AS x, i16 AS y FROM u) AS v WHERE x > y")),
             "Output: x:INTEGER\n"
             "Project x\n"
-            "  UnionAll inputs=2 columns=[x, y]\n"
-            "    Filter x > y\n"
-            "      Compute CAST(x AS INTEGER)\n"
-            "        Project i16, i32\n"
-            "          Scan table=t source=fake columns=[i16, i32]\n"
-            "    Filter x > y\n"
-            "      Compute CAST(y AS INTEGER)\n"
-            "        Project i32, i16\n"
-            "          Scan table=u source=fake columns=[i16, i32]\n");
+            "└─UnionAll inputs=2 columns=[x, y]\n"
+            "  ├─Filter x > y\n"
+            "  │ └─Compute CAST(x AS INTEGER)\n"
+            "  │   └─Project i16, i32\n"
+            "  │     └─Scan table=t source=fake columns=[i16, i32]\n"
+            "  └─Filter x > y\n"
+            "    └─Compute CAST(y AS INTEGER)\n"
+            "      └─Project i32, i16\n"
+            "        └─Scan table=u source=fake columns=[i16, i32]\n");
   EXPECT_EQ(Explain(Optimized("SELECT p FROM (SELECT 1.5 AS p FROM t UNION ALL SELECT 2.5 AS p "
                               "FROM u) AS v WHERE p = 1.5e0")),
             "Output: p:DECIMAL(2,1)\n"
             "Project p\n"
-            "  UnionAll inputs=2 columns=[p]\n"
-            "    Filter CAST(p AS DOUBLE) = 1.5\n"
-            "      Project 1.5\n"
-            "        Scan table=t source=fake columns=[]\n"
-            "    Filter CAST(p AS DOUBLE) = 1.5\n"
-            "      Project 2.5\n"
-            "        Scan table=u source=fake columns=[]\n");
+            "└─UnionAll inputs=2 columns=[p]\n"
+            "  ├─Filter CAST(p AS DOUBLE) = 1.5\n"
+            "  │ └─Project 1.5\n"
+            "  │   └─Scan table=t source=fake columns=[]\n"
+            "  └─Filter CAST(p AS DOUBLE) = 1.5\n"
+            "    └─Project 2.5\n"
+            "      └─Scan table=u source=fake columns=[]\n");
 }
 
 // Each reference of a CTE is bound on its own, so each keeps the branch its own conditions leave.
@@ -957,13 +957,13 @@ TEST(OptimizerTest, EachReferenceOfAUnionCteKeepsTheBranchItsConditionsLeave) {
                               "p.x = q.x AND p.tag = 'a' AND q.tag = 'b'")),
             "Output: count_star():BIGINT\n"
             "Aggregate COUNT(*)\n"
-            "  Join INNER build=right keys=[p.x = q.x]\n"
-            "    UnionAll inputs=1 columns=[x, tag]\n"
-            "      Project i16, 'a'\n"
-            "        Scan table=t source=fake columns=[i16]\n"
-            "    UnionAll inputs=1 columns=[x, tag]\n"
-            "      Project i16, 'b'\n"
-            "        Scan table=u source=fake columns=[i16]\n");
+            "└─Join INNER build=right keys=[p.x = q.x]\n"
+            "  ├─UnionAll inputs=1 columns=[x, tag]\n"
+            "  │ └─Project i16, 'a'\n"
+            "  │   └─Scan table=t source=fake columns=[i16]\n"
+            "  └─UnionAll inputs=1 columns=[x, tag]\n"
+            "    └─Project i16, 'b'\n"
+            "      └─Scan table=u source=fake columns=[i16]\n");
 }
 
 // ---- joins (hand-built plans: kinds and shapes no query makes) ----
@@ -3484,34 +3484,34 @@ TEST(OptimizerTest, TheUnnestingPassLeavesAnOrdinaryPlanAlone) {
 // item holds -- so the outer row count it limits is the join's own; with ORDER BY it stays above
 // the Sort.
 TEST(OptimizerTest, ALimitMovesBelowTheItemsOverALeftJoinBack) {
-  EXPECT_EQ(Explain(Optimized("SELECT i16, (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1 "
-                              "FROM t LIMIT 2")),
-            "Output: i16:SMALLINT ((SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1):BIGINT\n"
-            "Project i16, \"((SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1)\"\n"
-            "  Compute ((count_star() - 1) - 1)\n"
-            "    Compute (count_star() - 1)\n"
-            "      Compute (count_star() - 1)\n"
-            "        Compute COALESCE(count_star(), 0)\n"
-            "          Limit 2\n"
-            "            Join LEFT build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 4 unread "
-            "above\n"
-            "              Scan table=t source=fake columns=[i16, i64]\n"
-            "              GroupAggregate keys=[\"u.i64\"] COUNT(*)\n"
-            "                Scan table=u source=fake columns=[i64]\n");
-  EXPECT_EQ(Explain(Optimized("SELECT i16, (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) FROM t "
-                              "ORDER BY 2 LIMIT 2")),
-            "Output: i16:SMALLINT (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64):BIGINT\n"
-            "Project i16, \"(SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64)\"\n"
-            "  Limit 2\n"
-            "    Sort \"(SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64)\" ASC NULLS LAST\n"
-            "      Compute (count_star() - 1)\n"
-            "        Compute (count_star() - 1)\n"
-            "          Compute COALESCE(count_star(), 0)\n"
-            "            Join LEFT build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 4 unread "
-            "above\n"
-            "              Scan table=t source=fake columns=[i16, i64]\n"
-            "              GroupAggregate keys=[\"u.i64\"] COUNT(*)\n"
-            "                Scan table=u source=fake columns=[i64]\n");
+  EXPECT_EQ(
+      Explain(Optimized("SELECT i16, (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1 "
+                        "FROM t LIMIT 2")),
+      "Output: i16:SMALLINT ((SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1):BIGINT\n"
+      "Project i16, \"((SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1)\"\n"
+      "└─Compute ((count_star() - 1) - 1)\n"
+      "  └─Compute (count_star() - 1)\n"
+      "    └─Compute (count_star() - 1)\n"
+      "      └─Compute COALESCE(count_star(), 0)\n"
+      "        └─Limit 2\n"
+      "          └─Join LEFT build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 4 unread above\n"
+      "            ├─Scan table=t source=fake columns=[i16, i64]\n"
+      "            └─GroupAggregate keys=[\"u.i64\"] COUNT(*)\n"
+      "              └─Scan table=u source=fake columns=[i64]\n");
+  EXPECT_EQ(
+      Explain(Optimized("SELECT i16, (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) FROM t "
+                        "ORDER BY 2 LIMIT 2")),
+      "Output: i16:SMALLINT (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64):BIGINT\n"
+      "Project i16, \"(SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64)\"\n"
+      "└─Limit 2\n"
+      "  └─Sort \"(SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64)\" ASC NULLS LAST\n"
+      "    └─Compute (count_star() - 1)\n"
+      "      └─Compute (count_star() - 1)\n"
+      "        └─Compute COALESCE(count_star(), 0)\n"
+      "          └─Join LEFT build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 4 unread above\n"
+      "            ├─Scan table=t source=fake columns=[i16, i64]\n"
+      "            └─GroupAggregate keys=[\"u.i64\"] COUNT(*)\n"
+      "              └─Scan table=u source=fake columns=[i64]\n");
   const std::string one_row = Explain(Optimized(
       "SELECT i16, (SELECT COUNT(*) + (SELECT MIN(i16) FROM ok) FROM u WHERE u.i64 = t.i64) FROM t "
       "LIMIT 2"));
@@ -3542,7 +3542,7 @@ TEST(OptimizerTest, DependentKeysOverAJoinBack) {
   const LogicalPlan dependent = Optimized(
       std::format("SELECT {0} AS k, {0} + 1 AS k1, COUNT(*) FROM t GROUP BY 1, 2", kCount));
   EXPECT_EQ(keys(dependent), 1U) << Explain(dependent);
-  EXPECT_NE(Explain(dependent).find("Compute (count_star() + 1)\n      GroupAggregate"),
+  EXPECT_NE(Explain(dependent).find("Compute (count_star() + 1)\n    └─GroupAggregate"),
             std::string::npos)
       << Explain(dependent);
   const LogicalPlan limited = Optimized(
@@ -3576,10 +3576,10 @@ TEST(OptimizerTest, AJoinBackStandsAboveTheBlocksJoins) {
 TEST(OptimizerTest, ATailValuesReductionClonesWhatWhereKeeps) {
   const std::string filtered = Explain(Optimized(
       "SELECT ok.i16, (SELECT COUNT(*) FROM t WHERE t.i16 = ok.i16) FROM ok WHERE ok.i16 > 0"));
-  EXPECT_NE(filtered.find("      GroupAggregate keys=[\"t.i16\"] COUNT(*)\n"
-                          "        Join SEMI build=right keys=[\"t.i16\" = \"ok.i16\"]\n"
-                          "          Scan table=t source=fake columns=[i16]\n"
-                          "          Filter i16 > 0"),
+  EXPECT_NE(filtered.find("    └─GroupAggregate keys=[\"t.i16\"] COUNT(*)\n"
+                          "      └─Join SEMI build=right keys=[\"t.i16\" = \"ok.i16\"]\n"
+                          "        ├─Scan table=t source=fake columns=[i16]\n"
+                          "        └─Filter i16 > 0"),
             std::string::npos)
       << filtered;
   const std::string stacked = Explain(Optimized(

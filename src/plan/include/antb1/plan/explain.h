@@ -7,13 +7,14 @@
 namespace antb1::plan {
 
 // Deterministic text rendering of a logical plan (`antb1 explain` and the EXPLAIN tests): an
-// "Output:" line with the result columns, then one line per node, root first, each input indented
-// by two more spaces, e.g.
+// "Output:" line with the result columns, then one line per node, root first. Each input is the
+// next line, linked by `├─` (or `└─` for the last input); the gutter under an earlier input is
+// `│ ` and under the last input two spaces, so every input lines up under its parent, e.g.
 //
 //   Output: count_star():BIGINT sum(x):HUGEINT
 //   Aggregate COUNT(*), SUM(x)
-//     Filter x > 0 AND d >= DATE '2013-07-01'
-//       Scan table=t source=parquet(files=1, rows=10) columns=[x, d]
+//   └─Filter x > 0 AND d >= DATE '2013-07-01'
+//     └─Scan table=t source=parquet(files=1, rows=10) columns=[x, d]
 //
 // Column names that are not plain identifiers are double-quoted; strings and names show bytes
 // outside printable ASCII as \xHH.

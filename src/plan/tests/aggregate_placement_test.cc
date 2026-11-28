@@ -618,9 +618,9 @@ TEST(AggregatePlacementTest, ValuesOverAJoinBack) {
   const std::string sum_key = GatePlan(
       "SELECT (SELECT SUM(w.dk) FROM wide w WHERE w.dk = f.few) AS k, SUM(f.v) FROM facts f GROUP "
       "BY 1");
-  EXPECT_NE(sum_key.find("    Join LEFT build=right keys=[\"f.few\" = \"w.dk\"] carries 2 of 4 "
+  EXPECT_NE(sum_key.find("  └─Join LEFT build=right keys=[\"f.few\" = \"w.dk\"] carries 2 of 4 "
                          "unread above\n"
-                         "      GroupAggregate keys=[\"f.few\"] SUM(v)\n"),
+                         "    ├─GroupAggregate keys=[\"f.few\"] SUM(v)\n"),
             std::string::npos)
       << sum_key;
   // Next to a key computed over the left side, the exchange declines: that key's Compute is read
