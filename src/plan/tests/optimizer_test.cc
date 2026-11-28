@@ -2579,6 +2579,50 @@ void CheckScalarRewrite(const Catalog& catalog, std::string_view sql, bool accep
   }
 }
 
+TEST(OptimizerTest, OuterScalarConditionFiltersOnlyAnEmptyRejectingConsumer) {
+  const auto catalog = MakeCatalog();
+  const std::string scalar = "(SELECT COUNT(*) FROM u WHERE u.i32 = t.i32 AND t.i16 > 0)";
+  for (const auto& [consumer, expected] :
+       {std::pair{" > 0", JoinKind::kInner}, std::pair{" = 0", JoinKind::kLeft}}) {
+    const auto bound =
+        BindSql(std::format("SELECT t.i64 FROM t WHERE {}{}", scalar, consumer), catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimize(*bound);
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    const auto* join = Find<JoinNode>(plan->root);
+    ASSERT_NE(join, nullptr) << Explain(*plan);
+    EXPECT_EQ(join->kind, expected) << Explain(*plan);
+    EXPECT_EQ(Find<FilterNode>(join->left) != nullptr, expected == JoinKind::kInner);
+    const auto* group = Find<GroupAggregateNode>(join->right);
+    ASSERT_NE(group, nullptr) << Explain(*plan);
+    EXPECT_EQ(group->keys.size(), 1U);
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt);
+  }
+}
+
+TEST(OptimizerTest, GuardedScalarArgumentsRequireAnExactSetOfEnabledKeys) {
+  const auto catalog = MakeCatalog();
+  constexpr std::string_view kCount = "SELECT COUNT(*) FROM u WHERE u.i32 = t.i32 AND ";
+  for (const auto& [guard, accepted] : {std::pair{"t.i16 IS NULL OR t.s = 'x'", true},
+                                        std::pair{"t.i16 > 0 AND t.i64 IS NOT NULL", true},
+                                        std::pair{"CAST(t.i64 AS SMALLINT) > 0", false},
+                                        std::pair{"t.i16 > 0 AND u.i64 + t.i16 > 2", false}}) {
+    CheckScalarRewrite(catalog, std::format("SELECT ({}({})) FROM t", kCount, guard), accepted);
+  }
+  constexpr std::string_view kChecked =
+      "(SELECT MAX(CAST(u.i64 AS SMALLINT)) FROM u WHERE u.i32 = t.i32 AND t.i16 > 0)";
+  CheckScalarRewrite(catalog, std::format("SELECT {} FROM t", kChecked), true);
+  CheckScalarRewrite(catalog, std::format("SELECT {} FROM t LIMIT 1", kChecked), false);
+  CheckScalarRewrite(catalog, std::format("SELECT t.i64 FROM t WHERE {} > 0", kChecked), true);
+  CheckScalarRewrite(
+      catalog, "SELECT (SELECT AVG(u.dt) FROM u WHERE u.i32 = t.i32 AND t.i16 > 0) FROM t", true);
+  CheckScalarRewrite(
+      catalog,
+      "SELECT (SELECT MAX(i.v) FROM (SELECT i32 AS k, CAST(i64 AS SMALLINT) AS v FROM u) i "
+      "WHERE i.k = t.i32 AND t.i16 > 0) FROM t",
+      false);
+}
+
 TEST(OptimizerTest, ComputedScalarKeysRequireSafeSideLocalOperands) {
   const auto catalog = MakeCatalog();
   struct Example {

@@ -233,9 +233,10 @@ enum class Feature : std::uint8_t {
   kKeyedDomainAggregate,  // SQ9: a second outer column in a correlated aggregate inequality
   // SQ9: a scalar aggregate whose correlation has no equality key.
   kKeylessDomainAggregate,
-  kCorrelatedSingle,   // SQ4b: zero or one row per binding, checked at probe time
-  kWidenedScalarKey,   // SQ10: an aggregate correlation over two exact numeric types
-  kComputedScalarKey,  // SQ10: side-local expressions in a scalar aggregate equality
+  kCorrelatedSingle,      // SQ4b: zero or one row per binding, checked at probe time
+  kWidenedScalarKey,      // SQ10: an aggregate correlation over two exact numeric types
+  kComputedScalarKey,     // SQ10: side-local expressions in a scalar aggregate equality
+  kScalarOuterCondition,  // SQ10: a keyed scalar aggregate with an enclosing-row WHERE conjunct
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -437,6 +438,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "keyless_domain_aggregate";
     case Feature::kComputedScalarKey:
       return "computed_scalar_key";
+    case Feature::kScalarOuterCondition:
+      return "scalar_outer_condition";
     case Feature::kWidenedScalarKey:
       return "widened_scalar_key";
     case Feature::kNestedCorrelation:
@@ -668,6 +671,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedSingle,
     Feature::kWidenedScalarKey,
     Feature::kComputedScalarKey,
+    Feature::kScalarOuterCondition,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

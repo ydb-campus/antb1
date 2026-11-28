@@ -2713,6 +2713,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   int avg_integer = 0;
   int avg_decimal = 0;
   int computed_keys = 0;
+  int outer_conditions = 0;
   int grouped_integer_min_max = 0;
   int widened_keys = 0;
   int keyed_domains = 0;
@@ -2726,6 +2727,12 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     if (q.features.Has(Feature::kComputedScalarKey)) {
       ++computed_keys;
       EXPECT_TRUE(q.sql.contains('%')) << q.sql;
+      EXPECT_FALSE(q.features.Has(Feature::kCorrelatedSingle)) << q.sql;
+    }
+    if (q.features.Has(Feature::kScalarOuterCondition)) {
+      ++outer_conditions;
+      EXPECT_TRUE(q.sql.contains(" AND ")) << q.sql;
+      EXPECT_FALSE(q.features.Has(Feature::kKeylessDomainAggregate)) << q.sql;
       EXPECT_FALSE(q.features.Has(Feature::kCorrelatedSingle)) << q.sql;
     }
     const auto ordinary = without_widening.Generate(i);
@@ -2791,6 +2798,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     EXPECT_FALSE(q.features.Has(Feature::kScalarSubquery)) << q.sql;
   }
   EXPECT_GT(computed_keys, 0);
+  EXPECT_GT(outer_conditions, 0);
   EXPECT_GT(grouped_integer_min_max, 0);
   EXPECT_GT(widened_keys, 0);
   EXPECT_GT(grouped_scalars, 0);

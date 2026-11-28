@@ -93,30 +93,6 @@ std::optional<Predicate> ThroughProject(const ProjectNode& project, const Predic
   return below;
 }
 
-// These tests read already computed columns and can evaluate every value of their bound types.
-bool CanSkipPredicate(const Predicate& p) {
-  using enum Predicate::Kind;
-  if (p.kind == kFalse || p.kind == kIsNull || p.kind == kIsNotNull || p.kind == kIsTrue) {
-    return true;
-  }
-  if (!p.column) {
-    return false;
-  }
-  if (p.kind == kCompare) {
-    return p.column->type == p.constant.type || ComparesDecimalInDouble(*p.column, p.constant);
-  }
-  if (p.kind == kLike || p.kind == kNotLike) {
-    return p.column->type == LogicalType::kVarchar && p.constant.type == LogicalType::kVarchar &&
-           std::holds_alternative<std::string>(p.constant.value);
-  }
-  if (p.kind == kIn || p.kind == kNotIn) {
-    return std::ranges::all_of(p.values,
-                               [&](const Constant& v) { return v.type == p.column->type; });
-  }
-  return (p.kind == kCompareColumns || p.kind == kIsDistinct || p.kind == kIsNotDistinct) &&
-         p.other && p.column->type == p.other->type;
-}
-
 // A filter can discard rows before a Compute only if every expression it skips is total.
 // Cache exact footer ranges by physical field so multiple consumers of a table pay once.
 class ComputeSafety {
@@ -1337,6 +1313,30 @@ LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstim
 
 }  // namespace
 
+// These tests read already computed columns and can evaluate every value of their bound types.
+bool CanSkipPredicate(const Predicate& p) {
+  using enum Predicate::Kind;
+  if (p.kind == kFalse || p.kind == kIsNull || p.kind == kIsNotNull || p.kind == kIsTrue) {
+    return true;
+  }
+  if (!p.column) {
+    return false;
+  }
+  if (p.kind == kCompare) {
+    return p.column->type == p.constant.type || ComparesDecimalInDouble(*p.column, p.constant);
+  }
+  if (p.kind == kLike || p.kind == kNotLike) {
+    return p.column->type == LogicalType::kVarchar && p.constant.type == LogicalType::kVarchar &&
+           std::holds_alternative<std::string>(p.constant.value);
+  }
+  if (p.kind == kIn || p.kind == kNotIn) {
+    return std::ranges::all_of(p.values,
+                               [&](const Constant& v) { return v.type == p.column->type; });
+  }
+  return (p.kind == kCompareColumns || p.kind == kIsDistinct || p.kind == kIsNotDistinct) &&
+         p.other && p.column->type == p.other->type;
+}
+
 // Wide sums check the accumulator and AVG(DATE) checks the conversion to timestamp. Groups
 // removed by a consumer's pushed filter must stay unevaluated regardless of the sharing gate.
 bool CanFailOnGroup(const AggregateCall& call) {
@@ -1349,19 +1349,21 @@ bool CanFailOnGroup(const AggregateCall& call) {
          (call.kind == AggKind::kAvg && type == LogicalType::kDate);
 }
 
-bool CanPrecomputeScalarKey(const Expr& expr, const LogicalNodePtr& input) {
+namespace {
+
+bool SafeScalarOperand(const Expr& expr, const LogicalNodePtr& input, bool check_comparisons) {
   if (std::holds_alternative<ColumnExpr>(expr.node) ||
       std::holds_alternative<ConstantExpr>(expr.node)) {
     return true;
   }
   if (const auto* cast = std::get_if<CastExpr>(&expr.node)) {
     return IsExactWidening(cast->operand->type, expr.type) &&
-           CanPrecomputeScalarKey(*cast->operand, input);
+           SafeScalarOperand(*cast->operand, input, check_comparisons);
   }
   if (const auto* fn = std::get_if<FunctionExpr>(&expr.node)) {
     return (fn->function == Function::kStrlen || fn->function == Function::kLower ||
             fn->function == Function::kUpper) &&
-           CanPrecomputeScalarKey(*fn->args.front(), input);
+           SafeScalarOperand(*fn->args.front(), input, check_comparisons);
   }
   if (const auto* op = std::get_if<ArithExpr>(&expr.node);
       op != nullptr && IsInteger(expr.type) &&
@@ -1369,29 +1371,44 @@ bool CanPrecomputeScalarKey(const Expr& expr, const LogicalNodePtr& input) {
     const auto* divisor = std::get_if<ConstantExpr>(&op->right->node);
     const auto* value = divisor == nullptr ? nullptr : std::get_if<Int128>(&divisor->value.value);
     return value != nullptr && *value > 0 && *value <= RangeOf(expr.type).max &&
-           IsExactWidening(op->left->type, expr.type) && CanPrecomputeScalarKey(*op->left, input);
+           IsExactWidening(op->left->type, expr.type) &&
+           SafeScalarOperand(*op->left, input, check_comparisons);
   }
-  const auto safe = [&](const ExprPtr& operand) { return CanPrecomputeScalarKey(*operand, input); };
+  const auto safe = [&](const ExprPtr& operand) {
+    return SafeScalarOperand(*operand, input, check_comparisons);
+  };
   if (const auto* pred = std::get_if<PredicateExpr>(&expr.node)) {
-    return std::ranges::all_of(pred->operands, safe);
+    return (!check_comparisons || CanSkipPredicate(pred->predicate)) &&
+           std::ranges::all_of(pred->operands, safe);
   }
   if (const auto* boolean = std::get_if<BoolExpr>(&expr.node)) {
     return std::ranges::all_of(boolean->args, safe);
   }
   if (const auto* arms = std::get_if<CaseExpr>(&expr.node)) {
     const auto safe_arm = [&](const ExprPtr& arm) {
-      return arm == nullptr ||
-             (IsExactWidening(arm->type, expr.type) && CanPrecomputeScalarKey(*arm, input));
+      return arm == nullptr || (IsExactWidening(arm->type, expr.type) &&
+                                SafeScalarOperand(*arm, input, check_comparisons));
     };
     return std::ranges::all_of(arms->whens,
                                [&](const ExprPtr& when) {
-                                 return when == nullptr || CanPrecomputeScalarKey(*when, input);
+                                 return when == nullptr ||
+                                        SafeScalarOperand(*when, input, check_comparisons);
                                }) &&
            std::ranges::all_of(arms->thens, safe_arm) && safe_arm(arms->otherwise);
   }
   ComputeSafety safety;
   safety.use = ComputeSafety::Use::kScalarKey;
   return safety.Arithmetic(expr, input);
+}
+
+}  // namespace
+
+bool CanPrecomputeScalarKey(const Expr& expr, const LogicalNodePtr& input) {
+  return SafeScalarOperand(expr, input, false);
+}
+
+bool CanEvaluateOnUnmatchedRow(const Expr& expr, const LogicalNodePtr& input) {
+  return SafeScalarOperand(expr, input, true);
 }
 
 bool CanEvaluateUnboundProjection(const Expr& expr, const LogicalNodePtr& input) {

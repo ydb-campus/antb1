@@ -1538,8 +1538,7 @@ SMALLINT
 5
 6
 
-# An outer-only conjunct in the aggregate is a later SQ10 rule.
-onlyif duckdb
+# SQ10: an outer-only conjunct gives COUNT its empty value when the condition is not true.
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id AND c.ct_pop > 10000) = 0 ORDER BY 1
@@ -1548,6 +1547,108 @@ SMALLINT
 4
 5
 6
+
+# Duplicate parity keys see different COUNT and SUM values for TRUE, FALSE and NULL.
+query IIII nosort
+SELECT o.id, o.i32,
+       (SELECT COUNT(*) FROM edge i WHERE i.id % 2 = o.id % 2 AND o.i32 > 0),
+       (SELECT SUM(i.id) FROM edge i WHERE o.i32 > 0 AND i.id % 2 = o.id % 2)
+FROM edge o ORDER BY o.id
+----
+INTEGER	INTEGER	BIGINT	HUGEINT
+0	-2147483648	0	NULL
+1	2147483647	6	36
+2	0	0	NULL
+3	-1	0	NULL
+4	1	6	30
+5	NULL	0	NULL
+6	100000	6	30
+7	-100000	0	NULL
+8	7	6	30
+9	NULL	0	NULL
+10	54321	6	30
+11	-7	0	NULL
+
+# A false or NULL outer condition empties the aggregate input before HAVING and the select item.
+query III nosort
+SELECT o.id,
+       (SELECT COUNT(*) + 2 FROM edge i WHERE i.i16 IS NOT DISTINCT FROM o.i16
+        AND o.i32 IS NOT NULL AND o.i64 < 0 HAVING COUNT(*) = 0),
+       (SELECT COALESCE(SUM(i.id), 42) FROM edge i WHERE i.i16 IS NOT DISTINCT FROM o.i16
+        AND (o.i32 > 0 OR o.i64 < 0))
+FROM edge o ORDER BY o.id
+----
+INTEGER	BIGINT	HUGEINT
+0	NULL	0
+1	2	1
+2	2	42
+3	NULL	3
+4	2	4
+5	2	42
+6	2	6
+7	NULL	7
+8	2	13
+9	2	42
+10	NULL	10
+11	2	42
+
+# The empty-rejecting consumer can filter outer rows. The key widens independently of the guard.
+query I nosort
+SELECT o.id FROM edge o WHERE
+  (SELECT COUNT(*) FROM edge i WHERE i.id = o.i16 AND o.i32 >= 0) > 0
+ORDER BY o.id
+----
+INTEGER
+2
+4
+
+# The checked cast is reached for id 2 only. Other keys have values outside SMALLINT.
+query II nosort
+SELECT o.id, (SELECT MAX(CAST(i.i64 AS SMALLINT)) FROM edge i
+              WHERE i.id = o.id AND o.i16 = 0) FROM edge o ORDER BY o.id
+----
+INTEGER	SMALLINT
+0	NULL
+1	NULL
+2	0
+3	NULL
+4	NULL
+5	NULL
+6	NULL
+7	NULL
+8	NULL
+9	NULL
+10	NULL
+11	NULL
+
+statement error out of range
+SELECT o.id, (SELECT MAX(CAST(i.i64 AS SMALLINT)) FROM edge i
+              WHERE i.id = o.id AND o.i16 < 0) FROM edge o ORDER BY o.id
+
+# A strict select item can still raise an error on an empty group. Its checked operand
+# must run for disabled bindings before the enclosing comparison discards the row.
+statement error out of range
+SELECT o.id FROM edge o WHERE
+  (SELECT MAX(i.id) + CAST(COUNT(*) * 40000 - 40000 AS SMALLINT)
+   FROM edge i WHERE i.id = o.id AND o.i32 = 0) > 0 ORDER BY 1
+
+query I nosort
+SELECT o.id FROM edge o WHERE
+  (SELECT MAX(CAST(i.i64 AS SMALLINT)) FROM edge i WHERE i.id = o.id AND o.i16 = 0) >= 0
+ORDER BY 1
+----
+INTEGER
+2
+
+# The enclosing comparison rejects a NULL scalar. Its other operand only runs on the
+# surviving row, where the checked cast fits.
+query I nosort
+SELECT o.id FROM edge o WHERE
+  CAST(o.i64 AS SMALLINT) + (SELECT MAX(i.id) FROM edge i WHERE i.id = o.id AND o.i32 = 0) > 0
+ORDER BY 1
+----
+INTEGER
+2
 
 # A keyless SQ9 aggregate returns zero for a binding with no passing row.
 query I nosort

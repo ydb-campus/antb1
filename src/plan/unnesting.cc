@@ -1734,17 +1734,34 @@ arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation,
   return out;
 }
 
+LogicalNodePtr FilterScalarBindings(LogicalNodePtr input, const ExprPtr& condition,
+                                    ColumnId& last_id, SourceSpan span) {
+  last_id = ColumnId{std::to_underlying(last_id) + 1};
+  const BoundColumn tested{.id = last_id, .name = condition->name, .type = LogicalType::kBoolean};
+  auto computed = Make(ComputeNode{
+      .input = std::move(input), .exprs = {condition}, .ids = {tested.id}, .span = span});
+  return Make(FilterNode{.input = std::move(computed),
+                         .predicates = {{.kind = Predicate::Kind::kIsTrue, .column = tested}},
+                         .span = span});
+}
+
 // Evaluate error-prone maps only for actual bindings.
 arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlation,
                                                    const LogicalNodePtr& input,
                                                    const std::map<ColumnId, BoundColumn>& carried,
                                                    const Representatives& representatives,
-                                                   const Equivalences& equivalences) {
+                                                   const Equivalences& equivalences,
+                                                   const ExprPtr& condition = nullptr) {
   LogicalNodePtr outer = correlation.join.left;
   if (Traits(correlation.join.kind).single_match || correlation.mode == Mode::kValue) {
     std::set<ColumnId> bindings;
     for (const auto& [id, inner] : carried) {
       bindings.insert(id);
+    }
+    if (condition != nullptr) {
+      std::vector<ColumnId> reads;
+      CollectColumnIds(*condition, reads);
+      bindings.insert(reads.begin(), reads.end());
     }
     outer = ExactBindingSource(outer, std::move(bindings));
   }
@@ -1753,6 +1770,10 @@ arrow::Result<LogicalNodePtr> RestrictBindingInput(const Correlation& correlatio
     return correlation.Refuse(
         "whose selected or grouped expression needs an exact outer domain over subqueries or "
         "LIMIT");
+  }
+  if (condition != nullptr) {
+    outer = FilterScalarBindings(std::move(outer), condition, correlation.last_id,
+                                 correlation.join.span);
   }
   const ClonedInput domain = CloneInput(outer, correlation.last_id);
   std::vector<JoinKey> keys;
@@ -1787,19 +1808,22 @@ bool ReadsEmptyScan(const LogicalNodePtr& input) {
 }
 
 // A derived table may hide a checked expression behind an ordinary column reference.
-const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input) {
+const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded = false) {
   for (const auto& child : InputsOf(*input)) {
-    if (const auto* unsafe = FirstUnsafeInnerNode(child)) {
+    if (const auto* unsafe = FirstUnsafeInnerNode(child, guarded)) {
       return unsafe;
     }
   }
   const bool safe = std::visit(
-      [](const auto& node) {
+      [guarded](const auto& node) {
         using Node = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<Node, ComputeNode>) {
           return std::ranges::all_of(node.exprs, [&](const ExprPtr& expr) {
-            return CanEvaluateUnboundProjection(*expr, node.input);
+            return guarded ? CanEvaluateOnUnmatchedRow(*expr, node.input)
+                           : CanEvaluateUnboundProjection(*expr, node.input);
           });
+        } else if constexpr (std::is_same_v<Node, FilterNode>) {
+          return !guarded || std::ranges::all_of(node.predicates, CanSkipPredicate);
         } else if constexpr (std::is_same_v<Node, AggregateNode> ||
                              std::is_same_v<Node, GroupAggregateNode> ||
                              std::is_same_v<Node, GroupingSetsNode>) {
@@ -1809,22 +1833,33 @@ const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input) {
         } else if constexpr (std::is_same_v<Node, JoinNode>) {
           const auto traits = Traits(node.kind);
           return !traits.single_match &&
-                 std::ranges::all_of(node.residual, [](const ExprPtr& expr) {
-                   return SafeBeforeMembership(*expr);
+                 std::ranges::all_of(node.residual, [&](const ExprPtr& expr) {
+                   return guarded ? CanEvaluateOnUnmatchedRow(*expr, nullptr)
+                                  : SafeBeforeMembership(*expr);
                  });
         } else if constexpr (std::is_same_v<Node, DependentJoinNode>) {
-          return !Traits(node.kind).single_match;
+          return !guarded && !Traits(node.kind).single_match;
         } else {
-          return !std::is_same_v<Node, WindowNode>;
+          return guarded ? (std::is_same_v<Node, ScanNode> || std::is_same_v<Node, ProjectNode> ||
+                            std::is_same_v<Node, LimitNode> || std::is_same_v<Node, SortNode> ||
+                            std::is_same_v<Node, RowCountNode>)
+                         : !std::is_same_v<Node, WindowNode>;
         }
       },
       *input);
   return safe ? nullptr : input.get();
 }
 
-bool ConsumesAllBindings(std::span<const Ancestor> above) {
-  return std::ranges::all_of(above, [](const Ancestor& step) {
+bool ConsumesAllBindings(std::span<const Ancestor> above, std::span<const ColumnId> values = {}) {
+  return std::ranges::all_of(above, [values](const Ancestor& step) {
     const auto& ancestor = *step.node;
+    // A filter on the scalar itself must read its value before it can discard any row.
+    if (const auto* filter = std::get_if<FilterNode>(&ancestor);
+        filter != nullptr && !values.empty()) {
+      return std::ranges::all_of(filter->predicates, [values](const Predicate& p) {
+        return CanSkipPredicate(p) && p.column && std::ranges::contains(values, p.column->id);
+      });
+    }
     return std::holds_alternative<ProjectNode>(ancestor) ||
            std::holds_alternative<ComputeNode>(ancestor) ||
            std::holds_alternative<SortNode>(ancestor) ||
@@ -1984,7 +2019,8 @@ std::string NameOfCall(const AggregateCall& call, const Spine& spine) {
 }
 
 arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& spine,
-                                   bool computed_keys = false);
+                                   bool computed_keys = false,
+                                   const ExprPtr& outer_condition = nullptr);
 
 // Repeated keys on one side share their computed column.
 ExprPtr ScalarKeyColumn(const ExprPtr& value, ComputeNode& keys, ColumnId& last_id) {
@@ -2068,16 +2104,19 @@ ExprPtr NormalizeScalarKey(const ExprPtr& expr, bool computed_pass, const Correl
 }
 
 // SQ10: normalize an equality of two side-local expressions to columns of its exact common
-// type. The original outer columns remain available to other conjuncts at their original types.
-arrow::Result<Rewritten> ComputeScalarKeys(const Correlation& correlation, Spine spine,
-                                           const arrow::Status& missing_representative) {
+// type. Once key normalization is exhausted, lift safe outer-only conjuncts and retry substitution.
+arrow::Result<Rewritten> NormalizeScalarCorrelation(const Correlation& correlation, Spine spine,
+                                                    const arrow::Status& missing_representative,
+                                                    bool computed_keys) {
   const auto inner_ids = OutputIds(*spine.below);
   DependentJoinNode join = correlation.join;
   ComputeNode left{.input = join.left, .span = join.span};
   ComputeNode right{.input = spine.below, .span = join.span};
   ComputeNode predicates = *spine.computed;
+  const auto slot = [&spine](const ExprPtr* definition) {
+    return Narrow<std::size_t>(definition - spine.computed->exprs.data());
+  };
   bool changed_key = false;
-  bool computed_keys = false;
   ARROW_ASSIGN_OR_RAISE(const auto conjuncts, ConjunctsOf(correlation, spine));
   // Keep plans that plain mixed-width keys already answer. On a retry only computed
   // operands remain, so their original outer columns cannot get an accidental representative.
@@ -2086,17 +2125,50 @@ arrow::Result<Rewritten> ComputeScalarKeys(const Correlation& correlation, Spine
       const ExprPtr key =
           NormalizeScalarKey(*defined, computed_pass, correlation, inner_ids, left, right);
       if (key != *defined) {
-        predicates.exprs.at(Narrow<std::size_t>(defined - spine.computed->exprs.data())) = key;
+        predicates.exprs.at(slot(defined)) = key;
         changed_key = true;
       }
     }
     if (changed_key) {
-      computed_keys = computed_pass;
+      computed_keys |= computed_pass;
       break;
     }
   }
+  FilterNode filter = *spine.filter;
+  ExprPtr outer_condition;
   if (!changed_key) {
-    return missing_representative;
+    // Only retry after the existing substitutions and domain rules have declined. Removing
+    // the lifted definitions lets FreeVariables find exactly the keys still needed inside.
+    std::vector<ExprPtr> conditions;
+    std::set<ColumnId> lifted;
+    filter.predicates.clear();
+    for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+      const ExprPtr& expr = *conjuncts[i];
+      if (SidesOf(*expr, correlation.outer).outer_only() &&
+          CanEvaluateOnUnmatchedRow(*expr, join.left)) {
+        conditions.push_back(expr);
+        lifted.insert(predicates.ids.at(slot(conjuncts[i])));
+      } else {
+        filter.predicates.push_back(spine.filter->predicates[i]);
+      }
+    }
+    if (conditions.empty() || filter.predicates.empty()) {
+      return missing_representative;
+    }
+    ComputeNode kept{.input = predicates.input, .span = predicates.span};
+    for (std::size_t i = 0; i < predicates.ids.size(); ++i) {
+      if (!lifted.contains(predicates.ids[i])) {
+        kept.ids.push_back(predicates.ids[i]);
+        kept.exprs.push_back(predicates.exprs[i]);
+      }
+    }
+    predicates = std::move(kept);
+    outer_condition = conditions.size() == 1
+                          ? conditions.front()
+                          : std::make_shared<const Expr>(Expr{
+                                .node = BoolExpr{.op = BoolOp::kAnd, .args = std::move(conditions)},
+                                .type = LogicalType::kBoolean,
+                                .name = "outer WHERE"});
   }
   if (!left.ids.empty()) {
     join.left = Make(std::move(left));
@@ -2105,7 +2177,6 @@ arrow::Result<Rewritten> ComputeScalarKeys(const Correlation& correlation, Spine
     spine.below = Make(std::move(right));
   }
   predicates.input = spine.below;
-  FilterNode filter = *spine.filter;
   filter.input = Make(std::move(predicates));
   spine.computed = &std::get<ComputeNode>(*filter.input);
   join.right = Make(std::move(filter));
@@ -2124,9 +2195,23 @@ arrow::Result<Rewritten> ComputeScalarKeys(const Correlation& correlation, Spine
                             .build_side_ratio = correlation.build_side_ratio,
                             .above = correlation.above,
                             .report = correlation.report};
-  // Every eligible mixed equality now has one type, so a further missing representative
-  // returns its original refusal without another rewrite.
-  return ValueJoin(widened, spine, computed_keys);
+  // Each retry either normalizes an equality or removes the outer conditions in one pass.
+  return ValueJoin(widened, spine, computed_keys, outer_condition);
+}
+
+// Even a NULL select item can have an operand that raises on the empty aggregate values.
+bool CanSkipEmptyScalarItem(const Step& step) {
+  if (step.role == Role::kMap) {
+    if (const auto* compute = std::get_if<ComputeNode>(step.node.get())) {
+      return std::ranges::all_of(compute->exprs, [&](const ExprPtr& expr) {
+        return CanEvaluateOnUnmatchedRow(*expr, compute->input);
+      });
+    }
+  }
+  if (step.role == Role::kHaving) {
+    return std::ranges::all_of(std::get<FilterNode>(*step.node).predicates, CanSkipPredicate);
+  }
+  return step.role != Role::kJoin;
 }
 
 // Value mode's rewrite (ADR 0023's Path 2; the formalization's Lemmas 4.14 and 4.2): each outer
@@ -2152,17 +2237,18 @@ arrow::Result<Rewritten> ComputeScalarKeys(const Correlation& correlation, Spine
 //         Filter t.k = o.k                     GroupAggregate keys t.k  n' := count(*)
 //           Scan t                               Scan t
 arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& spine,
-                                   bool computed_keys) {
+                                   bool computed_keys, const ExprPtr& outer_condition) {
   const DependentJoinNode& join = correlation.join;
   ColumnId& last_id = correlation.last_id;
   std::map<ColumnId, EmptyValue> values;
   ARROW_RETURN_NOT_OK(CheckStatic(correlation, spine, values));
   ARROW_ASSIGN_OR_RAISE(Equivalences equivalences, EquivalencesOf(correlation, spine));
   LogicalNodePtr right = spine.below;
-  auto resolved = RepresentativesOf(correlation, spine, equivalences,
-                                    correlation.mode == Mode::kValue ? &right : nullptr);
-  if (!resolved.ok() && correlation.mode == Mode::kValue) {
-    return ComputeScalarKeys(correlation, spine, resolved.status());
+  const bool try_domain = correlation.mode == Mode::kValue && outer_condition == nullptr;
+  auto resolved =
+      RepresentativesOf(correlation, spine, equivalences, try_domain ? &right : nullptr);
+  if (!resolved.ok() && try_domain) {
+    return NormalizeScalarCorrelation(correlation, spine, resolved.status(), computed_keys);
   }
   ARROW_ASSIGN_OR_RAISE(const Representatives representatives, std::move(resolved));
   const bool has_domain = right != spine.below;
@@ -2174,29 +2260,40 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     appended.insert_or_assign(id, it == values.end() ? EmptyValue() : it->second);
   }
   // An empty outer relation needs no padding. Build that side so the grouped input never opens.
-  const bool empty_outer = computed_keys && ReadsEmptyScan(join.left);
-  const JoinBack join_back =
-      empty_outer ? JoinBack::kInner : ProveJoinBack(correlation.above, appended);
-  // Grouping can visit keys that no outer row reads. A newly admitted expression key must
-  // not evaluate a throwing argument, residual, or aggregate for one of those groups.
-  if (computed_keys) {
+  const bool guarded = outer_condition != nullptr;
+  const bool empty_outer = (computed_keys || guarded) && ReadsEmptyScan(join.left);
+  JoinBack join_back = empty_outer ? JoinBack::kInner : ProveJoinBack(correlation.above, appended);
+  if (!empty_outer && guarded && join_back == JoinBack::kInner &&
+      !std::ranges::all_of(spine.steps, CanSkipEmptyScalarItem)) {
+    join_back = JoinBack::kLeft;
+  }
+  // Grouping can visit keys that no outer row reads. A checked aggregate requires an
+  // exact restriction to enabled keys before its argument or state is evaluated.
+  bool needs_enabled_keys = false;
+  if (computed_keys || guarded) {
     for (const Step& step : spine.steps) {
-      if (const auto* compute = std::get_if<ComputeNode>(step.node.get());
-          compute != nullptr && (step.role == Role::kArguments || join_back == JoinBack::kInner) &&
+      const auto* compute = std::get_if<ComputeNode>(step.node.get());
+      const auto* aggregate = std::get_if<AggregateNode>(step.node.get());
+      const bool checked_input =
+          compute != nullptr &&
+          (step.role == Role::kArguments || (!guarded && join_back == JoinBack::kInner)) &&
           std::ranges::any_of(compute->exprs, [&](const ExprPtr& expr) {
-            return !CanPrecomputeScalarKey(*expr, compute->input);
-          })) {
-        return correlation.Refuse(
-            "with a computed key and a potentially failing aggregate expression");
-      }
-      if (const auto* aggregate = std::get_if<AggregateNode>(step.node.get());
-          aggregate != nullptr && std::ranges::any_of(aggregate->aggregates, CanFailOnGroup)) {
-        return correlation.Refuse("with a computed key and a potentially failing aggregate");
+            return guarded ? !CanEvaluateOnUnmatchedRow(*expr, compute->input)
+                           : !CanPrecomputeScalarKey(*expr, compute->input);
+          });
+      if (checked_input ||
+          (aggregate != nullptr && std::ranges::any_of(aggregate->aggregates, CanFailOnGroup))) {
+        if (!guarded) {
+          return correlation.Refuse(
+              "with a computed key and a potentially failing aggregate expression");
+        }
+        needs_enabled_keys = true;
       }
     }
-    if (std::ranges::any_of(equivalences.kept,
-                            [](const Expr* expr) { return !SafeBeforeMembership(*expr); })) {
-      return correlation.Refuse("with a computed key and a potentially failing residual");
+    if (std::ranges::any_of(equivalences.kept, [&](const Expr* expr) {
+          return guarded ? !CanEvaluateOnUnmatchedRow(*expr, right) : !SafeBeforeMembership(*expr);
+        })) {
+      return correlation.Refuse("with a potentially failing scalar correlation predicate");
     }
   }
   if (correlation.report != nullptr) {
@@ -2272,16 +2369,15 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   for (AggregateCall& call : grouped.aggregates) {
     call.id = rename(call.id);
   }
-  // On a LEFT join back each call whose empty value is no NULL (the COUNT kinds) is computed under
-  // a fresh id, and its own id is defined above the join as COALESCE(fresh, <empty value>): a real
-  // group's count is never NULL, so only an outer row with no group takes the empty value. The
-  // other calls keep their ids, NULL on such a row already.
-  std::vector<std::pair<AggregateCall, ColumnId>> coalesced;  // the call as written, its fresh id
+  // An absent group needs its empty aggregate value. A disabled binding needs that same
+  // value even if another outer row with the same key enabled the group.
+  std::vector<std::pair<AggregateCall, ColumnId>> empty_defaults;
   if (join_back == JoinBack::kLeft) {
     for (AggregateCall& call : grouped.aggregates) {
-      if (const EmptyValue empty = EmptyValueOf(call); empty.has_value() && !IsNull(empty)) {
-        coalesced.emplace_back(call, ColumnId{std::to_underlying(last_id) + 1});
-        last_id = coalesced.back().second;
+      if (const EmptyValue empty = EmptyValueOf(call);
+          guarded || (empty.has_value() && !IsNull(empty))) {
+        empty_defaults.emplace_back(call, ColumnId{std::to_underlying(last_id) + 1});
+        last_id = empty_defaults.back().second;
         call.id = last_id;
       }
     }
@@ -2300,13 +2396,26 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   };
   // Bottom-up: the kept conjuncts over the terminal, then the steps.
   bool restricted = has_domain;
-  if (const auto* unsafe = computed_keys ? FirstUnsafeInnerNode(spine.below) : nullptr) {
-    if (empty_outer || has_domain || !equivalences.kept.empty() ||
+  if (const auto* unsafe =
+          (computed_keys || guarded) ? FirstUnsafeInnerNode(spine.below, guarded) : nullptr) {
+    if (guarded || empty_outer || has_domain || !equivalences.kept.empty() ||
         !ConsumesAllBindings(correlation.above)) {
       return correlation.Refuse("with a computed key and a potentially failing derived input");
     }
     ARROW_ASSIGN_OR_RAISE(
         right, GuardDerivedProjection(correlation, right, unsafe, representatives, equivalences));
+    restricted = true;
+  }
+  if (needs_enabled_keys) {
+    if (!ConsumesAllBindings(correlation.above, OutputIds(*join.right))) {
+      return correlation.Refuse("whose checked aggregate needs every enabled binding");
+    }
+    std::map<ColumnId, BoundColumn> carried;
+    for (const auto& [outer, inner] : equivalent) {
+      carried.emplace(outer, described.at(inner));
+    }
+    ARROW_ASSIGN_OR_RAISE(right, RestrictBindingInput(correlation, right, carried, representatives,
+                                                      equivalences, outer_condition));
     restricted = true;
   }
   if (Traits(join.kind).single_match &&
@@ -2342,7 +2451,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   // The steps above the static aggregate, bottom-up, where they are rebuilt rather than re-made
   // over the group: above a LEFT join back, and wherever a HAVING is a CASE over them.
   const bool rebuilt =
-      join_back == JoinBack::kLeft || having ||
+      guarded || join_back == JoinBack::kLeft || having ||
       std::ranges::any_of(spine.steps, [](const Step& step) { return step.role == Role::kJoin; });
   std::vector<const Step*> maps;
   for (const Step& step : std::ranges::reverse_view(spine.steps)) {
@@ -2453,7 +2562,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
                         &typed](LogicalNodePtr top) {
     std::optional<BoundColumn> guard;  // the HAVING clauses below, once there is one
     std::set<ColumnId> defined;        // the renamed ids the select list defines
-    const auto guarded = [&guard](ExprPtr expr) -> ExprPtr {
+    const auto apply_having = [&guard](ExprPtr expr) -> ExprPtr {
       if (!guard.has_value()) {
         return expr;
       }
@@ -2513,7 +2622,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         ComputeNode out = *compute;
         out.input = std::move(top);
         for (ExprPtr& expr : out.exprs) {
-          expr = guarded(rename_reads(expr));
+          expr = apply_having(rename_reads(expr));
         }
         for (ColumnId& id : out.ids) {
           id = rename(id);
@@ -2531,7 +2640,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         if (constant == nullptr && rename(column.id) == project.ids[i]) {
           continue;  // passed through, and no HAVING guards it: defined below already
         }
-        items.exprs.push_back(guarded(std::make_shared<const Expr>(
+        items.exprs.push_back(apply_having(std::make_shared<const Expr>(
             constant != nullptr
                 ? Expr{.node = ConstantExpr{.value = **constant},
                        .type = (*constant)->type,
@@ -2552,7 +2661,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         continue;
       }
       const auto& [type, name] = typed.at(id);
-      guarded_values.exprs.push_back(guarded(std::make_shared<const Expr>(
+      guarded_values.exprs.push_back(apply_having(std::make_shared<const Expr>(
           Expr{.node = ColumnExpr{.index = 0, .id = fresh}, .type = type, .name = name})));
       guarded_values.ids.push_back(id);
     }
@@ -2562,7 +2671,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
 
   const std::optional<int64_t> left_rows = EstimateRows(*join.left);
   if (join_back == JoinBack::kInner) {
-    if (rebuilt) {
+    if (rebuilt && !guarded) {
       // Over the group: a HAVING's CASE reads it as it is, and a one-row join moves up with the
       // maps, which a Project's single input cannot carry.
       right = rebuild(std::move(right));
@@ -2572,7 +2681,8 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     const std::optional<int64_t> right_rows = EstimateRows(*right);
     LogicalNodePtr out = Make(JoinNode{
         .kind = JoinKind::kInner,
-        .left = join.left,
+        .left = guarded ? FilterScalarBindings(join.left, outer_condition, last_id, join.span)
+                        : join.left,
         .right = right,
         .keys = std::move(keys),
         .residual = {},
@@ -2580,6 +2690,9 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
                              : ChooseBuildSide(left_rows, right_rows, correlation.build_side_ratio),
         .estimate = left_rows,
         .span = join.span});
+    if (guarded) {
+      out = rebuild(std::move(out));
+    }
     return Rewritten{.node = std::move(out), .right = std::move(right)};
   }
   // LEFT builds its right input: it pads that side, which only a probe of the left one can tell
@@ -2592,29 +2705,32 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
                                      .build = BuildSide::kRight,
                                      .estimate = left_rows,
                                      .span = join.span});
-  if (!coalesced.empty()) {
-    ComputeNode counts{.input = std::move(top), .exprs = {}, .ids = {}, .span = aggregate->span};
-    for (const auto& [call, fresh] : coalesced) {
-      // Every call here has an empty value that is no NULL; the default is never taken.
+  if (!empty_defaults.empty()) {
+    ComputeNode defaults{.input = std::move(top), .exprs = {}, .ids = {}, .span = aggregate->span};
+    for (const auto& [call, fresh] : empty_defaults) {
       const Constant empty =
-          EmptyValueOf(call).value_or(Constant{.type = call.type, .value = Int128{0}});
-      const std::string name =
-          std::format("COALESCE({}, {})", NameOfCall(call, spine), ToString(empty));
-      counts.exprs.push_back(std::make_shared<const Expr>(
-          Expr{.node = CaseExpr{.whens = {nullptr},
-                                .thens = {std::make_shared<const Expr>(
-                                    Expr{.node = ColumnExpr{.index = 0, .id = fresh},
-                                         .type = call.type,
-                                         .name = NameOfCall(call, spine)})},
-                                .otherwise = std::make_shared<const Expr>(
-                                    Expr{.node = ConstantExpr{.value = empty},
-                                         .type = call.type,
-                                         .name = ToString(empty)})},
-               .type = call.type,
-               .name = name}));
-      counts.ids.push_back(call.id);
+          EmptyValueOf(call).value_or(Constant{.type = call.type, .value = std::monostate{}});
+      const ExprPtr fallback = std::make_shared<const Expr>(
+          Expr{.node = ConstantExpr{.value = empty}, .type = call.type, .name = ToString(empty)});
+      ExprPtr value =
+          ColumnValue(BoundColumn{.id = fresh, .name = NameOfCall(call, spine), .type = call.type});
+      if (!std::holds_alternative<std::monostate>(empty.value)) {
+        value = std::make_shared<const Expr>(
+            Expr{.node = CaseExpr{.whens = {nullptr}, .thens = {value}, .otherwise = fallback},
+                 .type = call.type,
+                 .name = std::format("COALESCE({}, {})", value->name, fallback->name)});
+      }
+      if (guarded) {
+        value = std::make_shared<const Expr>(Expr{
+            .node = CaseExpr{.whens = {outer_condition}, .thens = {value}, .otherwise = fallback},
+            .type = call.type,
+            .name = std::format("CASE WHEN {} THEN {} ELSE {} END", outer_condition->name,
+                                value->name, fallback->name)});
+      }
+      defaults.exprs.push_back(std::move(value));
+      defaults.ids.push_back(call.id);
     }
-    top = Make(std::move(counts));
+    top = Make(std::move(defaults));
   }
   return Rewritten{.node = rebuild(std::move(top)), .right = std::move(right)};
 }
