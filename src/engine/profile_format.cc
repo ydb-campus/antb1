@@ -154,13 +154,13 @@ PrintedSide JoinBuildSide(std::string_view detail) {
     return PrintedSide::kUnknown;
   }
   const std::string_view side = detail.substr(at + kBuild.size());
-  const auto token = [](std::string_view side, std::string_view name) {
-    return side.starts_with(name) && (side.size() == name.size() || side[name.size()] == ' ');
+  const auto matches = [](std::string_view text, std::string_view name) {
+    return text.starts_with(name) && (text.size() == name.size() || text[name.size()] == ' ');
   };
-  if (token(side, "left")) {
+  if (matches(side, "left")) {
     return PrintedSide::kLeft;
   }
-  if (token(side, "right")) {
+  if (matches(side, "right")) {
     return PrintedSide::kRight;
   }
   return PrintedSide::kUnknown;
