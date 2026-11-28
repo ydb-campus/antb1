@@ -9558,17 +9558,17 @@ TEST(BinderTest, MiddleEqualityPreservesFloatStorageTypeAcrossScopes) {
 
 TEST(BinderTest, MiddleEqualityRejectsCheckedSiblingWorkInEitherOrder) {
   const Catalog catalog = MakeCatalog();
-  const std::string nested = "EXISTS (SELECT 1 FROM ok i WHERE i.i16 = g.i16)";
-  for (const std::string sibling :
+  const std::string_view nested = "EXISTS (SELECT 1 FROM ok i WHERE i.i16 = g.i16)";
+  for (const std::string_view sibling :
        {"EXISTS (SELECT 1 FROM t x WHERE x.i16 = m.i16 AND x.i64 + m.i64 >= 0)",
         "CAST(m.i64 AS SMALLINT) IN (SELECT x.i16 FROM t x WHERE x.i16 = m.i16)",
         "(SELECT MAX(x.i64) FROM t x WHERE x.i16 = m.i16) + m.i64 >= 0",
         "(EXISTS (SELECT 1 FROM t x WHERE x.i16 = m.i16 AND x.i16 = 11) OR m.i64 + m.i64 >= 0)"}) {
-    for (const auto& conjuncts : {nested + " AND " + sibling, sibling + " AND " + nested}) {
-      const std::string sql =
+    for (const bool nested_first : {true, false}) {
+      const std::string sql = std::format(
           "SELECT g.i16 FROM t g WHERE EXISTS (SELECT 1 FROM u m WHERE "
-          "m.i16 = g.i16 AND g.i16 = 2 AND " +
-          conjuncts + ")";
+          "m.i16 = g.i16 AND g.i16 = 2 AND {} AND {})",
+          nested_first ? nested : sibling, nested_first ? sibling : nested);
       SCOPED_TRACE(sql);
       const auto bound = BindSql(sql, catalog);
       ASSERT_TRUE(bound.ok()) << bound.status();
