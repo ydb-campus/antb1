@@ -1965,7 +1965,7 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
         profile == nullptr ? nullptr : std::make_unique<ProfileNode>();
     ProfileNode* const producer_profile = held.get();
     auto make_producer = [node, widened, split, predicates = group.reader_predicates, profile,
-                          producer_profile]() -> OperatorResult {
+                          producer_profile] -> OperatorResult {
       if (widened == nullptr) {
         return Build(node, std::nullopt, producer_profile);
       }

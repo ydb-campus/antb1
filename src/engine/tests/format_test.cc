@@ -680,8 +680,8 @@ TEST(FormatPhysicalPlanTest, DrawsASharedProducerUnderTheFirstConsumer) {
   EXPECT_TRUE(left.children().empty());
   const QueryProfile profile{.output = "Output: c:BIGINT", .root = root};
   const std::string json = FormatProfile(profile, ProfileFormat::kJson);
-  const auto build_at = json.find("\"name\":\"HashBuild\"");
-  const auto produced_at = json.find("\"name\":\"PartGroupAggregate\"");
+  const auto build_at = json.find(R"("name":"HashBuild")");
+  const auto produced_at = json.find(R"("name":"PartGroupAggregate")");
   ASSERT_NE(build_at, std::string::npos) << json;
   ASSERT_NE(produced_at, std::string::npos) << json;
   EXPECT_LT(build_at, produced_at) << json;

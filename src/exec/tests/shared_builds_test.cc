@@ -603,7 +603,7 @@ TEST_F(SharedBuildsTest, ALaterSuccessfulRunClearsTheFallbackProfile) {
   ASSERT_TRUE(dropped.ok()) << dropped.status();
   EXPECT_EQ(testing::SingleInt64(**dropped), 9);
   EXPECT_NE(profile.fallback_plan(), nullptr);
-  MemoryBudget roomy(int64_t{1} << 20);
+  MemoryBudget roomy(int64_t{1024} * 1024);
   const auto kept = Drain(op, ExecContext{.budget = &roomy});
   ASSERT_TRUE(kept.ok()) << kept.status();
   EXPECT_EQ(profile.fallback_plan(), nullptr);
