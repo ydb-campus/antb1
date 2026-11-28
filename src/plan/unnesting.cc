@@ -984,6 +984,7 @@ struct Rewritten {
   ExprPtr deferred_match = nullptr;
   // Decide whether to split this membership after the nested joins have been rewritten.
   std::optional<JoinKey> pending_lookups = std::nullopt;
+  LogicalNodePtr pending_outer_safety = nullptr;
 };
 
 // Equality-correlated NOT IN needs two lookups: the membership key, and per-binding row/NULL
@@ -1198,12 +1199,23 @@ void VisitValueChildren(E& expr, const F& visit) {
       expr.node);
 }
 
+bool ReadsOuterDouble(const Expr& expr, const std::set<ColumnId>& outer) {
+  if (const auto* column = std::get_if<ColumnExpr>(&expr.node)) {
+    return expr.type == LogicalType::kDouble && outer.contains(column->id);
+  }
+  bool reads = false;
+  VisitValueChildren(expr, [&](const ExprPtr& child) {
+    reads = reads || (child && ReadsOuterDouble(*child, outer));
+  });
+  return reads;
+}
+
 // A binding can group positive and negative zero together. A quotient can distinguish those
 // bindings when its divisor reads the outer row, even though ordinary comparisons cannot.
 bool ObservesBindingZeroSign(const Expr& expr, const std::set<ColumnId>& outer) {
   if (const auto* op = std::get_if<ArithExpr>(&expr.node);
       op != nullptr && op->op == ArithOp::kDivide && op->right->type == LogicalType::kDouble &&
-      SidesOf(*op->right, outer).outer) {
+      ReadsOuterDouble(*op->right, outer)) {
     return true;
   }
   bool observes = false;
@@ -1229,6 +1241,7 @@ ExprPtr InlineValues(const ExprPtr& expr, const std::map<ColumnId, ExprPtr>& val
 struct MembershipInput {
   LogicalNodePtr right;
   ExprPtr deferred_item;
+  bool mixed;
 };
 
 // This is deliberately a proof of harmless evaluation, not IsStrict: a strict cast can still
@@ -1265,8 +1278,7 @@ const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarde
 // qualifying pairs are evaluated, including later items that can fail after an earlier item
 // matched.
 arrow::Result<MembershipInput> MembershipMaps(const Correlation& correlation, const Spine& spine,
-                                              const BoundColumn& item, bool has_residual,
-                                              std::span<const JoinKey> keys = {}) {
+                                              const BoundColumn& item, bool has_residual) {
   LogicalNodePtr input = spine.below;
   std::set<ColumnId> outer = correlation.outer;
   bool mixed = false;
@@ -1341,31 +1353,32 @@ arrow::Result<MembershipInput> MembershipMaps(const Correlation& correlation, co
         FirstUnsafeInnerNode(spine.below, true) != nullptr) {
       return correlation.Refuse("with a mixed projection over a potentially failing set input");
     }
-    if (FirstUnsafeInnerNode(correlation.join.left, true) != nullptr) {
-      return correlation.Refuse("with a mixed projection over a potentially failing outer input");
-    }
-    // Equality can supply every outer value in an item. Compute it once per set row so that
-    // repeated correlation keys still use the ordinary hash membership path.
-    if (selected && SidesOf(*selected, correlation.outer).both()) {
-      const auto available = OutputIds(*input);
-      std::map<ColumnId, ExprPtr> equivalents;
-      for (const JoinKey& key : keys) {
-        if (correlation.outer.contains(key.left.id) &&
-            std::ranges::contains(available, key.right.id)) {
-          equivalents.try_emplace(key.left.id, ColumnValue(key.right));
-        }
-      }
-      ExprPtr local = InlineValues(selected, equivalents);
-      if (!SidesOf(*local, correlation.outer).outer) {
-        input = Make(ComputeNode{.input = std::move(input),
-                                 .exprs = {std::move(local)},
-                                 .ids = {item.id},
-                                 .span = correlation.join.span});
-        selected.reset();
-      }
+  }
+  return MembershipInput{
+      .right = std::move(input), .deferred_item = std::move(selected), .mixed = mixed};
+}
+
+// Equality can supply every outer value in a mixed item. Compute it once per set row.
+void HashMixedMembershipItem(const Correlation& correlation, std::span<const JoinKey> keys,
+                             LogicalNodePtr& right, ExprPtr& item) {
+  if (item == nullptr || !SidesOf(*item, correlation.outer).both()) {
+    return;
+  }
+  const auto available = OutputIds(*right);
+  std::map<ColumnId, ExprPtr> equivalents;
+  for (const JoinKey& key : keys) {
+    if (correlation.outer.contains(key.left.id) && std::ranges::contains(available, key.right.id)) {
+      equivalents.try_emplace(key.left.id, ColumnValue(key.right));
     }
   }
-  return MembershipInput{.right = std::move(input), .deferred_item = std::move(selected)};
+  ExprPtr local = InlineValues(item, equivalents);
+  if (!SidesOf(*local, correlation.outer).outer) {
+    right = Make(ComputeNode{.input = std::move(right),
+                             .exprs = {std::move(local)},
+                             .ids = {correlation.join.membership->right.id},
+                             .span = correlation.join.span});
+    item.reset();
+  }
 }
 
 arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& spine) {
@@ -1471,11 +1484,13 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
   LogicalNodePtr left = join.left;
   LogicalNodePtr right = spine.below;
   ExprPtr deferred_item;
+  bool mixed = false;
   if (join.membership.has_value()) {
-    ARROW_ASSIGN_OR_RAISE(auto mapped, MembershipMaps(correlation, spine, join.membership->right,
-                                                      !residual.empty(), keys));
+    ARROW_ASSIGN_OR_RAISE(
+        auto mapped, MembershipMaps(correlation, spine, join.membership->right, !residual.empty()));
     right = std::move(mapped.right);
     deferred_item = std::move(mapped.deferred_item);
+    mixed = mapped.mixed;
   } else if (Traits(join.kind).single_match) {
     // PlainScalarMaps proves these maps can run on the build before the residual.
     const auto& item = std::get<ProjectNode>(*join.right).columns.front();
@@ -1505,6 +1520,15 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
     right = Make(ComputeNode{
         .input = std::move(right), .exprs = inner_casts, .ids = inner_cast_ids, .span = join.span});
   }
+  LogicalNodePtr pending_outer_safety;
+  if (mixed) {
+    if (FirstDependentJoin(join.left) != nullptr) {
+      pending_outer_safety = join.left;
+    } else if (FirstUnsafeInnerNode(join.left, true) != nullptr) {
+      return correlation.Refuse("with a mixed projection over a potentially failing outer input");
+    }
+    HashMixedMembershipItem(correlation, keys, right, deferred_item);
+  }
   // ADR 0026's C2b, C2c and C3: a semi or an anti join may build on its left input, the side it
   // preserves, when the subquery side is decisively larger -- the shape a correlated EXISTS or NOT
   // EXISTS over a large relation has, where ADR 0022's rule built the whole of that relation to
@@ -1514,7 +1538,7 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
       Traits(join.kind).may_build_left
           ? ChooseBuildSide(left_rows, EstimateRows(*right), correlation.build_side_ratio)
           : BuildSide::kRight;
-  return MembershipNode(
+  Rewritten rewritten = MembershipNode(
       correlation,
       JoinNode{.kind = join.kind,
                .left = std::move(left),
@@ -1529,6 +1553,8 @@ arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& s
                .estimate = left_rows,
                .span = join.span},
       deferred_item);
+  rewritten.pending_outer_safety = std::move(pending_outer_safety);
+  return rewritten;
 }
 
 // A simple selected value can be carried directly by the hash build while the keys and
@@ -3835,12 +3861,12 @@ class Walker {
       : last_id_(last_id), build_side_ratio_(build_side_ratio), report_(report) {}
 
   arrow::Result<LogicalNodePtr> Walk(const LogicalNodePtr& node) {
-    if (middle_inputs_.empty()) {
+    if (tracked_inputs_.empty()) {
       return WalkNode(node);
     }
     ARROW_ASSIGN_OR_RAISE(LogicalNodePtr result, WalkNode(node));
     if (node != result) {
-      for (auto& input : middle_inputs_) {
+      for (auto& input : tracked_inputs_) {
         if (input == node) {
           input = result;
         }
@@ -3854,10 +3880,10 @@ class Walker {
                                                 const DependentJoinNode& dependent) {
     // Follow the existing middle input through sibling rewrites. Check work on extra middle
     // rows, including eager projections. The final deferred item only runs on matched pairs.
-    middle_inputs_.push_back(dependent.left);
+    tracked_inputs_.push_back(dependent.left);
     auto result = Walk(rewritten.node);
-    LogicalNodePtr middle = std::move(middle_inputs_.back());
-    middle_inputs_.pop_back();
+    LogicalNodePtr middle = std::move(tracked_inputs_.back());
+    tracked_inputs_.pop_back();
     if (result.ok() && FirstUnsafeInnerNode(*result, /*guarded=*/true, {middle.get()},
                                             rewritten.deferred_match.get()) != nullptr) {
       if (dependent.membership.has_value()) {
@@ -3889,8 +3915,22 @@ class Walker {
       }
       const bool guarded = dependent->guard_membership ||
                            dependent->middle_key == DependentJoinNode::MiddleKey::kSubstituted;
-      ARROW_ASSIGN_OR_RAISE(
-          auto result, guarded ? WalkSubstituted(rewritten, *dependent) : Walk(rewritten.node));
+      if (rewritten.pending_outer_safety != nullptr) {
+        tracked_inputs_.push_back(rewritten.pending_outer_safety);
+      }
+      auto walked = guarded ? WalkSubstituted(rewritten, *dependent) : Walk(rewritten.node);
+      if (rewritten.pending_outer_safety != nullptr) {
+        LogicalNodePtr outer = std::move(tracked_inputs_.back());
+        tracked_inputs_.pop_back();
+        if (walked.ok() && FirstUnsafeInnerNode(outer, true) != nullptr) {
+          return UnsupportedError(
+              std::format("a correlated {} with a mixed projection over a potentially failing "
+                          "outer input is not supported",
+                          dependent->kind == JoinKind::kAnti ? "NOT IN" : "IN"),
+              dependent->span);
+        }
+      }
+      ARROW_ASSIGN_OR_RAISE(auto result, std::move(walked));
       if (rewritten.pending_lookups.has_value()) {
         const auto& join = std::get<JoinNode>(*result);
         if (WorthNestedLookups(join, above_) && !UnsafeToClone(join.right) &&
@@ -3925,7 +3965,7 @@ class Walker {
     return changed ? WithInputs(*node, std::move(inputs)) : node;
   }
 
-  std::vector<LogicalNodePtr> middle_inputs_;
+  std::vector<LogicalNodePtr> tracked_inputs_;
   ColumnId& last_id_;
   int64_t build_side_ratio_;
   UnnestReport* report_;

@@ -292,3 +292,58 @@ INTEGER
 9
 10
 11
+
+# A safe keyed EXISTS can precede or follow mixed membership.
+query I nosort
+SELECT o.id FROM edge o WHERE EXISTS (SELECT 1 FROM edge e WHERE e.id = o.id AND e.id < 3)
+AND o.id IN (SELECT COALESCE(i.id, o.id) FROM edge i WHERE i.id = o.id) ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+
+query I nosort
+SELECT o.id FROM edge o WHERE o.id IN (SELECT COALESCE(i.id, o.id) FROM edge i WHERE i.id = o.id)
+AND EXISTS (SELECT 1 FROM edge e WHERE e.id = o.id AND e.id < 3) ORDER BY o.id
+----
+INTEGER
+0
+1
+2
+
+# Promoting an integer binding in a divisor cannot make equal bindings differ in zero sign.
+query I nosort
+SELECT o.id FROM edge o WHERE 1 IN (SELECT CASE WHEN i.id / (o.id + 1e0) > 0e0 THEN 1 ELSE 0 END
+FROM edge i WHERE i.id = o.id) ORDER BY o.id
+----
+INTEGER
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+# A directly computed inner key can supply the outer value in the selected item.
+query I nosort
+WITH v AS (SELECT id, id % 3 AS k FROM edge)
+SELECT o.id FROM v o WHERE o.id NOT IN (SELECT COALESCE(i.i16, o.k) FROM edge i
+WHERE i.id % 3 = o.k) ORDER BY o.id
+----
+INTEGER
+0
+3
+4
+5
+6
+7
+8
+9
+10
+11
