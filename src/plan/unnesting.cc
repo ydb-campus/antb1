@@ -1985,9 +1985,13 @@ bool ReadsEmptyScan(const LogicalNodePtr& input) {
 }
 
 // A derived table may hide a checked expression behind an ordinary column reference.
-const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded = false) {
+const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded = false,
+                                        const std::set<const LogicalNode*>& existing_inputs = {}) {
+  if (existing_inputs.contains(input.get())) {
+    return nullptr;
+  }
   for (const auto& child : InputsOf(*input)) {
-    if (const auto* unsafe = FirstUnsafeInnerNode(child, guarded)) {
+    if (const auto* unsafe = FirstUnsafeInnerNode(child, guarded, existing_inputs)) {
       return unsafe;
     }
   }
@@ -2017,10 +2021,11 @@ const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarde
         } else if constexpr (std::is_same_v<Node, DependentJoinNode>) {
           return !guarded && !Traits(node.kind).single_match;
         } else {
-          return guarded ? (std::is_same_v<Node, ScanNode> || std::is_same_v<Node, ProjectNode> ||
-                            std::is_same_v<Node, LimitNode> || std::is_same_v<Node, SortNode> ||
-                            std::is_same_v<Node, RowCountNode>)
-                         : !std::is_same_v<Node, WindowNode>;
+          return guarded
+                     ? (std::is_same_v<Node, ScanNode> || std::is_same_v<Node, ProjectNode> ||
+                        std::is_same_v<Node, LimitNode> || std::is_same_v<Node, SortNode> ||
+                        std::is_same_v<Node, RowCountNode> || std::is_same_v<Node, UnionAllNode>)
+                     : !std::is_same_v<Node, WindowNode>;
         }
       },
       *input);
@@ -3552,6 +3557,18 @@ arrow::Result<Rewritten> SingleJoin(const Correlation& correlation) {
   return PartitionedBlock(correlation, *spine);
 }
 
+// A sibling still evaluates its own independent inputs as before (D23). Only operations
+// that acquire extra middle bindings need the SQ10 check. Match an unchanged input by identity.
+void CollectIndependentInputs(const LogicalNodePtr& node, std::set<const LogicalNode*>& inputs) {
+  if (FreeVariables(*node).empty()) {
+    inputs.insert(node.get());
+    return;
+  }
+  for (const auto& child : InputsOf(*node)) {
+    CollectIndependentInputs(child, inputs);
+  }
+}
+
 // The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.
 arrow::Result<LogicalNodePtr> UnnestJoin(DependentJoinNode join, ColumnId& last_id,
                                          int64_t build_side_ratio, std::span<const Ancestor> above,
@@ -3576,6 +3593,11 @@ arrow::Result<LogicalNodePtr> UnnestJoin(DependentJoinNode join, ColumnId& last_
   const std::vector<ColumnId> initial_ids = OutputIds(*join.left);
   const std::vector<KeyParts> equivalents =
       MembershipEquivalents(join.right, std::set<ColumnId>(initial_ids.begin(), initial_ids.end()));
+  std::set<const LogicalNode*> sibling_inputs;
+  if (join.middle_key == DependentJoinNode::MiddleKey::kSibling) {
+    sibling_inputs.insert(join.left.get());
+    CollectIndependentInputs(join.right, sibling_inputs);
+  }
   join.right = RewriteOuterMembership(join.right, join.left, equivalents);
   const std::vector<ColumnId> outer_ids = OutputIds(*join.left);
   const Correlation correlation{.join = join,
@@ -3626,6 +3648,11 @@ arrow::Result<LogicalNodePtr> UnnestJoin(DependentJoinNode join, ColumnId& last_
       return arrow::Status::NotImplemented("the unnesting pass lost an output of a rewritten join");
     }
   }
+  if (!sibling_inputs.empty() &&
+      FirstUnsafeInnerNode(out.node, /*guarded=*/true, sibling_inputs) != nullptr) {
+    return correlation.Refuse(
+        "with a potentially failing sibling expression under a middle-block key");
+  }
   return out.node;
 }
 
@@ -3641,13 +3668,52 @@ class Walker {
       : last_id_(last_id), build_side_ratio_(build_side_ratio), report_(report) {}
 
   arrow::Result<LogicalNodePtr> Walk(const LogicalNodePtr& node) {
+    if (middle_inputs_.empty()) {
+      return WalkNode(node);
+    }
+    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr result, WalkNode(node));
+    if (node != result) {
+      for (auto& input : middle_inputs_) {
+        if (input == node) {
+          input = result;
+        }
+      }
+    }
+    return result;
+  }
+
+ private:
+  arrow::Result<LogicalNodePtr> WalkNode(const LogicalNodePtr& node) {
     if (node == nullptr) {
       return node;
     }
     if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
       ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
                             UnnestJoin(*dependent, last_id_, build_side_ratio_, above_, report_));
-      return Walk(rewritten);  // its inputs may hold more
+      if (dependent->middle_key == DependentJoinNode::MiddleKey::kUnsafeConsumer) {
+        return UnsupportedError(
+            "nested EXISTS with a middle-block key and a potentially failing sibling expression is "
+            "not supported",
+            dependent->span);
+      }
+      if (dependent->middle_key != DependentJoinNode::MiddleKey::kSubstituted) {
+        return Walk(rewritten);  // its inputs may hold more dependent joins
+      }
+      // A substituted key can match middle rows the original outer binding excludes. Check
+      // the operators that actually run, excluding the existing middle input even when an
+      // earlier subquery rewrites that input. Nested substitutions track their own boundary.
+      middle_inputs_.push_back(dependent->left);
+      auto result = Walk(rewritten);
+      LogicalNodePtr middle = std::move(middle_inputs_.back());
+      middle_inputs_.pop_back();
+      if (result.ok() &&
+          FirstUnsafeInnerNode(*result, /*guarded=*/true, {middle.get()}) != nullptr) {
+        return UnsupportedError(
+            "nested EXISTS with a middle-block key and a potentially failing "
+            "inner expression is not supported",
+            dependent->span);
+      }
+      return result;
     }
     std::vector<LogicalNodePtr> inputs = InputsOf(*node);
     bool changed = false;
@@ -3672,7 +3738,7 @@ class Walker {
     return changed ? WithInputs(*node, std::move(inputs)) : node;
   }
 
- private:
+  std::vector<LogicalNodePtr> middle_inputs_;
   ColumnId& last_id_;
   int64_t build_side_ratio_;
   UnnestReport* report_;

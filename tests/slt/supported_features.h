@@ -214,6 +214,7 @@ enum class Feature : std::uint8_t {
   kCorrelatedIn,
   // SQ8c: a keyed nested EXISTS inside a conjunct that also reads the enclosing block.
   kNestedCorrelation,
+  kMiddleEqualityExists,  // SQ10: nested EXISTS reads a key equated in the middle WHERE
   kWindowWholePartition,  // W2: whole-partition aggregates over raw rows or grouped output
   kWindowRank,            // W3: RANK over raw rows or grouped output
   kWindowRowsPrefix,      // W4: running ROWS aggregates over raw rows or grouped output
@@ -444,6 +445,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "widened_scalar_key";
     case Feature::kNestedCorrelation:
       return "nested_correlation";
+    case Feature::kMiddleEqualityExists:
+      return "middle_equality_exists";
     case Feature::kWindowWholePartition:
       return "window_whole_partition";
     case Feature::kWindowRank:
@@ -666,6 +669,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedExistsBlock,
     Feature::kCorrelatedIn,
     Feature::kNestedCorrelation,
+    Feature::kMiddleEqualityExists,
     Feature::kKeyedDomainAggregate,
     Feature::kKeylessDomainAggregate,
     Feature::kCorrelatedSingle,

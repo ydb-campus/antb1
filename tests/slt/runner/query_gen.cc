@@ -3110,12 +3110,13 @@ class Builder {
 
   // A correlated key's comparison: `=`, or now and then IS NOT DISTINCT FROM, from a stream of its
   // own so that a query without one is the query this seed gave before.
-  void CorrelatedKeyComparison() {
+  bool CorrelatedKeyComparison() {
     if (allowed_.Has(Feature::kNullEqualKeys) && null_equal_rng_.Percent(kNullEqualPercent)) {
       NotDistinctFrom();
-    } else {
-      Symbol("=");
+      return false;
     }
+    Symbol("=");
+    return true;
   }
 
   // `<outer>.<k>`, the outer end of a correlated key. Written directly rather than through
@@ -3174,7 +3175,7 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
     Keyword("WHERE");
     InnerColumn(c, *c.inner_key);
-    CorrelatedKeyComparison();
+    const bool ordinary_key = CorrelatedKeyComparison();
     OuterColumn(c);
     // An optional non-equality over the same pair, which only a residual can evaluate: it keeps
     // the key, so the shape stays inside Path 1.
@@ -3221,6 +3222,38 @@ class Builder {
         OuterColumn(c);
         Symbol("<");
         InnerColumn(c, *c.inner_key);
+        Symbol(")");
+      }
+    }
+    if (!membership && ordinary_key && !used_.Has(Feature::kNestedCorrelation) &&
+        allowed_.Has(Feature::kMiddleEqualityExists)) {
+      // Reuse the middle table name in the innermost block. It shadows the middle binding and
+      // differs from the outer binding, so the equality must read two blocks out.
+      Rng rng = corr_rng_;
+      if (rng.Percent(35)) {
+        used_.Add(Feature::kMiddleEqualityExists);
+        Keyword("AND");
+        if (rng.Percent(kNotExistsPercent)) {
+          Keyword("NOT");
+        }
+        Keyword("EXISTS");
+        Symbol("(");
+        Keyword("SELECT");
+        Symbol("*");
+        Keyword("FROM");
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+        Keyword("WHERE");
+        InnerColumn(c, *c.inner_key);
+        Symbol("=");
+        OuterColumn(c);
+        const Literal literal = MakeLiteral(rng, *c.inner_key);
+        if (allowed_.Contains(literal.features)) {
+          Keyword("AND");
+          InnerColumn(c, *c.inner_key);
+          Symbol(">");
+          Emit(literal.tokens);
+          used_.Add(literal.features);
+        }
         Symbol(")");
       }
     }

@@ -488,8 +488,12 @@ const BindingColumn& Scope::column(ColumnLocation where) const {
 }
 
 bool Scope::StoredAsFloat(ColumnId id) const {
-  const std::optional<ColumnLocation> where = Find(id);
-  return where.has_value() && column(*where).stored_as_float;
+  for (const Scope* scope = this; scope != nullptr; scope = scope->outer_) {
+    if (const auto where = scope->Find(id)) {
+      return scope->column(*where).stored_as_float;
+    }
+  }
+  return false;
 }
 
 }  // namespace antb1::plan

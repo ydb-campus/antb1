@@ -9436,6 +9436,176 @@ TEST(BinderTest, NestedCorrelatedPredicatesMayReadTheEnclosingBlock) {
   }
 }
 
+TEST(BinderTest, MiddleEqualityProducesClosedNestedSemiAndAntiJoins) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {"SELECT o.i16 FROM t o WHERE EXISTS (SELECT 1 FROM u m WHERE NOT EXISTS "
+                          "(SELECT 1 FROM ok i WHERE i.i16 = o.i16) AND o.i16 = m.i16)",
+                          "SELECT o.p FROM dec o WHERE EXISTS (SELECT 1 FROM dec m WHERE o.q = o.p "
+                          "AND m.p = o.q AND EXISTS (SELECT 1 FROM dec i WHERE o.p = i.q))"}) {
+    SCOPED_TRACE(sql);
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    auto optimized = Optimize(*bound);
+    ASSERT_TRUE(optimized.ok()) << optimized.status();
+    EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+    EXPECT_TRUE(FreeVariables(*optimized->root).empty());
+    EXPECT_FALSE(Explain(*optimized).contains("DependentJoin"));
+  }
+}
+
+TEST(BinderTest, MiddleEqualityExplainsTheKeyAvailableToTheInnerJoin) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&](std::string_view key) -> arrow::Result<LogicalPlan> {
+    ARROW_ASSIGN_OR_RAISE(
+        auto bound,
+        BindSql(
+            std::format("SELECT o.i16 FROM t o WHERE EXISTS (SELECT 1 FROM u m WHERE m.i16 = o.i16 "
+                        "AND EXISTS (SELECT 1 FROM ok i WHERE i.i16 = {}))",
+                        key),
+            catalog));
+    return Optimize(bound);
+  };
+  const auto distant = optimized("o.i16");
+  const auto direct = optimized("m.i16");
+  ASSERT_TRUE(distant.ok()) << distant.status();
+  ASSERT_TRUE(direct.ok()) << direct.status();
+  EXPECT_EQ(Explain(*distant), Explain(*direct));
+}
+
+TEST(BinderTest, MiddleEqualityRequiresAnOrdinaryUnconditionalSameTypeKey) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [proof, inner] : std::vector<std::pair<std::string_view, std::string_view>>{
+           {"m.i32 = o.i32", "i.i16 = o.i16"},
+           {"m.i32 = o.i16", "i.i16 = o.i16"},
+           {"m.i16 IS NOT DISTINCT FROM o.i16", "i.i16 = o.i16"},
+           {"m.i16 + 1 = o.i16", "i.i16 = o.i16"},
+           {"(m.i16 = o.i16 OR m.i32 = 0)", "i.i16 = o.i16"},
+           {"m.i16 = o.i16", "i.i16 > o.i16"},
+           {"m.i16 = o.i16", "i.i16 IS NOT DISTINCT FROM o.i16"},
+           {"m.i16 = o.i16", "(i.i16 = o.i16 OR i.i16 = 0)"},
+           {"m.i16 = o.i16", "m.i16 = o.i16"},
+           {"m.i16 = o.i16", "EXISTS (SELECT 1 FROM t x WHERE x.i16 = o.i16)"}}) {
+    const std::string sql = std::format(
+        "SELECT o.i16 FROM t o WHERE EXISTS (SELECT 1 FROM u m WHERE {} AND EXISTS "
+        "(SELECT 1 FROM ok i WHERE {}))",
+        proof, inner);
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok());
+    const auto detail = GetSqlError(bound.status());
+    ASSERT_NE(detail, nullptr);
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_EQ(SpanText(sql, bound.status()), "o.i16");
+    EXPECT_TRUE(bound.status().message().contains("further out"));
+  }
+}
+
+TEST(BinderTest, MiddleEqualityRejectsCheckedInnerExpressionsAfterBinding) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* residual : {"CAST(i.i64 AS SMALLINT) > m.i16", "CAST(i.i64 AS SMALLINT) > 0"}) {
+    const std::string sql = std::format(
+        "SELECT o.i16 FROM t o WHERE EXISTS (SELECT 1 FROM u m WHERE m.i16 = o.i16 "
+        "AND EXISTS (SELECT 1 FROM t i WHERE i.i16 = o.i16 AND {}))",
+        residual);
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimize(*bound);
+    ASSERT_FALSE(plan.ok());
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr);
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_EQ(SpanText(sql, plan.status()), "EXISTS");
+    EXPECT_TRUE(plan.status().message().contains("potentially failing inner expression"));
+    const auto invalid = BindSql(sql + " AND o.missing = 0", catalog);
+    ASSERT_FALSE(invalid.ok());
+    ASSERT_NE(GetSqlError(invalid.status()), nullptr);
+    EXPECT_EQ(GetSqlError(invalid.status())->kind(), kBind);
+  }
+}
+
+TEST(BinderTest, MiddleEqualityPreservesFloatStorageTypeAcrossScopes) {
+  Catalog catalog;
+  ASSERT_TRUE(catalog
+                  .Register("tf", std::make_shared<FakeTable>(
+                                      arrow::schema({arrow::field("f", arrow::float32()),
+                                                     arrow::field("d", arrow::float64()),
+                                                     arrow::field("id", arrow::int32())}),
+                                      10, std::vector<int>{0}))
+                  .ok());
+  const std::string nested = "EXISTS (SELECT 1 FROM tf i WHERE i.id = m.id AND i.d = g.f)";
+  for (const bool proof_first : {true, false}) {
+    const std::string sql =
+        "SELECT g.id FROM tf g WHERE EXISTS (SELECT 1 FROM tf m WHERE "
+        "m.id = g.id AND " +
+        (proof_first ? "m.d = g.f AND " + nested : nested + " AND m.d = g.f") + ")";
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok());
+    const auto detail = GetSqlError(bound.status());
+    ASSERT_NE(detail, nullptr);
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_TRUE(bound.status().message().contains(proof_first ? "FLOAT" : "further out"));
+  }
+}
+
+TEST(BinderTest, MiddleEqualityRejectsCheckedSiblingWorkInEitherOrder) {
+  const Catalog catalog = MakeCatalog();
+  const std::string_view nested = "EXISTS (SELECT 1 FROM ok i WHERE i.i16 = g.i16)";
+  for (const std::string_view sibling :
+       {"EXISTS (SELECT 1 FROM t x WHERE x.i16 = m.i16 AND x.i64 + m.i64 >= 0)",
+        "CAST(m.i64 AS SMALLINT) IN (SELECT x.i16 FROM t x WHERE x.i16 = m.i16)",
+        "(SELECT MAX(x.i64) FROM t x WHERE x.i16 = m.i16) + m.i64 >= 0",
+        "(EXISTS (SELECT 1 FROM t x WHERE x.i16 = m.i16 AND x.i16 = 11) OR m.i64 + m.i64 >= 0)"}) {
+    for (const bool nested_first : {true, false}) {
+      const std::string sql = std::format(
+          "SELECT g.i16 FROM t g WHERE EXISTS (SELECT 1 FROM u m WHERE "
+          "m.i16 = g.i16 AND g.i16 = 2 AND {} AND {})",
+          nested_first ? nested : sibling, nested_first ? sibling : nested);
+      SCOPED_TRACE(sql);
+      const auto bound = BindSql(sql, catalog);
+      ASSERT_TRUE(bound.ok()) << bound.status();
+      const auto plan = Optimize(*bound);
+      ASSERT_FALSE(plan.ok());
+      const auto detail = GetSqlError(plan.status());
+      ASSERT_NE(detail, nullptr);
+      EXPECT_EQ(detail->kind(), kUnsupported);
+      EXPECT_TRUE(plan.status().message().contains("potentially failing sibling expression"))
+          << plan.status();
+    }
+  }
+}
+
+TEST(BinderTest, MiddleEqualityChecksEveryUnionAllBranch) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view arms :
+       {"SELECT i16 FROM t UNION ALL SELECT CAST(i64 AS SMALLINT) FROM u",
+        "SELECT CAST(i64 AS SMALLINT) AS i16 FROM u UNION ALL SELECT i16 FROM t"}) {
+    const std::string sql = std::format(
+        "SELECT g.i16 FROM t g WHERE EXISTS (SELECT 1 FROM u m "
+        "WHERE m.i16 = g.i16 AND EXISTS (SELECT 1 FROM ({}) i "
+        "WHERE i.i16 = g.i16))",
+        arms);
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimize(*bound);
+    ASSERT_FALSE(plan.ok());
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr);
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_TRUE(plan.status().message().contains("potentially failing inner expression"));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MiddleEqualityAmbiguity, BindErrorTest,
+    ::testing::Values(ErrorCase{
+        "SELECT g.i16 FROM t g CROSS JOIN u h WHERE EXISTS (SELECT 1 FROM (SELECT i16 AS mid "
+        "FROM u) m WHERE m.mid = g.i16 AND EXISTS (SELECT 1 FROM (SELECT i16 AS iid FROM ok) "
+        "i WHERE i.iid = i16))",
+        kBind, "i16", "ambiguous"}));
+
 TEST(BinderTest, NestedCorrelationsWithoutRepresentativesRemainUnsupported) {
   const Catalog catalog = MakeCatalog();
   for (const char* sql :

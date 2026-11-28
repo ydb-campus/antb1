@@ -39,6 +39,8 @@
 #include "antb1/sql/unparse.h"
 
 #include "arithmetic_rewrite.h"
+#include "column_classes.h"
+#include "compute_safety.h"
 #include "join_order.h"
 #include "key_type.h"
 #include "or_factoring.h"
@@ -3094,6 +3096,8 @@ enum class Clause : std::uint8_t {
 // The clauses whose outer references ADR 0023 answers.
 bool WhereClause(Clause clause) { return clause == Clause::kWhere || clause == Clause::kInnerOn; }
 
+class Binder;
+
 // The subquery a block is bound for: its operator, at which a refusal of the block points,
 // and whether it is a HAVING conjunct. An EXISTS block's select list is checked but its stars are
 // not expanded (ADR 0023's Path 1 drops the list, and so does ADR 0041's uncorrelated EXISTS, but
@@ -3104,6 +3108,8 @@ struct SubqueryContext {
   bool membership = false;      // an IN/NOT IN set, rather than an EXISTS block
   bool having = false;          // above the aggregation of the block that holds it
   bool outside_having = false;  // there, in its select list or ORDER BY (ADR 0041's SQ2b)
+  mutable bool used_middle_key = false;
+  const Binder* middle = nullptr;  // SQ10: the enclosing EXISTS whose WHERE conjunct is binding
 };
 
 // Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope,
@@ -3130,6 +3136,7 @@ struct SubqueryJoin {
   // in `left_key` and `right_key`; other dependent joins leave them empty. `exprs` holds what the
   // comparison computes on the outer side.
   bool dependent = false;
+  bool used_middle_key = false;
   LogicalNodePtr right;   // the sub-plan, its column cast to the key type
   BoundColumn left_key;   // of the tree below (the IN forms)
   BoundColumn right_key;  // of the sub-plan (the IN forms)
@@ -3209,14 +3216,15 @@ class Binder {
     Binder& binder;
 
     arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
-      auto resolved = binder.Resolve(ref);
+      std::string name = RefName(ref);
+      auto resolved = binder.Resolve(ref, &name);
       if (!resolved.ok() && binder.shape_ == Shape::kProjection) {
         if (auto alias = binder.AliasFallback(ref, resolved.status())) {
           return *std::move(alias);
         }
       }
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, std::move(resolved));
-      return ColumnLeaf(column.id, column.type, RefName(ref),
+      return ColumnLeaf(column.id, column.type, std::move(name),
                         binder.scope_.StoredAsFloat(column.id));
     }
     arrow::Result<Typed> operator()(const sql::Literal& lit) const { return LiteralOperand(lit); }
@@ -4014,11 +4022,13 @@ class Binder {
     JoinKind scalar_kind = JoinKind::kOneRow;
     LogicalType type;  // the column's, which a BindingColumn holds as an optional
     bool correlated = false;
+    bool used_middle_key = false;
     // The ids its plan reads from the blocks enclosing it (FreeVariables): empty exactly when it is
     // not correlated. One text binds to the ids its outer names resolve to (ADR 0041's SQ5).
     std::vector<ColumnId> free;
   };
-  arrow::Result<SubqueryBlock> BindSubqueryBlock(const SubqueryConjunct& form, bool having);
+  arrow::Result<SubqueryBlock> BindSubqueryBlock(const SubqueryConjunct& form, bool having,
+                                                 bool where_exists = false);
   // The key type of an IN subquery's join, of its probe and its set's column, or its refusal.
   static arrow::Result<LogicalType> InKeyType(const Typed& probe, LogicalType set,
                                               const sql::SubqueryExpr& s);
@@ -4265,7 +4275,8 @@ class Binder {
   // Rule 9 is applied here rather than in the scope, after the select-list aliases: an inner
   // block's `GROUP BY <alias>` whose alias happens to name a column of an enclosing block is the
   // alias, not a correlation, and whether it resolves must not depend on the FROM order.
-  [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const {
+  [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref,
+                                                   std::string* expr_name = nullptr) const {
     auto resolved = scope_.Resolve(ref, visible_);
     if (resolved.ok() || (ref.qualifier.empty() && FindAlias(select_, ref.name).has_value())) {
       return resolved;
@@ -4282,8 +4293,8 @@ class Binder {
       return resolved;  // no enclosing block has the name: a bind error, as rule 9 says
     }
     // An outer reference. ADR 0023 answers one only in a WHERE conjunct of its own block (an inner
-    // join's ON counts as WHERE, rule 10) and only one block out; every other one exits 4 here, at
-    // the reference's span, with the rule it broke.
+    // join's ON counts as WHERE, rule 10). SQ10 can express a more distant equality key
+    // through the enclosing block if that block requires the same value.
     if (!outer_encloses_) {
       // A derived table or a CTE: the name is in a sibling or declaring scope, so this is a
       // lateral reference, which ADR 0022 refuses and no PR of ADR 0023 answers.
@@ -4296,6 +4307,17 @@ class Binder {
       return Scope::CorrelationError(ref, Scope::Refusal::kClause);
     }
     if (outer->distance > 1) {
+      if (outer->distance == 2 && exists_ != nullptr && exists_->middle != nullptr &&
+          middle_key_ref_ == ref.span) {
+        ARROW_ASSIGN_OR_RAISE(const auto column, outer->scope->Resolve(ref, outer->visible));
+        if (auto key = exists_->middle->MiddleEqualityKey(column.id)) {
+          exists_->used_middle_key = true;
+          if (expr_name != nullptr) {
+            *expr_name = ArgumentName(key->qualifier) + "." + ArgumentName(key->name);
+          }
+          return *key;
+        }
+      }
       return Scope::CorrelationError(ref, Scope::Refusal::kDistance);
     }
     // The outer reference ADR 0023 answers: resolved in the enclosing block's scope, by its id, so
@@ -4304,6 +4326,8 @@ class Binder {
     // in the visibility it was found in: an ON's for a subquery of that ON (rule 10).
     return outer->scope->Resolve(ref, outer->visible);
   }
+
+  std::optional<BoundColumn> MiddleEqualityKey(ColumnId outer) const;
 
   // Whether `expr`, bound in `visible`, reads a column that only an enclosing query block has,
   // which makes its conjunct one for the block-top filter rather than one to classify by the
@@ -4371,6 +4395,10 @@ class Binder {
 
   const sql::SelectStatement& stmt_;
   Scope scope_;
+  // The potentially distant operand of the ordinary equality currently being bound.
+  std::optional<SourceSpan> middle_key_ref_;
+  // Populated only when a nested EXISTS first asks for a column two blocks out.
+  mutable std::optional<std::unordered_map<ColumnId, BoundColumn>> middle_keys_;
   std::map<const sql::BinaryExpr*, WrittenComparison> written_comparisons_;
   Visibility visible_;  // the clause being bound (the default: every binding, in one level)
   mutable std::optional<bool> correlated_;  // Correlated(), once asked
@@ -6560,14 +6588,41 @@ arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
   return arrow::Status::OK();
 }
 
+// The SQ10 proof uses only ordinary column equalities required by WHERE. A comparison inside
+// an OR, NOT, join ON or another block cannot establish equality for every passing row.
+std::optional<std::pair<const sql::ColumnRef*, const sql::ColumnRef*>> EqualityColumns(
+    const sql::Expr& expr) {
+  const auto* equal = std::get_if<sql::BinaryExpr>(&expr);
+  if (equal == nullptr || equal->op != sql::BinaryOp::kEq) {
+    return std::nullopt;
+  }
+  const auto* left = std::get_if<sql::ColumnRef>(&*equal->left);
+  const auto* right = std::get_if<sql::ColumnRef>(&*equal->right);
+  if (left == nullptr || right == nullptr) {
+    return std::nullopt;
+  }
+  return std::pair{left, right};
+}
+
 arrow::Status Binder::BindCorrelatedConjunct(const sql::Expr& conjunct) {
   in_correlated_ = true;
+  if (exists_ != nullptr && exists_->middle != nullptr && clause_ == Clause::kWhere) {
+    if (const auto columns = EqualityColumns(conjunct)) {
+      const auto [left, right] = *columns;
+      if (scope_.LookUp(*left).outcome == Lookup::Outcome::kFound) {
+        middle_key_ref_ = right->span;
+      } else if (scope_.LookUp(*right).outcome == Lookup::Outcome::kFound) {
+        middle_key_ref_ = left->span;
+      }
+    }
+  }
   Widen(correlated_span_, conjunct.span());
   arrow::Result<Typed> condition =
       BindBool(conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true);
   if (condition.ok()) {
     correlated_filter_.push_back(IsTrue(InputColumn(*condition, /*where=*/true), conjunct.span()));
   }
+  middle_key_ref_.reset();
   in_correlated_ = false;  // restored on the error path too, before the status propagates
   return condition.status();
 }
@@ -6727,8 +6782,52 @@ LogicalNodePtr WithoutSelectList(const LogicalNodePtr& node, bool under_sort = f
   return node;
 }
 
+std::optional<BoundColumn> Binder::MiddleEqualityKey(ColumnId outer) const {
+  if (!middle_keys_) {
+    ColumnClasses classes;
+    std::vector<BoundColumn> local;
+    std::vector<ColumnId> enclosing;
+    for (const auto* conjunct : Conjuncts(stmt_.where)) {
+      const auto columns = EqualityColumns(*conjunct);
+      if (!columns) {
+        continue;
+      }
+      // Look ahead without binding expressions or publishing their errors: even an equality
+      // written after EXISTS is necessary, and each conjunct still binds in its original order.
+      const auto left = Resolve(*columns->first);
+      const auto right = Resolve(*columns->second);
+      if (!left.ok() || !right.ok() || left->type != right->type ||
+          (left->type == LogicalType::kDouble &&
+           (scope_.StoredAsFloat(left->id) || scope_.StoredAsFloat(right->id)))) {
+        continue;
+      }
+      classes.Merge(left->id, right->id);
+      for (const BoundColumn* column : {&*left, &*right}) {
+        if (const auto location = scope_.Find(column->id)) {
+          local.push_back(*column);
+          local.back().qualifier = scope_.bindings()[location->binding].name();
+        } else {
+          enclosing.push_back(column->id);
+        }
+      }
+    }
+    std::unordered_map<ColumnId, BoundColumn> representatives;
+    for (const auto& column : local) {
+      representatives.try_emplace(classes.Find(column.id), column);
+    }
+    middle_keys_.emplace();
+    for (const ColumnId id : enclosing) {
+      if (const auto it = representatives.find(classes.Find(id)); it != representatives.end()) {
+        middle_keys_->try_emplace(id, it->second);
+      }
+    }
+  }
+  const auto it = middle_keys_->find(outer);
+  return it != middle_keys_->end() ? std::optional{it->second} : std::nullopt;
+}
+
 arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryConjunct& form,
-                                                               bool having) {
+                                                               bool having, bool where_exists) {
   // CheckConjuncts accepted this conjunct, and it runs over the same conjuncts: a Binder with no
   // way to bind a sub-block could never have been handed one.
   ANTB1_CHECK(bind_block_ != nullptr);
@@ -6736,10 +6835,12 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   // enclosing block has is a correlation that exits 4 rather than a missing column -- which is
   // what keeps a correlated subquery an Unsupported failure and not a bind error. An EXISTS
   // block's binder gates a correlated block itself (GateCorrelatedExists).
-  const SubqueryContext exists{.op_span = form.subquery->op_span,
-                               .membership = !form.exists() && !form.scalar(),
-                               .having = having,
-                               .outside_having = having && clause_ != Clause::kHaving};
+  const SubqueryContext exists{
+      .op_span = form.subquery->op_span,
+      .membership = !form.exists() && !form.scalar(),
+      .having = having,
+      .outside_having = having && clause_ != Clause::kHaving,
+      .middle = where_exists && exists_ != nullptr && clause_ == Clause::kWhere ? this : nullptr};
   // ADR 0041's decision 23
   if (aggregate_argument_) {
     scope_.set_subquery_place(Scope::SubqueryPlace::kAggregateArgument);
@@ -6788,6 +6889,7 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
                            .column = {},
                            .type = LogicalType::kBigInt,
                            .correlated = true,
+                           .used_middle_key = exists.used_middle_key,
                            .free = std::move(free)};
     }
     // An uncorrelated EXISTS is DuckDB's own plan (ADR 0041's decision 5): COUNT(*) over LIMIT 1 of
@@ -6902,6 +7004,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
     if (block.correlated) {
       RowSlot().emplace_back(SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
                                           .dependent = true,
+                                          .used_middle_key = block.used_middle_key,
                                           .right = std::move(block.right),
                                           .left_key = {},
                                           .right_key = {},
@@ -7071,7 +7174,9 @@ void Binder::InKeys(SubqueryJoin& join, const Typed& probe, const SubqueryBlock&
 }
 
 // One subquery conjunct's join over `node`.
-LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join, int64_t build_side_ratio) {
+LogicalNodePtr SubqueryJoinNode(
+    LogicalNodePtr node, SubqueryJoin& join, int64_t build_side_ratio,
+    DependentJoinNode::MiddleKey middle_key = DependentJoinNode::MiddleKey::kNone) {
   if (!join.exprs.empty()) {
     node = Make(ComputeNode{.input = std::move(node),
                             .exprs = std::move(join.exprs),
@@ -7095,6 +7200,7 @@ LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join, int64_t
         .membership = join.left_key.id != kNoColumnId
                           ? std::optional(JoinKey{.left = join.left_key, .right = join.right_key})
                           : std::nullopt,
+        .middle_key = middle_key,
         .span = join.span});
   } else {
     // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
@@ -7133,13 +7239,42 @@ LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joi
   return node;
 }
 
+// IN probes and filters consuming subquery results run outside the dependent joins. Record
+// whether those operations can see extra middle rows, then issue any refusal after binding.
+DependentJoinNode::MiddleKey SlotMiddleKey(const std::vector<SlotEntry>& slot,
+                                           const LogicalNodePtr& input) {
+  using enum DependentJoinNode::MiddleKey;
+  if (std::ranges::none_of(slot, [](const SlotEntry& entry) {
+        const auto* join = std::get_if<SubqueryJoin>(&entry);
+        return join != nullptr && join->used_middle_key;
+      })) {
+    return kNone;
+  }
+  const auto safe_expr = [&](const ExprPtr& expr) {
+    return CanEvaluateOnUnmatchedRow(*expr, input);
+  };
+  const auto safe_step = [&](const auto& step) {
+    return std::ranges::all_of(step.exprs, safe_expr) &&
+           std::ranges::all_of(step.filter, CanSkipPredicate);
+  };
+  for (const SlotEntry& entry : slot) {
+    if (!std::visit(safe_step, entry)) {
+      return kUnsafeConsumer;
+    }
+  }
+  return kSubstituted;
+}
+
 // A slot's entries over `node`, in the order they were bound: each join, and each filter as what
 // it computes, then its predicates.
 LogicalNodePtr SlotNodes(LogicalNodePtr node, std::vector<SlotEntry>& slot,
                          int64_t build_side_ratio) {
+  using enum DependentJoinNode::MiddleKey;
+  const auto slot_key = SlotMiddleKey(slot, node);
   for (SlotEntry& entry : slot) {
     if (auto* join = std::get_if<SubqueryJoin>(&entry)) {
-      node = SubqueryJoinNode(std::move(node), *join, build_side_ratio);
+      const auto middle_key = join->used_middle_key || slot_key == kNone ? slot_key : kSibling;
+      node = SubqueryJoinNode(std::move(node), *join, build_side_ratio, middle_key);
       continue;
     }
     auto& filter = std::get<SlotFilter>(entry);
@@ -7712,7 +7847,8 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
     }
     // A correlated EXISTS or scalar comparison is ADR 0023's dependent join; an uncorrelated one is
     // a value in the slot (ADR 0041's decisions 4 and 5), the conjunct a filter reading it.
-    ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(*form, /*having=*/false));
+    ARROW_ASSIGN_OR_RAISE(SubqueryBlock block,
+                          BindSubqueryBlock(*form, /*having=*/false, form->exists()));
     if (block.correlated && form->other != nullptr &&
         HoldsSubqueryWhere(*form->other, [&form](const sql::SubqueryExpr& other) {
           return SameSubquery(other, *form->subquery);
