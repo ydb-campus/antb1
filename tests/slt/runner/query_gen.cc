@@ -3051,7 +3051,7 @@ class Builder {
       // candidate admits.
       if (!allowed_.Has(Feature::kCorrelatedAggregate) ||
           !corr_rng_.Percent(kCorrelatedAggregatePercent) || !CorrelatedAggregate(c)) {
-        CorrelatedExists(c);
+        CorrelatedExists(c, !conditions && from_->bindings.size() == 1);
       }
     }
     if (value) {
@@ -3145,9 +3145,14 @@ class Builder {
   // `[NOT] EXISTS (SELECT * FROM inner WHERE inner.k = outer.k [AND inner.x <op> outer.x])`, ADR
   // 0023's Path 1: a plain block, at least one key, and an optional non-equality residual. The
   // select list is `*`, which U2 checks but does not expand, and records no shape feature.
-  void CorrelatedExists(const CorrelatedCandidate& c) {
+  void CorrelatedExists(const CorrelatedCandidate& c, bool plain_outer_scan) {
     const bool membership = allowed_.Has(Feature::kCorrelatedIn) && corr_rng_.Percent(25);
     used_.Add(membership ? Feature::kCorrelatedIn : Feature::kCorrelatedExists);
+    // A mixed item or a nested NOT IN can visit every pair sharing the correlation key.
+    const bool bounded_membership =
+        !membership || c.inner_unique ||
+        (from_->bindings.size() == 1 &&
+         SaturatingProduct(c.outer->table->rows, c.inner->rows) <= kMaxJoinRows);
     const GenColumn* item = c.inner_key;
     const GenColumn* probe = c.outer_key;
     if (membership) {
@@ -3165,7 +3170,19 @@ class Builder {
     Keyword(membership ? "IN" : "EXISTS");
     Symbol("(");
     Keyword("SELECT");
-    if (membership) {
+    Rng item_rng = corr_rng_;
+    // General outer predicates and join residuals may contain checked expressions.
+    const bool mixed_item = membership && plain_outer_scan && bounded_membership &&
+                            allowed_.Has(Feature::kMixedMembershipItem) && item_rng.Percent(25);
+    if (mixed_item) {
+      used_.Add(Feature::kMixedMembershipItem);
+      Keyword("COALESCE");
+      Symbol("(");
+      InnerColumn(c, *item);
+      Symbol(",");
+      OuterValue(c, *probe);
+      Symbol(")");
+    } else if (membership) {
       InnerColumn(c, *item);
     } else {
       Symbol("*");
@@ -3225,14 +3242,8 @@ class Builder {
         Symbol(")");
       }
     }
-    // NOT IN with a nested join can test membership on the pairs sharing a correlation key.
-    // A unique inner key bounds this by the outer rows; otherwise cap the fixture product.
-    const bool bounded_membership =
-        !membership || c.inner_unique ||
-        (from_->bindings.size() == 1 &&
-         SaturatingProduct(c.outer->table->rows, c.inner->rows) <= kMaxJoinRows);
-    if (bounded_membership && ordinary_key && !used_.Has(Feature::kNestedCorrelation) &&
-        allowed_.Has(Feature::kMiddleEqualityExists)) {
+    if (!mixed_item && bounded_membership && ordinary_key &&
+        !used_.Has(Feature::kNestedCorrelation) && allowed_.Has(Feature::kMiddleEqualityExists)) {
       // Reuse the middle table name in the innermost block. It shadows the middle binding and
       // differs from the outer binding, so the equality must read two blocks out.
       Rng rng = corr_rng_;

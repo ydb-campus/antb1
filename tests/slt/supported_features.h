@@ -238,6 +238,7 @@ enum class Feature : std::uint8_t {
   kWidenedScalarKey,      // SQ10: an aggregate correlation over two exact numeric types
   kComputedScalarKey,     // SQ10: side-local expressions in a scalar aggregate equality
   kScalarOuterCondition,  // SQ10: a keyed scalar aggregate with an enclosing-row WHERE conjunct
+  kMixedMembershipItem,   // SQ10: a plain correlated IN/NOT IN item reads both rows
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -431,6 +432,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_exists_block";
     case Feature::kCorrelatedIn:
       return "correlated_in";
+    case Feature::kMixedMembershipItem:
+      return "mixed_membership_item";
     case Feature::kKeyedDomainAggregate:
       return "keyed_domain_aggregate";
     case Feature::kCorrelatedSingle:
@@ -668,6 +671,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedExistsMark,
     Feature::kCorrelatedExistsBlock,
     Feature::kCorrelatedIn,
+    Feature::kMixedMembershipItem,
     Feature::kNestedCorrelation,
     Feature::kMiddleEqualityExists,
     Feature::kKeyedDomainAggregate,

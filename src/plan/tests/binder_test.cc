@@ -9381,10 +9381,15 @@ TEST(BinderTest, CorrelatedMembershipKeepsItsPairAndColumnIds) {
   constexpr const char* kJoinedMembership =
       "SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u JOIN ok ON "
       "u.i16 = ok.i16 AND ok.i16 = t.i64)";
+  constexpr const char* kMixedNotIn =
+      "SELECT i16 FROM t WHERE i32 NOT IN (SELECT CAST(u.i32 AS BIGINT) + t.i32 AS x FROM u "
+      "WHERE u.i64=t.i64 ORDER BY x)";
   for (const char* sql :
        {"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i64 = t.i64)",
         "SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE i64 = t.i64)",
-        "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)", kJoinedMembership,
+        "SELECT i16 FROM t WHERE i32 IN (SELECT COALESCE(u.i32, t.i32) FROM u WHERE u.i64=t.i64)",
+        kMixedNotIn, "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)",
+        kJoinedMembership,
         "SELECT i16 FROM t WHERE i32 IN (SELECT t.i64 FROM u WHERE u.i16 = t.i16)"}) {
     SCOPED_TRACE(sql);
     auto bound = BindSql(sql, catalog);
@@ -9402,6 +9407,123 @@ TEST(BinderTest, CorrelatedMembershipKeepsItsPairAndColumnIds) {
     ASSERT_TRUE(original.ok()) << original.status();
     EXPECT_FALSE(Explain(*original).contains("DependentJoin"));
     EXPECT_EQ(PositionMismatch(*original), std::nullopt);
+  }
+}
+
+TEST(BinderTest, MixedMembershipHashesItemsSuppliedByCorrelationKeys) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view op : {"IN", "NOT IN"}) {
+    const auto optimized = [&](std::string_view fallback,
+                               std::string_view inner_key = "u.i32") -> arrow::Result<LogicalPlan> {
+      ARROW_ASSIGN_OR_RAISE(
+          auto bound, BindSql(std::format("SELECT t.i16 FROM t WHERE t.i16 {} "
+                                          "(SELECT COALESCE(u.i16, {}) FROM u WHERE {}=t.i32)",
+                                          op, fallback, inner_key),
+                              catalog));
+      return Optimize(bound);
+    };
+    SCOPED_TRACE(op);
+    const auto keyed = optimized("t.i32");
+    const auto computed = optimized("t.i32", "u.i32 % 3");
+    const auto independent = optimized("t.i64");
+    ASSERT_TRUE(keyed.ok()) << keyed.status();
+    ASSERT_TRUE(computed.ok()) << computed.status();
+    ASSERT_TRUE(independent.ok()) << independent.status();
+    const JoinNode* hashed = testing::FirstJoin(*keyed);
+    const JoinNode* paired = testing::FirstJoin(*independent);
+    ASSERT_NE(hashed, nullptr);
+    ASSERT_NE(paired, nullptr);
+    EXPECT_EQ(hashed->keys.size(), 2U) << Explain(*keyed);
+    EXPECT_TRUE(hashed->residual.empty()) << Explain(*keyed);
+    const JoinNode* computed_join = testing::FirstJoin(*computed);
+    ASSERT_NE(computed_join, nullptr);
+    EXPECT_EQ(computed_join->keys.size(), 2U) << Explain(*computed);
+    EXPECT_TRUE(computed_join->residual.empty()) << Explain(*computed);
+    EXPECT_EQ(PositionMismatch(*computed), std::nullopt);
+    EXPECT_EQ(paired->keys.size(), 1U) << Explain(*independent);
+    EXPECT_FALSE(paired->residual.empty()) << Explain(*independent);
+    EXPECT_EQ(PositionMismatch(*keyed), std::nullopt);
+    EXPECT_TRUE(FreeVariables(*keyed->root).empty());
+  }
+}
+
+TEST(BinderTest, MixedMembershipRequiresAKeyAndSafeExpressions) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view op : {"IN", "NOT IN"}) {
+    for (const auto& [block, reason] :
+         std::to_array<std::pair<std::string_view, std::string_view>>({
+             {"SELECT COALESCE(u.i32,t.i32) FROM u WHERE u.i64<t.i64", "without a key"},
+             {"SELECT CASE WHEN u.i32/t.d<0 THEN 1 ELSE 0 END FROM u WHERE u.i32=t.i32",
+              "sign of a binding's zero"},
+             {"SELECT CAST(u.i64 AS SMALLINT)+t.i32 FROM u WHERE u.i32=t.i32",
+              "potentially failing mixed projection"},
+             {"SELECT COALESCE(u.i32,t.i32) FROM u WHERE u.i32=t.i32 ORDER BY CAST(u.i64 AS "
+              "SMALLINT)",
+              "potentially failing mixed projection or sort item"},
+             {"SELECT COALESCE(v.x,t.i16) FROM (SELECT i32,CAST(i64 AS SMALLINT) AS x FROM u) v "
+              "WHERE v.i32=t.i32",
+              "potentially failing set input"},
+             {"SELECT COALESCE(u.i32,t.i32) FROM u WHERE CAST(u.i64 AS SMALLINT)=t.i16",
+              "potentially failing set input"},
+         })) {
+      const std::string sql = std::format("SELECT t.i32 FROM t WHERE t.i32 {} ({})", op, block);
+      SCOPED_TRACE(sql);
+      auto bound = BindSql(sql, catalog);
+      ASSERT_TRUE(bound.ok()) << bound.status();
+      const auto optimized = Optimize(*bound);
+      ASSERT_FALSE(optimized.ok()) << Explain(*optimized);
+      const auto detail = GetSqlError(optimized.status());
+      ASSERT_NE(detail, nullptr) << optimized.status();
+      EXPECT_EQ(detail->kind(), kUnsupported);
+      EXPECT_EQ(SpanText(sql, optimized.status()), op);
+      EXPECT_TRUE(optimized.status().message().contains(reason)) << optimized.status();
+    }
+  }
+}
+
+TEST(BinderTest, MixedMembershipChecksTheSourceOfTheOuterFallback) {
+  for (const std::string_view op : {"IN", "NOT IN"}) {
+    const std::string sql = std::format(
+        "SELECT o.i32 FROM (SELECT i32, CAST(i64 AS SMALLINT) AS x FROM t) o "
+        "WHERE o.i32=2 AND o.i32 {} (SELECT COALESCE(u.i16,o.x) FROM u WHERE u.i32=o.i32)",
+        op);
+    SCOPED_TRACE(sql);
+    auto bound = BindSql(sql, MakeCatalog());
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto optimized = Optimize(*bound);
+    ASSERT_FALSE(optimized.ok()) << Explain(*optimized);
+    const auto detail = GetSqlError(optimized.status());
+    ASSERT_NE(detail, nullptr) << optimized.status();
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_EQ(SpanText(sql, optimized.status()), op);
+    EXPECT_TRUE(optimized.status().message().contains("potentially failing outer input"));
+  }
+}
+
+TEST(BinderTest, MixedMembershipChecksAnEarlierExistsAfterUnnesting) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view op : {"IN", "NOT IN"}) {
+    for (const bool unsafe : {false, true}) {
+      const std::string sql = std::format(
+          "SELECT t.i32 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i32=t.i32{}) "
+          "AND t.i32 {} (SELECT COALESCE(u.i16,t.i32) FROM u WHERE u.i32=t.i32)",
+          unsafe ? " AND CAST(u.i64 AS SMALLINT)>=0" : "", op);
+      SCOPED_TRACE(sql);
+      const auto bound = BindSql(sql, catalog);
+      ASSERT_TRUE(bound.ok()) << bound.status();
+      const auto optimized = Optimize(*bound);
+      if (unsafe) {
+        ASSERT_FALSE(optimized.ok());
+        const auto detail = GetSqlError(optimized.status());
+        ASSERT_NE(detail, nullptr) << optimized.status();
+        EXPECT_EQ(detail->kind(), kUnsupported);
+        EXPECT_EQ(SpanText(sql, optimized.status()), op);
+        EXPECT_TRUE(optimized.status().message().contains("potentially failing outer input"));
+      } else {
+        ASSERT_TRUE(optimized.ok()) << optimized.status();
+        EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+      }
+    }
   }
 }
 
