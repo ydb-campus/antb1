@@ -40,6 +40,7 @@
 
 #include "arithmetic_rewrite.h"
 #include "column_classes.h"
+#include "compute_safety.h"
 #include "join_order.h"
 #include "key_type.h"
 #include "or_factoring.h"
@@ -6795,7 +6796,9 @@ std::optional<BoundColumn> Binder::MiddleEqualityKey(ColumnId outer) const {
       // written after EXISTS is necessary, and each conjunct still binds in its original order.
       const auto left = Resolve(*columns->first);
       const auto right = Resolve(*columns->second);
-      if (!left.ok() || !right.ok() || left->type != right->type) {
+      if (!left.ok() || !right.ok() || left->type != right->type ||
+          (left->type == LogicalType::kDouble &&
+           (scope_.StoredAsFloat(left->id) || scope_.StoredAsFloat(right->id)))) {
         continue;
       }
       classes.Merge(left->id, right->id);
@@ -7171,7 +7174,9 @@ void Binder::InKeys(SubqueryJoin& join, const Typed& probe, const SubqueryBlock&
 }
 
 // One subquery conjunct's join over `node`.
-LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join, int64_t build_side_ratio) {
+LogicalNodePtr SubqueryJoinNode(
+    LogicalNodePtr node, SubqueryJoin& join, int64_t build_side_ratio,
+    DependentJoinNode::MiddleKey middle_key = DependentJoinNode::MiddleKey::kNone) {
   if (!join.exprs.empty()) {
     node = Make(ComputeNode{.input = std::move(node),
                             .exprs = std::move(join.exprs),
@@ -7195,7 +7200,7 @@ LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join, int64_t
         .membership = join.left_key.id != kNoColumnId
                           ? std::optional(JoinKey{.left = join.left_key, .right = join.right_key})
                           : std::nullopt,
-        .used_middle_key = join.used_middle_key,
+        .middle_key = middle_key,
         .span = join.span});
   } else {
     // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
@@ -7234,13 +7239,42 @@ LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joi
   return node;
 }
 
+// IN probes and filters consuming subquery results run outside the dependent joins. Record
+// whether those operations can see extra middle rows, then issue any refusal after binding.
+DependentJoinNode::MiddleKey SlotMiddleKey(const std::vector<SlotEntry>& slot,
+                                           const LogicalNodePtr& input) {
+  using enum DependentJoinNode::MiddleKey;
+  if (std::ranges::none_of(slot, [](const SlotEntry& entry) {
+        const auto* join = std::get_if<SubqueryJoin>(&entry);
+        return join != nullptr && join->used_middle_key;
+      })) {
+    return kNone;
+  }
+  const auto safe_expr = [&](const ExprPtr& expr) {
+    return CanEvaluateOnUnmatchedRow(*expr, input);
+  };
+  const auto safe_step = [&](const auto& step) {
+    return std::ranges::all_of(step.exprs, safe_expr) &&
+           std::ranges::all_of(step.filter, CanSkipPredicate);
+  };
+  for (const SlotEntry& entry : slot) {
+    if (!std::visit(safe_step, entry)) {
+      return kUnsafeConsumer;
+    }
+  }
+  return kSubstituted;
+}
+
 // A slot's entries over `node`, in the order they were bound: each join, and each filter as what
 // it computes, then its predicates.
 LogicalNodePtr SlotNodes(LogicalNodePtr node, std::vector<SlotEntry>& slot,
                          int64_t build_side_ratio) {
+  using enum DependentJoinNode::MiddleKey;
+  const auto slot_key = SlotMiddleKey(slot, node);
   for (SlotEntry& entry : slot) {
     if (auto* join = std::get_if<SubqueryJoin>(&entry)) {
-      node = SubqueryJoinNode(std::move(node), *join, build_side_ratio);
+      const auto middle_key = join->used_middle_key || slot_key == kNone ? slot_key : kSibling;
+      node = SubqueryJoinNode(std::move(node), *join, build_side_ratio, middle_key);
       continue;
     }
     auto& filter = std::get<SlotFilter>(entry);

@@ -962,6 +962,39 @@ AND EXISTS (SELECT 1 FROM edge x WHERE x.id = m.id AND x.id = 2 AND CAST(x.i64 A
 INTEGER
 2
 
+# The UNION ALL concatenates its two integer inputs. Both key spellings see the same rows.
+query I nosort
+SELECT COUNT(*) FROM edge g WHERE EXISTS (SELECT 1 FROM edge m WHERE m.id = g.id
+AND EXISTS (SELECT 1 FROM (SELECT id FROM edge UNION ALL SELECT id FROM edge) i WHERE i.id = g.id))
+----
+BIGINT
+12
+
+query I nosort
+SELECT COUNT(*) FROM edge g WHERE EXISTS (SELECT 1 FROM edge m WHERE m.id = g.id
+AND EXISTS (SELECT 1 FROM (SELECT id FROM edge UNION ALL SELECT id FROM edge) i WHERE i.id = m.id))
+----
+BIGINT
+12
+
+# A FLOAT from the enclosing block compares at FLOAT precision even inside a correlated predicate (D11).
+query I nosort
+SELECT g.id FROM floats g WHERE EXISTS (SELECT 1 FROM edge m WHERE m.id = g.id AND g.f = 16777217)
+ORDER BY 1
+----
+INTEGER
+8
+
+# DuckDB restricts the sibling residual to the surviving outer binding. antb1 refuses before execution.
+onlyif duckdb
+query I nosort
+SELECT g.id FROM edge g WHERE EXISTS (SELECT 1 FROM edge m WHERE m.id = g.id AND g.id = 2
+AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id)
+AND EXISTS (SELECT 1 FROM edge x WHERE x.id = m.id AND x.i64 + m.i64 >= 0))
+----
+INTEGER
+2
+
 # ---- DuckDB only, for good: DuckDB's error texts ----
 
 onlyif duckdb

@@ -724,7 +724,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   ordinary column equalities that every passing row satisfies. The equality filters NULLs and preserves
   duplicate outer rows. Names resolve in the nearest visible scope before substitution. The inner plan must
   be safe to evaluate for middle rows whose key no outer row binds. A checked expression that could fail on
-  such a row gives exit code 4. The unnesting's
+  such a row gives exit code 4, including a sibling subquery's predicate over a middle row and an inner row.
+  A derived `UNION ALL` is safe here when its inputs and their conversions are safe. FLOAT columns cannot
+  establish an equality for substitution (D11). The unnesting's
   refusals (for example, an inequality-only scalar aggregate whose binding source contains a LIMIT)
   come once the whole query is bound, after every bind error. A
   correlated `EXISTS` block binds its clauses before the unnesting checks its shape, so its own bind errors
