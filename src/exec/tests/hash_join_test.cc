@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -506,6 +507,93 @@ std::unique_ptr<ScriptedSource> SourceOf(const std::shared_ptr<arrow::Schema>& s
   return std::make_unique<ScriptedSource>(
       schema, std::vector<Batch>{Batch{.data = BatchOf(schema, std::move(columns)),
                                        .selection = std::move(selection)}});
+}
+
+// A materialized probe with one possible host-allocation failure, as when a column projection
+// constructs the next RecordBatch. Its buffers themselves never need to be materialized again.
+class ReadyProbeSource final : public Operator {
+ public:
+  ReadyProbeSource(std::shared_ptr<arrow::RecordBatch> batch, bool fail_successor)
+      : batch_(std::move(batch)), fail_successor_(fail_successor) {}
+  const std::shared_ptr<arrow::Schema>& output_schema() const override { return batch_->schema(); }
+  std::size_t ReadyBatches(std::size_t limit, int64_t min_rows, int64_t max_rows) const override {
+    return batch_->num_rows() >= min_rows && batch_->num_rows() <= max_rows
+               ? std::min(limit, kBatches - next_)
+               : 0;
+  }
+  arrow::Status Open(ExecContext& /*ctx*/) override {
+    next_ = 0;
+    return arrow::Status::OK();
+  }
+  arrow::Result<Batch> Next() override {
+    if (next_ == kBatches) {
+      return Batch{};
+    }
+    if (next_++ == 1 && std::exchange(fail_successor_, false)) {
+      throw std::bad_alloc();
+    }
+    return Batch{.data = batch_, .selection = {}};
+  }
+  arrow::Status Close() override { return arrow::Status::OK(); }
+
+ private:
+  static constexpr std::size_t kBatches = 4;
+  std::shared_ptr<arrow::RecordBatch> batch_;
+  bool fail_successor_;
+  std::size_t next_ = 0;
+};
+
+void CheckReadyProbeAllocationFailures(arrow::internal::ThreadPool* pool) {
+  const auto schema = Int64Schema({"k"});
+  constexpr int64_t kRows = 512;
+  const auto batch = BatchOf(schema, {Int64s(std::vector<std::optional<int64_t>>(kRows, 1))});
+  const auto make_join = [&](bool fail_successor) {
+    auto build = DrainedBuild(plan::JoinKind::kFull, SourceOf(schema, {Int64s({1})}), {0});
+    return MakeJoin(std::make_unique<ReadyProbeSource>(batch, fail_successor), std::move(build),
+                    {0}, /*prepares=*/true);
+  };
+
+  constexpr int64_t kLimit = int64_t{1024} * 1024;
+  std::atomic<bool> used = false;
+  MemoryBudget budget(kLimit);
+  auto ctx = ContextOf(pool, kRows, &budget);
+  ctx.ready_probe_used = &used;
+  auto join = make_join(true);
+  const auto failed = Drain(*join, ctx);
+  ASSERT_TRUE(failed.status().IsOutOfMemory()) << failed.status();
+  EXPECT_TRUE(used.load());  // the second input failed before any worker was dispatched
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+  ctx.ready_probe_used = nullptr;
+  const auto recovered = Drain(*join, ctx);
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_EQ((*recovered)->num_rows(), 4 * kRows);
+
+  // No query limit: the backend can still refuse the parent's allocation while output from
+  // later batches is live. Calibrate the request to the space available after one serial batch.
+  MemoryBudget backend(kLimit);
+  MemoryBudget unlimited(std::nullopt, &backend);
+  auto parent_ctx = ContextOf(pool, kRows, &unlimited);
+  int64_t parent_bytes = 0;
+  const auto parent = [&](std::atomic<bool>* token) -> arrow::Status {
+    parent_ctx.ready_probe_used = token;
+    auto probe = make_join(false);
+    ARROW_RETURN_NOT_OK(probe->Open(parent_ctx));
+    ARROW_ASSIGN_OR_RAISE(auto first, probe->Next());
+    EXPECT_EQ(first.selected_rows(), kRows);
+    pool->WaitForIdle();
+    if (parent_bytes == 0) {
+      parent_bytes = kLimit - backend.bytes_allocated();
+    }
+    const auto allocated = arrow::AllocateBuffer(parent_bytes, &unlimited);
+    ARROW_RETURN_NOT_OK(probe->Close());
+    return allocated.status();
+  };
+  ASSERT_TRUE(parent(nullptr).ok());
+  used.store(false);
+  EXPECT_TRUE(parent(&used).IsOutOfMemory());
+  EXPECT_TRUE(used.load());
+  EXPECT_EQ(backend.bytes_allocated(), 0);
+  EXPECT_TRUE(parent(nullptr).ok());
 }
 
 std::optional<int64_t> MetricOf(const ProfileNode& node, const std::string& name) {
@@ -6475,12 +6563,126 @@ TEST_F(HashJoinTest, AFullJoinEmitsItsUnmatchedBuildRowsAfterItsProbe) {
   EXPECT_EQ(Sorted(RowsOf(**again)), Sorted(expected));
 }
 
+// A streaming LIMIT can finish in the middle of its second batch. A LIMIT on a count still
+// needs the entire join, so the two-worker probe can use both batches of each group wave.
+void CheckLimitedGroupedProbe(const plan::LogicalPlan& plan, ExecContext ctx,
+                              const arrow::Table& reference) {
+  const auto project = Node(
+      plan::ProjectNode{.input = plan.root, .columns = {Column(1, "pid", LogicalType::kBigInt)}});
+  const auto limited =
+      PlanOf(Node(plan::LimitNode{.input = project, .limit = 900, .offset = 150}), 1);
+  ProfileNode bounded;
+  const auto rows = RunPlan(limited, ctx, &bounded);
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  const auto expected = reference.Slice(150, 900)->SelectColumns({1});
+  ASSERT_TRUE(expected.ok()) << expected.status();
+  EXPECT_TRUE((*rows)->Equals(**expected));
+  const auto* join = bounded.Child(0)->Child(0);
+  ASSERT_EQ(join->name(), "HashJoin");
+  ASSERT_EQ(join->batches(), 2);
+  EXPECT_EQ(join->children().at(0)->batches(), join->batches());
+
+  const auto count = Node(plan::AggregateNode{
+      .input = plan.root,
+      .aggregates = {
+          {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}}});
+  ProfileNode blocking;
+  ctx.threads = 2;
+  const auto total =
+      RunPlan(PlanOf(Node(plan::LimitNode{.input = count, .limit = 1}), 1), ctx, &blocking);
+  ASSERT_TRUE(total.ok()) << total.status();
+  EXPECT_EQ(testing::SingleInt64(**total), reference.num_rows());
+  const auto* counted_join = blocking.Child(0)->Child(0);
+  ASSERT_EQ(counted_join->name(), "HashJoin");
+  EXPECT_GT(MetricOf(*counted_join, "parallel_probe_batches").value_or(0), 1);
+}
+
+// A grouped probe supplies finished batches in group order. Exercise lookup, output gathering,
+// repeated marks on the same build row and the unmatched tail, then close a partially consumed
+// join and reuse it. The same executor used for the scan-backed FULL join drives this case.
+void CheckFullJoinOverGroupedBatches(arrow::internal::ThreadPool* pool) {
+  const auto probe_key = [](int64_t i) -> std::optional<int64_t> {
+    if (i % 11 == 0) {
+      return std::nullopt;
+    }
+    return i % 41;
+  };
+  const auto probe = KeyTable("p", 4, 6144, probe_key);
+  const auto build = KeyTable("b", 3, 15, [](int64_t i) -> std::optional<int64_t> {
+    if (i == 0) {
+      return std::nullopt;
+    }
+    return i + 3;
+  });
+  const auto pk = Column(0, "pk", LogicalType::kBigInt);
+  const auto pid = Column(1, "pid", LogicalType::kBigInt);
+  const auto bk = Column(0, "bk", LogicalType::kBigInt);
+  const auto plan_for = [&](const std::shared_ptr<MemoryTable>& probe_table) {
+    const auto grouped = Node(plan::GroupAggregateNode{
+        .input = ScanOf(probe_table, "p"), .keys = {pid, pk}, .aggregates = {}});
+    const auto projected =
+        Node(plan::ProjectNode{.input = grouped,
+                               .columns = {Column(1, "pk", LogicalType::kBigInt),
+                                           Column(0, "pid", LogicalType::kBigInt)}});
+    return PlanOf(JoinOf(plan::JoinKind::kFull, projected, ScanOf(build, "b"), {pk}, {bk}), 4);
+  };
+  const auto plan = plan_for(probe);
+  const Rows expected = Sorted(ReferenceFull(RowsOf(*probe), RowsOf(*build), {0}, {0}, 2, 2, {}));
+  ProfileNode serial_profile;
+  const auto serial = RunPlan(plan, ContextOf(nullptr, 2048), &serial_profile);
+  ASSERT_TRUE(serial.ok()) << serial.status().ToString();
+  EXPECT_EQ(Sorted(RowsOf(**serial)), expected);
+  EXPECT_EQ(MetricOf(serial_profile, "parallel_probe_batches").value_or(0), 0);
+
+  MemoryBudget budget(64 * 1024 * 1024);
+  ExecContext ctx = ContextOf(pool, 2048, &budget);
+  {
+    ProfileNode without_retry;
+    const auto result = RunPlan(plan, ctx, &without_retry);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_TRUE((*result)->Equals(**serial));
+    EXPECT_EQ(MetricOf(without_retry, "parallel_probe_batches").value_or(0), 0);
+  }
+  std::atomic<bool> used = false;
+  ctx.ready_probe_used = &used;
+  ASSERT_NO_FATAL_FAILURE(CheckLimitedGroupedProbe(plan, ctx, **serial));
+  used = false;
+  const auto small = KeyTable("p", 4, 64, probe_key);
+  {
+    ProfileNode tiny_batches;
+    const auto result = RunPlan(plan_for(small), ctx, &tiny_batches);
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(Sorted(RowsOf(**result)),
+              Sorted(ReferenceFull(RowsOf(*small), RowsOf(*build), {0}, {0}, 2, 2, {})));
+    EXPECT_FALSE(used.load());
+    EXPECT_EQ(MetricOf(tiny_batches, "parallel_probe_batches").value_or(0), 0);
+  }
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(plan, &profile);
+  ASSERT_TRUE(op.ok()) << op.status().ToString();
+  ASSERT_TRUE((*op)->Open(ctx).ok());
+  while (MetricOf(profile, "parallel_probe_batches").value_or(0) == 0) {
+    const auto batch = (*op)->Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_FALSE(batch->end());
+  }
+  ASSERT_TRUE((*op)->Close().ok());
+  EXPECT_TRUE(used.load());
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+  const auto parallel = Drain(**op, ctx);
+  ASSERT_TRUE(parallel.ok()) << parallel.status().ToString();
+  EXPECT_TRUE((*parallel)->Equals(**serial));
+  EXPECT_GT(MetricOf(profile, "parallel_probe_batches").value_or(0), 1);
+}
+
 // A FULL join whose probe is a part pipeline ends it (it emits its build rows): the sink hands on
 // every part's pairs and padded rows in part order, then the build rows no part's probe marked.
 // One thread and the pool give the same rows in the same order, the reference's; a second run of
 // the same sink gives them again, and one stopped after its first batch releases what it holds.
 TEST_F(HashJoinTest, AFullJoinOverPartsGivesTheSameRowsOnAnyNumberOfThreads) {
   const auto pool = MakeThreadPool();
+  ASSERT_NO_FATAL_FAILURE(CheckFullJoinOverGroupedBatches(pool.get()));
+  ASSERT_NO_FATAL_FAILURE(CheckReadyProbeAllocationFailures(pool.get()));
   // Build keys 0..9 then 0..4 again, NULL every 7th row; probe keys i % 13, NULL every 11th row:
   // some rows of each side match nothing.
   const auto build_table = KeyTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> {
