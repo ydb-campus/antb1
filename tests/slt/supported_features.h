@@ -214,7 +214,7 @@ enum class Feature : std::uint8_t {
   kCorrelatedIn,
   // SQ8c: a keyed nested EXISTS inside a conjunct that also reads the enclosing block.
   kNestedCorrelation,
-  kMiddleEqualityExists,  // SQ10: nested EXISTS reads a key equated in the middle WHERE
+  kMiddleEqualityExists,  // SQ10: nested EXISTS reads a key equated by an EXISTS or IN block
   kWindowWholePartition,  // W2: whole-partition aggregates over raw rows or grouped output
   kWindowRank,            // W3: RANK over raw rows or grouped output
   kWindowRowsPrefix,      // W4: running ROWS aggregates over raw rows or grouped output

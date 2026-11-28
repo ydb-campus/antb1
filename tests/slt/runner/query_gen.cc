@@ -3225,7 +3225,13 @@ class Builder {
         Symbol(")");
       }
     }
-    if (!membership && ordinary_key && !used_.Has(Feature::kNestedCorrelation) &&
+    // NOT IN with a nested join can test membership on the pairs sharing a correlation key.
+    // A unique inner key bounds this by the outer rows; otherwise cap the fixture product.
+    const bool bounded_membership =
+        !membership || c.inner_unique ||
+        (from_->bindings.size() == 1 &&
+         SaturatingProduct(c.outer->table->rows, c.inner->rows) <= kMaxJoinRows);
+    if (bounded_membership && ordinary_key && !used_.Has(Feature::kNestedCorrelation) &&
         allowed_.Has(Feature::kMiddleEqualityExists)) {
       // Reuse the middle table name in the innermost block. It shadows the middle binding and
       // differs from the outer binding, so the equality must read two blocks out.

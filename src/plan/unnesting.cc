@@ -3699,15 +3699,21 @@ class Walker {
       if (dependent->middle_key != DependentJoinNode::MiddleKey::kSubstituted) {
         return Walk(rewritten);  // its inputs may hold more dependent joins
       }
-      // A substituted key can match middle rows the original outer binding excludes. Check
-      // the operators that actually run, excluding the existing middle input even when an
-      // earlier subquery rewrites that input. Nested substitutions track their own boundary.
+      // Check the rewritten inner EXISTS above its middle input. A membership set that supplied
+      // the key also checks its own work above the outer probe: set filters and projected items
+      // can otherwise run on extra middle rows. Track each left input through sibling rewrites.
       middle_inputs_.push_back(dependent->left);
       auto result = Walk(rewritten);
       LogicalNodePtr middle = std::move(middle_inputs_.back());
       middle_inputs_.pop_back();
       if (result.ok() &&
           FirstUnsafeInnerNode(*result, /*guarded=*/true, {middle.get()}) != nullptr) {
+        if (dependent->membership.has_value()) {
+          return UnsupportedError(
+              "membership with a middle-block key and a potentially failing "
+              "set expression is not supported",
+              dependent->span);
+        }
         return UnsupportedError(
             "nested EXISTS with a middle-block key and a potentially failing "
             "inner expression is not supported",

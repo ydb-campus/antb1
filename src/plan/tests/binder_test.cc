@@ -9479,6 +9479,67 @@ TEST(BinderTest, MiddleEqualityExplainsTheKeyAvailableToTheInnerJoin) {
   EXPECT_EQ(Explain(*distant), Explain(*direct));
 }
 
+TEST(BinderTest, MiddleEqualityMembershipMatchesTheExplicitKeyPlan) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view op : {"IN", "NOT IN"}) {
+    const auto optimized = [&](std::string_view key) -> arrow::Result<LogicalPlan> {
+      ARROW_ASSIGN_OR_RAISE(
+          auto bound,
+          BindSql(std::format("SELECT g.i32 FROM t g WHERE g.i32 {} (SELECT m.i32 FROM u m WHERE "
+                              "EXISTS (SELECT 1 FROM ok i WHERE i.i16 = {}) AND m.i16 = g.i16)",
+                              op, key),
+                  catalog));
+      return Optimize(bound);
+    };
+    SCOPED_TRACE(op);
+    const auto direct = optimized("m.i16");
+    const auto distant = optimized("g.i16");
+    ASSERT_TRUE(direct.ok()) << direct.status();
+    ASSERT_TRUE(distant.ok()) << distant.status();
+    EXPECT_EQ(Explain(*distant), Explain(*direct));
+    EXPECT_TRUE(FreeVariables(*distant->root).empty());
+    EXPECT_EQ(PositionMismatch(*distant), std::nullopt);
+  }
+}
+
+TEST(BinderTest, MiddleEqualityMembershipChecksTheSetAfterBinding) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view op : {"IN", "NOT IN"}) {
+    const std::string sql = std::format(
+        "SELECT g.i16 FROM t g WHERE g.i16 {} (SELECT m.i16 FROM u m WHERE m.i16 = g.i16 "
+        "AND g.i16 = 2 AND CAST(m.i64 AS SMALLINT) >= 0 "
+        "AND EXISTS (SELECT 1 FROM ok i WHERE i.i16 = g.i16))",
+        op);
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimize(*bound);
+    ASSERT_FALSE(plan.ok());
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr);
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_TRUE(plan.status().message().contains("potentially failing set expression"));
+    const auto invalid = BindSql(sql + " AND g.missing = 0", catalog);
+    ASSERT_FALSE(invalid.ok());
+    ASSERT_NE(GetSqlError(invalid.status()), nullptr);
+    EXPECT_EQ(GetSqlError(invalid.status())->kind(), kBind);
+  }
+}
+
+TEST(BinderTest, MiddleEqualityMembershipRequiresAnOrdinaryEquality) {
+  const std::string sql =
+      "SELECT g.i32 FROM t g WHERE g.i32 NOT IN (SELECT m.i32 FROM u m "
+      "WHERE m.i16 IS NOT DISTINCT FROM g.i16 AND EXISTS "
+      "(SELECT 1 FROM ok i WHERE i.i16 = g.i16))";
+  const auto bound = BindSql(sql, MakeCatalog());
+  ASSERT_FALSE(bound.ok());
+  const auto detail = GetSqlError(bound.status());
+  ASSERT_NE(detail, nullptr);
+  EXPECT_EQ(detail->kind(), kUnsupported);
+  EXPECT_EQ(SpanText(sql, bound.status()), "g.i16");
+  EXPECT_TRUE(bound.status().message().contains("further out"));
+}
+
 TEST(BinderTest, MiddleEqualityRequiresAnOrdinaryUnconditionalSameTypeKey) {
   const Catalog catalog = MakeCatalog();
   for (const auto& [proof, inner] : std::vector<std::pair<std::string_view, std::string_view>>{

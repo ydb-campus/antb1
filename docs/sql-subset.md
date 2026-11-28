@@ -718,13 +718,16 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   block's aggregates (SQ13 too) exit 4 once their blocks bind. SQ8c also answers a nested correlated scalar value
   or EXISTS in a conjunct that reads the enclosing block itself: each nested subquery binds to its immediate
   enclosing block, and the outer reference stays in the containing block's correlated filter. The existing key
-  and representative requirements still apply. In a nested `[NOT] EXISTS` conjunct of an `EXISTS` block's
-  `WHERE`, an ordinary equality between an inner column and a column two blocks out can use a middle-block
-  column of the same type. The middle `WHERE` must equate those columns, directly or through a chain of
-  ordinary column equalities that every passing row satisfies. The equality filters NULLs and preserves
-  duplicate outer rows. Names resolve in the nearest visible scope before substitution. The inner plan must
-  be safe to evaluate for middle rows whose key no outer row binds. A checked expression that could fail on
-  such a row gives exit code 4, including a sibling subquery's predicate over a middle row and an inner row.
+  and representative requirements still apply. In a nested `[NOT] EXISTS` conjunct in the `WHERE` of an
+  `EXISTS`, `IN` or `NOT IN` block, an ordinary equality between an inner column and a column two blocks
+  out can use a middle-block column of the same type. The middle `WHERE` must equate those columns, directly
+  or through a chain of ordinary column equalities that every passing row satisfies. The equality filters
+  NULLs and preserves duplicate outer rows. Membership uses the resulting set, including the empty-input
+  row of a static aggregate. A NULL set member can make `NOT IN` unknown, and an empty set makes it true
+  even for a NULL probe. Names resolve in the nearest visible scope before substitution.
+  The inner plan must be safe to evaluate for middle rows whose key no outer row binds. A checked
+  expression that could fail on such a row gives exit code 4. This check also covers the rewritten
+  membership set, including its filters and projected values, and sibling predicates over middle and inner rows.
   A derived `UNION ALL` is safe here when its inputs and their conversions are safe. FLOAT columns cannot
   establish an equality for substitution (D11). The unnesting's
   refusals (for example, an inequality-only scalar aggregate whose binding source contains a LIMIT)

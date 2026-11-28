@@ -3108,8 +3108,9 @@ struct SubqueryContext {
   bool membership = false;      // an IN/NOT IN set, rather than an EXISTS block
   bool having = false;          // above the aggregation of the block that holds it
   bool outside_having = false;  // there, in its select list or ORDER BY (ADR 0041's SQ2b)
+  // The EXISTS read a substituted key, or this membership set supplied that key to a nested EXISTS.
   mutable bool used_middle_key = false;
-  const Binder* middle = nullptr;  // SQ10: the enclosing EXISTS whose WHERE conjunct is binding
+  const Binder* middle = nullptr;  // SQ10: the block whose WHERE supplies an equivalent local key
 };
 
 // Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope,
@@ -3137,9 +3138,10 @@ struct SubqueryJoin {
   // comparison computes on the outer side.
   bool dependent = false;
   bool used_middle_key = false;
-  LogicalNodePtr right;   // the sub-plan, its column cast to the key type
-  BoundColumn left_key;   // of the tree below (the IN forms)
-  BoundColumn right_key;  // of the sub-plan (the IN forms)
+  bool guard_membership = false;  // The set contains a nested EXISTS with a substituted key.
+  LogicalNodePtr right;           // the sub-plan, its column cast to the key type
+  BoundColumn left_key;           // of the tree below (the IN forms)
+  BoundColumn right_key;          // of the sub-plan (the IN forms)
   std::vector<ExprPtr> exprs;
   std::vector<ColumnId> ids;  // per expression: its column
   std::vector<Predicate> filter;
@@ -3183,7 +3185,7 @@ class Binder {
       : stmt_(stmt),
         scope_(std::move(bindings), outer, outer_visible),
         outer_encloses_(outer_encloses),
-        membership_block_(exists != nullptr && exists->membership),
+        membership_(exists != nullptr && exists->membership ? exists : nullptr),
         exists_(exists != nullptr && !exists->membership ? exists : nullptr),
         ids_(ids),
         options_(options),
@@ -4300,7 +4302,7 @@ class Binder {
       // lateral reference, which ADR 0022 refuses and no PR of ADR 0023 answers.
       return Scope::CorrelationError(ref, Scope::Refusal::kLateral);
     }
-    const bool membership_item = membership_block_ && clause_ == Clause::kSelect &&
+    const bool membership_item = membership_ != nullptr && clause_ == Clause::kSelect &&
                                  !aggregate_argument_ && !HasGroupBy(stmt_) &&
                                  !IsAggregateQuery(stmt_);
     if (!WhereClause(clause_) && !membership_item) {
@@ -4414,7 +4416,7 @@ class Binder {
   bool outer_encloses_ = false;
   bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
   bool outer_membership_conjunct_ = false;
-  bool membership_block_ = false;
+  const SubqueryContext* membership_ = nullptr;
   // The EXISTS conjunct this block is bound for, if any. ADR 0023's Path 1 and ADR 0041's
   // uncorrelated EXISTS drop its select list, so a star here, `*` or `t.*`, is checked by name (ADR
   // 0022's rule 5, or its one FROM item) and against the block's grouping (CheckGrouped), but
@@ -6823,7 +6825,13 @@ std::optional<BoundColumn> Binder::MiddleEqualityKey(ColumnId outer) const {
     }
   }
   const auto it = middle_keys_->find(outer);
-  return it != middle_keys_->end() ? std::optional{it->second} : std::nullopt;
+  if (it == middle_keys_->end()) {
+    return std::nullopt;
+  }
+  if (membership_ != nullptr) {
+    membership_->used_middle_key = true;
+  }
+  return it->second;
 }
 
 arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryConjunct& form,
@@ -6835,12 +6843,13 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   // enclosing block has is a correlation that exits 4 rather than a missing column -- which is
   // what keeps a correlated subquery an Unsupported failure and not a bind error. An EXISTS
   // block's binder gates a correlated block itself (GateCorrelatedExists).
-  const SubqueryContext exists{
-      .op_span = form.subquery->op_span,
-      .membership = !form.exists() && !form.scalar(),
-      .having = having,
-      .outside_having = having && clause_ != Clause::kHaving,
-      .middle = where_exists && exists_ != nullptr && clause_ == Clause::kWhere ? this : nullptr};
+  const bool middle_where =
+      where_exists && clause_ == Clause::kWhere && (exists_ != nullptr || membership_ != nullptr);
+  const SubqueryContext exists{.op_span = form.subquery->op_span,
+                               .membership = !form.exists() && !form.scalar(),
+                               .having = having,
+                               .outside_having = having && clause_ != Clause::kHaving,
+                               .middle = middle_where ? this : nullptr};
   // ADR 0041's decision 23
   if (aggregate_argument_) {
     scope_.set_subquery_place(Scope::SubqueryPlace::kAggregateArgument);
@@ -6982,6 +6991,7 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
                                           : JoinKind::kOneRow,
                        .type = type,
                        .correlated = correlated,
+                       .used_middle_key = exists.used_middle_key,
                        .free = std::move(free)};
 }
 
@@ -7042,6 +7052,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
   const BindingColumn& column = block.column;
   SubqueryJoin join{.kind = block.scalar_kind,
                     .dependent = block.correlated,
+                    .guard_membership = block.used_middle_key,
                     .right = std::move(block.right),
                     .left_key = {},
                     .right_key = {},
@@ -7200,7 +7211,8 @@ LogicalNodePtr SubqueryJoinNode(
         .membership = join.left_key.id != kNoColumnId
                           ? std::optional(JoinKey{.left = join.left_key, .right = join.right_key})
                           : std::nullopt,
-        .middle_key = middle_key,
+        .middle_key =
+            join.guard_membership ? DependentJoinNode::MiddleKey::kSubstituted : middle_key,
         .span = join.span});
   } else {
     // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
@@ -7643,7 +7655,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
     // No GROUP BY key holds this mark (a key's is bound first): the speculation fails.
     return BindError("an IN subquery that no GROUP BY key holds", s.op_span);
   }
-  if (group && Correlated() && exists_ == nullptr && !membership_block_ && !dry_run_) {
+  if (group && Correlated() && exists_ == nullptr && membership_ == nullptr && !dry_run_) {
     // A join above a correlated block's aggregation stands where ADR 0023's Path 2 does not look.
     return Reject(Rejection{.span = s.op_span,
                             .message = "an IN subquery over the aggregate of a correlated "
