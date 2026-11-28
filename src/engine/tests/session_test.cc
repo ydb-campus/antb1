@@ -1,5 +1,6 @@
 #include "antb1/engine/session.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -19,13 +20,89 @@
 #include <parquet/arrow/writer.h>
 
 #include "antb1/engine/format.h"
+#include "antb1/exec/memory_budget.h"
+#include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
+
+#include "../memory_fallback.h"
 
 namespace antb1::engine {
 namespace {
 
 namespace fs = std::filesystem;
+
+TEST(MemoryFallbackTest, ReleasesPendingProbeOutputBeforeRetryingAParentAllocation) {
+  constexpr int64_t kLimit = 128;
+  exec::MemoryBudget budget(kLimit);
+  plan::LogicalPlan logical;
+  plan::LogicalPlan fallback;
+  fallback.root = std::make_shared<const plan::LogicalNode>(plan::RowCountNode{});
+  std::vector<bool> lookahead;
+  auto run = [&](const plan::LogicalPlan& chosen,
+                 std::atomic<bool>* used) -> arrow::Result<std::unique_ptr<arrow::Buffer>> {
+    EXPECT_EQ(&chosen, &logical);
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+    lookahead.push_back(used != nullptr);
+    exec::MemoryReservation queued;
+    if (used != nullptr) {
+      EXPECT_FALSE(used->load());
+      queued.Reset(&budget);
+      ARROW_RETURN_NOT_OK(queued.Resize(kLimit / 2));
+      used->store(true);
+    }
+    // The parent needs the entire budget. It fits after the first attempt's queued output goes.
+    return arrow::AllocateBuffer(kLimit, &budget);
+  };
+  const auto result = RunWithMemoryFallback(logical, fallback, run);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ((*result)->size(), kLimit);
+  EXPECT_EQ(lookahead, (std::vector<bool>{true, false}));
+}
+
+TEST(MemoryFallbackTest, OnlyRetriesUsedProbeLookaheadOnAnAllocationFailure) {
+  const plan::LogicalPlan logical;
+  const plan::LogicalPlan fallback;
+  for (bool used_wave : {true, false}) {
+    int attempts = 0;
+    const auto error = used_wave ? arrow::Status::Invalid("bad input")
+                                 : arrow::Status::OutOfMemory("input does not fit");
+    auto run = [&](const plan::LogicalPlan&, std::atomic<bool>* used) -> arrow::Result<int> {
+      ++attempts;
+      if (used != nullptr) {
+        used->store(used_wave);
+      }
+      return error;
+    };
+    const auto result = RunWithMemoryFallback(logical, fallback, run);
+    EXPECT_EQ(result.status(), error);
+    EXPECT_EQ(attempts, 1);
+  }
+}
+
+TEST(MemoryFallbackTest, RunsThePlanFallbackWhenTheSerialProbeAlsoExceedsTheBudget) {
+  const plan::LogicalPlan logical;
+  plan::LogicalPlan fallback;
+  fallback.root = std::make_shared<const plan::LogicalNode>(plan::RowCountNode{});
+  std::vector<bool> primary_attempts;
+  std::vector<bool> fallback_attempts;
+  auto run = [&](const plan::LogicalPlan& chosen, std::atomic<bool>* used) -> arrow::Result<int> {
+    const bool primary = &chosen == &logical;
+    (primary ? primary_attempts : fallback_attempts).push_back(used != nullptr);
+    if (used != nullptr) {
+      used->store(true);
+    }
+    if (primary || used != nullptr) {
+      return arrow::Status::OutOfMemory("insufficient budget");
+    }
+    return 1;
+  };
+  const auto result = RunWithMemoryFallback(logical, fallback, run);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(*result, 1);
+  EXPECT_EQ(primary_attempts, (std::vector<bool>{true, false}));
+  EXPECT_EQ(fallback_attempts, (std::vector<bool>{true, false}));
+}
 
 class SessionTest : public ::testing::Test {
  protected:

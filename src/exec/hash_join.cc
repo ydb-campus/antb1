@@ -1058,6 +1058,7 @@ arrow::Status HashJoinOperator::Open(ExecContext& ctx) {
   ctx_ = ctx;
   batch_size_ = std::max<int64_t>(ctx.batch_size, 1);
   memory_.Reset(ctx.budget);
+  ready_memory_.Reset(ctx.budget);
   opened_ = true;
   if (prepares_) {
     return arrow::Status::OK();  // the first Next prepares the build
@@ -1169,6 +1170,25 @@ arrow::Result<Batch> HashJoinOperator::Next() {
   }
   while (!done_) {
     if (batch_.data == nullptr) {
+      if (!ready_probes_ && own_tail_ && ctx_.executor != nullptr && ctx_.threads > 1 &&
+          table_->unique() && residual_.empty() && !probe_keys_.empty() &&
+          (ctx_.budget == nullptr || !ctx_.budget->under_pressure())) {
+        ARROW_RETURN_NOT_OK(StartReadyProbes());
+      }
+      if (ready_probes_) {
+        ARROW_ASSIGN_OR_RAISE(auto out, ready_probes_->Next());
+        ready_inputs_[next_ready_++] = {};
+        if (ready_probes_->done()) {
+          ready_probes_.reset();
+          Free(ready_inputs_);
+          ready_memory_.Release();
+        }
+        if (profile() != nullptr) {
+          profile()->Add("parallel_probe_batches", MetricUnit::kCount, 1);
+          profile()->Add("window_rows", MetricUnit::kCount, out.data->num_rows());
+        }
+        return out;
+      }
       ARROW_RETURN_NOT_OK(Pull());
       continue;
     }
@@ -1228,6 +1248,84 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
   return arrow::Status::Invalid("hash join: unhandled join kind");  // unreachable
 }
 
+arrow::Status HashJoinOperator::StartReadyProbes() {
+  // A worker must have enough rows to repay dispatch, and its whole output must fit one batch.
+  constexpr int64_t kMinProbeTaskRows = 512;
+  const auto max_rows = std::min<int64_t>(batch_size_, std::numeric_limits<std::uint32_t>::max());
+  const bool limited = ctx_.budget != nullptr && ctx_.budget->limit().has_value();
+  if (ctx_.executor->IsCurrentExecutor() || (limited && ctx_.ready_probe_used == nullptr)) {
+    return arrow::Status::OK();
+  }
+  const auto count =
+      input_->ReadyBatches(static_cast<std::size_t>(ctx_.threads), kMinProbeTaskRows, max_rows);
+  if (count < 2) {
+    return arrow::Status::OK();
+  }
+  // If the additional references cannot fit, leave the group cursor untouched for Pull().
+  const auto status = ready_memory_.Resize(Narrow<int64_t>(count * sizeof(Batch)));
+  if (status.IsOutOfMemory()) {
+    return arrow::Status::OK();
+  }
+  ARROW_RETURN_NOT_OK(status);
+  try {
+    ready_inputs_.reserve(count);
+  } catch (const std::bad_alloc&) {
+    ready_memory_.Release();
+    return arrow::Status::OK();
+  }
+  for (std::size_t i = 0; i < count; ++i) {
+    ARROW_ASSIGN_OR_RAISE(auto in, input_->Next());
+    ANTB1_CHECK(!in.end());
+    ANTB1_CHECK(in.selection == nullptr);
+    ANTB1_CHECK(in.data->num_rows() >= kMinProbeTaskRows);
+    ANTB1_CHECK(in.data->num_rows() <= max_rows);
+    ready_inputs_.push_back(std::move(in));
+  }
+  // This path and the serial probe use the same scratch in different places. Release the
+  // caller's last serial workspace before workers allocate theirs, including on a solo retry.
+  Free(matches_);
+  Free(build_rows_);
+  keys_.clear();
+  memory_.Release();
+  if (limited) {
+    ctx_.ready_probe_used->store(true, std::memory_order_relaxed);
+  }
+  const auto parts = Narrow<int64_t>(ready_inputs_.size());
+  next_ready_ = 0;
+  auto task = [this](int64_t part, const std::atomic<bool>&) {
+    return ProbeReady(ready_inputs_[static_cast<std::size_t>(part)]);
+  };
+  ready_probes_ = std::make_unique<PartScheduler<Batch>>(parts, std::move(task), ctx_.executor,
+                                                         parts, ctx_.budget);
+  return arrow::Status::OK();
+}
+
+arrow::Result<Batch> HashJoinOperator::ProbeReady(const Batch& input) const {
+  MemoryReservation memory;
+  memory.Reset(ctx_.budget);
+  arrow::ArrayVector keys;
+  std::vector<JoinMatches> matches;
+  std::vector<JoinRowRef> refs;
+  ARROW_RETURN_NOT_OK(FindMatches(input, keys, matches, memory));
+  return LeftWindow(input, 0, matches, refs, memory, nullptr);
+}
+
+arrow::Status HashJoinOperator::FindMatches(const Batch& in, arrow::ArrayVector& keys,
+                                            std::vector<JoinMatches>& matches,
+                                            MemoryReservation& memory) const {
+  keys.clear();
+  for (const int key : probe_keys_) {
+    keys.push_back(in.data->column(key));
+  }
+  ARROW_RETURN_NOT_OK(Fit(matches, static_cast<std::size_t>(in.data->num_rows()), memory));
+  const ProfileTimer find(profile(), "find");
+  if (probe_keys_.empty()) {
+    // A nested loop (ADR 0040): every build row is a candidate of every selected row.
+    return table_->FindEvery(in.data->num_rows(), in.selection.get(), ctx_.pool, matches);
+  }
+  return table_->Find(keys, in.selection.get(), ctx_.pool, matches);
+}
+
 arrow::Status HashJoinOperator::Pull() {
   ARROW_ASSIGN_OR_RAISE(Batch in, input_->Next());
   if (in.end()) {
@@ -1249,19 +1347,7 @@ arrow::Status HashJoinOperator::Pull() {
     return arrow::Status::CapacityError("a join probe batch of ", in.data->num_rows(), " rows");
   }
   if (keep_ != Keep::kAll) {  // the rows' matches decide
-    keys_.clear();
-    for (const int key : probe_keys_) {
-      keys_.push_back(in.data->column(key));
-    }
-    ARROW_RETURN_NOT_OK(Fit(matches_, static_cast<std::size_t>(in.data->num_rows()), memory_));
-    const ProfileTimer find(profile(), "find");
-    if (probe_keys_.empty()) {
-      // A nested loop (ADR 0040): every build row is a candidate of every selected row.
-      ARROW_RETURN_NOT_OK(
-          table_->FindEvery(in.data->num_rows(), in.selection.get(), ctx_.pool, matches_));
-    } else {
-      ARROW_RETURN_NOT_OK(table_->Find(keys_, in.selection.get(), ctx_.pool, matches_));
-    }
+    ARROW_RETURN_NOT_OK(FindMatches(in, keys_, matches_, memory_));
   }
   // Find gives unselected rows empty ranges. Duplicates of unprobed keys never reach this check.
   if (plan::Traits(kind_).single_match && residual_.empty() && !table_->unique() &&
@@ -1446,19 +1532,30 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextLeftWindow() {
   if (profile() != nullptr) {
     profile()->Add("window_rows", MetricUnit::kCount, rows);
   }
-  ARROW_RETURN_NOT_OK(Fit(build_rows_, static_cast<std::size_t>(rows), memory_));
+  return LeftWindow(
+      batch_, begin,
+      std::span(matches_).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(rows)),
+      build_rows_, memory_, *std::move(selection));
+}
+
+arrow::Result<Batch> HashJoinOperator::LeftWindow(
+    const Batch& input, int64_t begin, std::span<const JoinMatches> matches,
+    std::vector<JoinRowRef>& refs, MemoryReservation& memory,
+    std::shared_ptr<arrow::BooleanArray> selection) const {
+  const auto rows = Narrow<int64_t>(matches.size());
+  ARROW_RETURN_NOT_OK(Fit(refs, matches.size(), memory));
   const std::span<const JoinRowRef> table_rows = table_->rows();
   for (int64_t i = 0; i < rows; ++i) {  // NULL where a row has no match (padded)
-    const JoinMatches& m = matches_[static_cast<std::size_t>(begin + i)];
-    build_rows_[static_cast<std::size_t>(i)] =
+    const JoinMatches& m = matches[static_cast<std::size_t>(i)];
+    refs[static_cast<std::size_t>(i)] =
         m.end > m.begin ? table_rows[m.begin] : JoinRowRef{.chunk = kNoChunk, .row = 0};
     if (marks_ != nullptr && m.end > m.begin) {
       marks_->Mark(m.begin);  // a FULL join: the build row this one matched
     }
   }
-  ARROW_ASSIGN_OR_RAISE(const arrow::ArrayVector build, GatherBuild<true>(rows));
-  const std::shared_ptr<arrow::RecordBatch> probe = batch_.data->Slice(begin, rows);
-  return Batch{.data = Assemble(probe->columns(), build, rows), .selection = *std::move(selection)};
+  ARROW_ASSIGN_OR_RAISE(const arrow::ArrayVector build, GatherBuild<true>(refs));
+  const std::shared_ptr<arrow::RecordBatch> probe = input.data->Slice(begin, rows);
+  return Batch{.data = Assemble(probe->columns(), build, rows), .selection = std::move(selection)};
 }
 
 arrow::Result<std::optional<Batch>> HashJoinOperator::NextPadded() {
@@ -1901,10 +1998,11 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextPairs() {
 }
 
 template <bool kWithNulls>
-arrow::Result<arrow::ArrayVector> HashJoinOperator::GatherBuild(int64_t rows) {
+arrow::Result<arrow::ArrayVector> HashJoinOperator::GatherBuild(
+    std::span<const JoinRowRef> refs) const {
+  const auto rows = Narrow<int64_t>(refs.size());
   const ProfileTimer gather(profile(), "gather");
   const arrow::Schema& schema = *table_->spec().schema();
-  const std::span<const JoinRowRef> refs(build_rows_.data(), static_cast<std::size_t>(rows));
   arrow::ArrayVector columns;
   columns.reserve(static_cast<std::size_t>(schema.num_fields()));
   for (int c = 0; c < schema.num_fields(); ++c) {
@@ -1965,6 +2063,9 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::ApplyResiduals(Batch out) 
 }
 
 void HashJoinOperator::End() {
+  ready_probes_.reset();
+  Free(ready_inputs_);
+  ready_memory_.Release();
   done_ = true;
   batch_ = Batch{};
   Free(keys_);
@@ -1991,6 +2092,7 @@ void HashJoinOperator::End() {
 }
 
 arrow::Status HashJoinOperator::Close() {
+  ready_probes_.reset();  // an early LIMIT can close with later probe batches still in flight
   arrow::Status status;
   if (input_opened_) {
     status = input_->Close();

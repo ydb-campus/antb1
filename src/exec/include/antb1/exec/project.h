@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -21,6 +22,8 @@ class ProjectOperator final : public Operator {
     return schema_;
   }
   const BatchPartition* RequestPartitioning(int column, PartitionRequest request) override;
+  [[nodiscard]] std::size_t ReadyBatches(std::size_t limit, int64_t min_rows,
+                                         int64_t max_rows) const override;
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
   arrow::Status Close() override { return input_->Close(); }
