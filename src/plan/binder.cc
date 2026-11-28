@@ -9945,7 +9945,8 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
   ARROW_ASSIGN_OR_RAISE(
       BoundBlock bound,
       BindBlock(block, catalog, options, ids, frame, carries_binding ? outer : scope,
-                carries_binding, nullptr, binding_visibility.value_or(Visibility{})));
+                carries_binding, nullptr,
+                carries_binding ? binding_visibility.value_or(Visibility{}) : Visibility{}));
   std::vector<BindingColumn> columns = std::move(bound.columns);
   // A column alias list after a CTE name is rejected by the parser (rule 7), so a CTE's list is
   // always the one written where it was declared.

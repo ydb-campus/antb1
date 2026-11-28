@@ -9459,6 +9459,20 @@ TEST(BinderTest, ProjectedInputCorrelationStopsAtOtherBoundaries) {
   }
 }
 
+TEST(BinderTest, ProjectedInputCorrelationPreservesAncestorCteVisibility) {
+  constexpr std::string_view kSql =
+      "SELECT a3.i32 FROM t a1, t a2, t a3 WHERE EXISTS "
+      "(WITH s AS (SELECT a3.i32 FROM u) SELECT 1 FROM u b1 JOIN u b2 "
+      "ON EXISTS (SELECT 1 FROM s))";
+  const auto bound = BindSql(kSql, MakeCatalog());
+  ASSERT_FALSE(bound.ok());
+  const auto detail = GetSqlError(bound.status());
+  ASSERT_NE(detail, nullptr) << bound.status();
+  EXPECT_EQ(detail->kind(), kUnsupported);
+  EXPECT_EQ(SpanText(kSql, bound.status()), "a3.i32");
+  EXPECT_TRUE(bound.status().message().contains("a lateral qualified column")) << bound.status();
+}
+
 TEST(BinderTest, ProjectedInputCorrelationRejectsExistsAboveGrouping) {
   const Catalog catalog = MakeCatalog();
   constexpr const char* kHaving =
