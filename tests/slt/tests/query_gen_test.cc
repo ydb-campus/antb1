@@ -6172,6 +6172,8 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
     EXPECT_FALSE(blocks.front()->query->where.empty());
     const bool mixed = q.features.Has(Feature::kMixedMembershipItem);
     if (mixed) {
+      EXPECT_EQ(parsed->from.size(), 1U);
+      EXPECT_EQ(parsed->where.size(), 1U);
       EXPECT_TRUE(q.sql.contains("COALESCE")) << q.sql;
     }
     if (q.sql.contains("NOT IN")) {
