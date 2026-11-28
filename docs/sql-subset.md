@@ -723,13 +723,16 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   out can use a middle-block column of the same type. The middle `WHERE` must equate those columns, directly
   or through a chain of ordinary column equalities that every passing row satisfies. The equality filters
   NULLs and preserves duplicate outer rows. Membership uses the resulting set, including the empty-input
-  row of a static aggregate. A NULL set member can make `NOT IN` unknown, and an empty set makes it true
-  even for a NULL probe. Names resolve in the nearest visible scope before substitution.
+  row of a static aggregate. Equality-only `NOT IN` can use the per-binding hash lookups once the nested
+  EXISTS has been unnested, when the set can be evaluated twice and repeated keys make pair testing costly.
+  A NULL set member can make `NOT IN` unknown, and an empty set makes it true even for a NULL probe. Names resolve in the
+  nearest visible scope before substitution.
   The inner plan must be safe to evaluate for middle rows whose key no outer row binds. A checked
   expression that could fail on such a row gives exit code 4. This check also covers the rewritten
-  membership set, including its filters and projected values, and sibling predicates over middle and inner rows.
-  A derived `UNION ALL` is safe here when its inputs and their conversions are safe. FLOAT columns cannot
-  establish an equality for substitution (D11). The unnesting's
+  membership set, including its filters and eager projections, and sibling predicates over middle and inner rows.
+  A deferred membership item still runs only on matching bindings after the correlation predicates.
+  Derived `UNION`, `INTERSECT` and `EXCEPT` (including `ALL`) are safe here when their inputs and
+  conversions are safe. FLOAT columns cannot establish an equality for substitution (D11). The unnesting's
   refusals (for example, an inequality-only scalar aggregate whose binding source contains a LIMIT)
   come once the whole query is bound, after every bind error. A
   correlated `EXISTS` block binds its clauses before the unnesting checks its shape, so its own bind errors

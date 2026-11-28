@@ -934,3 +934,70 @@ AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id) AND CAST(m.i64 AS SMALLINT) 
 ----
 INTEGER
 2
+
+# The checked item runs after the correlation, including before NOT IN tests its NULLs.
+query I nosort
+SELECT g.id FROM edge g WHERE g.id = 2 AND g.i16 IN (SELECT CAST(m.i64 AS SMALLINT) FROM edge m
+WHERE m.id = g.id AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id)) ORDER BY 1
+----
+INTEGER
+2
+
+query I nosort
+SELECT g.id FROM edge g WHERE g.i16 NOT IN (SELECT CAST(m.i64 AS SMALLINT) FROM edge m
+WHERE m.id = g.id AND g.id = 2 AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id)) ORDER BY 1
+----
+INTEGER
+0
+1
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+# The matching binding still evaluates the cast and reports its execution error.
+statement error out of range
+SELECT g.id FROM edge g WHERE g.id = 0 AND g.i16 IN (SELECT CAST(m.i64 AS SMALLINT) FROM edge m
+WHERE m.id = g.id AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id))
+
+# The independent set operation is total over its integer inputs.
+query I nosort
+SELECT g.id FROM edge g WHERE g.id IN (SELECT m.id FROM
+(SELECT id FROM edge EXCEPT SELECT id FROM edge WHERE id <> 2) m
+WHERE m.id = g.id AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id)) ORDER BY 1
+----
+INTEGER
+2
+
+query I nosort
+SELECT COUNT(*) FROM edge g WHERE g.id IN (SELECT m.id FROM
+(SELECT id FROM edge INTERSECT ALL SELECT id FROM edge WHERE id < 3) m
+WHERE m.id = g.id AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id))
+----
+BIGINT
+3
+
+query I nosort
+SELECT COUNT(*) FROM edge g WHERE g.id IN (SELECT m.id FROM
+(SELECT id FROM edge UNION SELECT id FROM edge) m
+WHERE m.id = g.id AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id))
+----
+BIGINT
+12
+
+# Repeated correlation keys use the per-binding lookups. The NULL item rejects binding 1;
+# the nested EXISTS empties binding 2, which therefore retains its NULL probes.
+query II nosort
+WITH vals AS (SELECT fl_row AS a, fl_row % 3 AS k FROM fleet)
+SELECT g.k, COUNT(*) FROM vals g WHERE (CASE WHEN g.k = 2 THEN NULL ELSE g.a + 10000 END) NOT IN
+(SELECT CASE WHEN m.k = 1 THEN NULL ELSE m.a END FROM vals m WHERE m.k = g.k
+AND EXISTS (SELECT 1 FROM vals i WHERE i.k = g.k AND i.k < 2)) GROUP BY g.k ORDER BY g.k
+----
+INTEGER	BIGINT
+0	2496
+2	2496

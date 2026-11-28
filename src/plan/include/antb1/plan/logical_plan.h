@@ -614,6 +614,8 @@ struct DependentJoinNode {
   // condition and to the binding-dependent work of sibling subqueries in the same WHERE.
   enum class MiddleKey : std::uint8_t { kNone, kSubstituted, kSibling, kUnsafeConsumer };
   MiddleKey middle_key = MiddleKey::kNone;
+  // The membership set supplied a key to its nested EXISTS. The set can itself be a sibling.
+  bool guard_membership = false;
   SourceSpan span;  // the subquery in the query
 };
 

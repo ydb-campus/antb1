@@ -974,21 +974,24 @@ ClonedInput CloneInput(const LogicalNodePtr& input, ColumnId& last_id) {
   return out;
 }
 
+// A rule's rewrite: the node that stands where the dependent join stood, and the right input of the
+// join it makes, which Lemma 3.1's check reads. Lift mode's node is that join; value mode's may be
+// the maps over a LEFT join back.
+struct Rewritten {
+  LogicalNodePtr node;
+  LogicalNodePtr right;
+  // Only this join's deferred membership comparison runs after its correlation matched.
+  ExprPtr deferred_match = nullptr;
+  // Decide whether to split this membership after the nested joins have been rewritten.
+  std::optional<JoinKey> pending_lookups = std::nullopt;
+};
+
 // Equality-correlated NOT IN needs two lookups: the membership key, and per-binding row/NULL
 // counts. The second has one row per correlation tuple, so even its residual visits at most one
 // pair per outer row. Empty tuples have no group and therefore keep even a NULL probe. Residual
 // correlations retain the general candidate-pair path; do not clone pending dependent joins or
 // LIMITs that could choose different rows on their second evaluation.
-LogicalNodePtr MembershipNode(const Correlation& correlation, JoinNode join,
-                              const ExprPtr& deferred_item = nullptr) {
-  const auto& membership = correlation.join.membership;
-  if (!membership.has_value() || join.kind != JoinKind::kAnti || deferred_item != nullptr ||
-      join.keys.empty() || !join.residual.empty() || FirstDependentJoin(join.right) != nullptr ||
-      UnsafeToClone(join.right) || !FreeVariables(*join.right).empty()) {
-    AddMembership(correlation.join, join.keys, join.residual, deferred_item);
-    return Make(std::move(join));
-  }
-  ColumnId& last_id = correlation.last_id;
+LogicalNodePtr MembershipLookups(JoinNode join, const JoinKey& membership, ColumnId& last_id) {
   const auto fresh = [&last_id] {
     last_id = ColumnId{std::to_underlying(last_id) + 1};
     return last_id;
@@ -1005,7 +1008,7 @@ LogicalNodePtr MembershipNode(const Correlation& correlation, JoinNode join,
                                                          .id = rows.id,
                                                          .span = join.span},
                                            AggregateCall{.kind = AggKind::kCount,
-                                                         .arg = counted.Rename(membership->right),
+                                                         .arg = counted.Rename(membership.right),
                                                          .type = values.type,
                                                          .id = values.id,
                                                          .span = join.span}},
@@ -1036,16 +1039,137 @@ LogicalNodePtr MembershipNode(const Correlation& correlation, JoinNode join,
       .right = Make(std::move(groups)),
       .keys = std::move(keys),
       .residual = {std::make_shared<const Expr>(Expr{
-          .node = BoolExpr{.op = BoolOp::kOr, .args = {IsNullValue(membership->left), has_null}},
+          .node = BoolExpr{.op = BoolOp::kOr, .args = {IsNullValue(membership.left), has_null}},
           .type = LogicalType::kBoolean,
           .name = "NULL membership"})},
       .build = BuildSide::kRight,
       .estimate = join.estimate,
       .span = join.span});
-  join.keys.push_back(*membership);
+  join.keys.push_back(membership);
   // Preserve duplicates on the outer side without enumerating them as build-side candidates.
   join.build = BuildSide::kRight;
   return Make(std::move(join));
+}
+
+// Each hash-based NOT IN reads its set twice. Keep the candidate-pair plan around a nested
+// NOT IN so a chain of them does not double the size of the plan at every level.
+bool ContainsDependentNotIn(const LogicalNodePtr& node) {
+  if (const auto* join = std::get_if<DependentJoinNode>(node.get());
+      join != nullptr && join->membership.has_value() && join->kind == JoinKind::kAnti) {
+    return true;
+  }
+  return std::ranges::any_of(InputsOf(*node), ContainsDependentNotIn);
+}
+
+// Approximate the correlation-key domain on the set rows that survive a nested EXISTS.
+// Stop at a filter: the scan count can substantially overstate the rows it passes.
+struct MembershipDomain {
+  std::optional<int64_t> values;
+  std::optional<Int128> min;
+  std::optional<Int128> max;
+};
+
+MembershipDomain MembershipKeyDomain(const LogicalNodePtr& input, ColumnId id, int64_t rows) {
+  if (const auto* scan = std::get_if<ScanNode>(input.get())) {
+    const auto at = std::ranges::find(scan->ids, id);
+    if (at == scan->ids.end()) {
+      return {};
+    }
+    const int field = scan->fields.at(Narrow<std::size_t>(at - scan->ids.begin()));
+    const ColumnRange range = ColumnRangeOf(*scan->table, field);
+    return {.values = ColumnDomain(*scan->table, field, range), .min = range.min, .max = range.max};
+  }
+  if (const auto* project = std::get_if<ProjectNode>(input.get())) {
+    const auto at = std::ranges::find(project->ids, id);
+    return at == project->ids.end()
+               ? MembershipDomain{}
+               : MembershipKeyDomain(
+                     project->input,
+                     project->columns.at(Narrow<std::size_t>(at - project->ids.begin())).id, rows);
+  }
+  if (const auto* compute = std::get_if<ComputeNode>(input.get())) {
+    if (const auto* definition = DefinedBy(*compute, id)) {
+      if (const auto column = WidenedColumn(**definition)) {
+        return MembershipKeyDomain(compute->input, *column, rows);
+      }
+      const auto* op = std::get_if<ArithExpr>(&(*definition)->node);
+      if (op != nullptr && op->op == ArithOp::kModulo) {
+        const auto* literal = std::get_if<ConstantExpr>(&op->right->node);
+        const auto* divisor =
+            literal == nullptr ? nullptr : std::get_if<Int128>(&literal->value.value);
+        if (divisor != nullptr && *divisor > 0 && *divisor < rows) {
+          // A signed remainder can be negative as well as positive.
+          return {.values = static_cast<int64_t>(std::min<Int128>(rows, 2 * *divisor - 1)),
+                  .min = 1 - *divisor,
+                  .max = *divisor - 1};
+        }
+      }
+      return {};
+    }
+    return MembershipKeyDomain(compute->input, id, rows);
+  }
+  if (const auto* join = std::get_if<JoinNode>(input.get());
+      join != nullptr && Traits(join->kind).filters_left) {
+    return MembershipKeyDomain(join->left, id, rows);
+  }
+  return {};
+}
+
+// Count probes only across row-preserving maps. A filter, LIMIT or another join could leave a
+// single probe; avoid building the nested set a second time on a speculative row count.
+bool WorthNestedLookups(const JoinNode& join, std::span<const Ancestor> above) {
+  auto probe = join.left;
+  while (std::holds_alternative<ProjectNode>(*probe) ||
+         std::holds_alternative<ComputeNode>(*probe)) {
+    probe = InputsOf(*probe).front();
+  }
+  if (!std::holds_alternative<ScanNode>(*probe) ||
+      std::ranges::any_of(above, [](const Ancestor& step) {
+        return std::holds_alternative<LimitNode>(*step.node);
+      })) {
+    return false;
+  }
+  const int64_t probes = EstimateRows(*probe).value_or(0);
+  const int64_t rows = EstimateRows(*join.right).value_or(0);
+  // Two hash builds and a grouped count cost more than a few candidate tests per row.
+  constexpr int64_t kPairsPerRow = 32;
+  if (std::min(rows, probes) <= kPairsPerRow) {
+    return false;
+  }
+  Int128 pairs = Int128{rows} * probes;
+  for (const JoinKey& key : join.keys) {
+    const auto outer = MembershipKeyDomain(join.left, key.left.id, probes);
+    const auto inner = MembershipKeyDomain(join.right, key.right.id, rows);
+    if (!outer.values || !inner.values || (outer.min && inner.max && *outer.min > *inner.max) ||
+        (inner.min && outer.max && *inner.min > *outer.max)) {
+      return false;
+    }
+    pairs /= std::max({int64_t{1}, *outer.values, *inner.values});
+  }
+  return pairs >= kPairsPerRow * (Int128{rows} + probes);
+}
+
+Rewritten MembershipNode(const Correlation& correlation, JoinNode join,
+                         const ExprPtr& deferred_item = nullptr) {
+  Rewritten out{.node = nullptr, .right = join.right};
+  const auto& membership = correlation.join.membership;
+  if (membership && join.kind == JoinKind::kAnti && deferred_item == nullptr &&
+      !join.keys.empty() && join.residual.empty()) {
+    if (FirstDependentJoin(join.right) != nullptr) {
+      if (!ContainsDependentNotIn(join.right)) {
+        out.pending_lookups = membership;
+      }
+    } else if (!UnsafeToClone(join.right) && FreeVariables(*join.right).empty()) {
+      out.node = MembershipLookups(std::move(join), *membership, correlation.last_id);
+      return out;
+    }
+  }
+  AddMembership(correlation.join, join.keys, join.residual, deferred_item);
+  if (deferred_item != nullptr) {
+    out.deferred_match = join.residual.back();
+  }
+  out.node = Make(std::move(join));
+  return out;
 }
 
 // Map each child of a value, including CASE's optional branches. Column replacement below keeps
@@ -1190,7 +1314,7 @@ arrow::Result<MembershipInput> MembershipMaps(const Correlation& correlation, co
                                               : nullptr};
 }
 
-arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spine& spine) {
+arrow::Result<Rewritten> LiftJoin(const Correlation& correlation, const Spine& spine) {
   const DependentJoinNode& join = correlation.join;
   ColumnId& last_id = correlation.last_id;
   std::vector<JoinKey> keys;
@@ -1986,7 +2110,8 @@ bool ReadsEmptyScan(const LogicalNodePtr& input) {
 
 // A derived table may hide a checked expression behind an ordinary column reference.
 const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded = false,
-                                        const std::set<const LogicalNode*>& existing_inputs = {}) {
+                                        const std::set<const LogicalNode*>& existing_inputs = {},
+                                        const Expr* deferred_match = nullptr) {
   if (existing_inputs.contains(input.get())) {
     return nullptr;
   }
@@ -1996,7 +2121,7 @@ const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarde
     }
   }
   const bool safe = std::visit(
-      [guarded](const auto& node) {
+      [guarded, deferred_match](const auto& node) {
         using Node = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<Node, ComputeNode>) {
           return std::ranges::all_of(node.exprs, [&](const ExprPtr& expr) {
@@ -2015,8 +2140,9 @@ const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarde
           const auto traits = Traits(node.kind);
           return !traits.single_match &&
                  std::ranges::all_of(node.residual, [&](const ExprPtr& expr) {
-                   return guarded ? CanEvaluateOnUnmatchedRow(*expr, nullptr)
-                                  : SafeBeforeMembership(*expr);
+                   return expr.get() == deferred_match ||
+                          (guarded ? CanEvaluateOnUnmatchedRow(*expr, nullptr)
+                                   : SafeBeforeMembership(*expr));
                  });
         } else if constexpr (std::is_same_v<Node, DependentJoinNode>) {
           return !guarded && !Traits(node.kind).single_match;
@@ -2024,7 +2150,8 @@ const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarde
           return guarded
                      ? (std::is_same_v<Node, ScanNode> || std::is_same_v<Node, ProjectNode> ||
                         std::is_same_v<Node, LimitNode> || std::is_same_v<Node, SortNode> ||
-                        std::is_same_v<Node, RowCountNode> || std::is_same_v<Node, UnionAllNode>)
+                        std::is_same_v<Node, RowCountNode> || std::is_same_v<Node, UnionAllNode> ||
+                        std::is_same_v<Node, SetOperationNode>)
                      : !std::is_same_v<Node, WindowNode>;
         }
       },
@@ -2172,14 +2299,6 @@ ExprPtr ConditionOf(const Predicate& predicate, const BoundColumn& any) {
            .type = LogicalType::kBoolean,
            .name = std::move(name)});
 }
-
-// A rule's rewrite: the node that stands where the dependent join stood, and the right input of the
-// join it makes, which Lemma 3.1's check reads. Lift mode's node is that join; value mode's may be
-// the maps over a LEFT join back.
-struct Rewritten {
-  LogicalNodePtr node;
-  LogicalNodePtr right;
-};
 
 // The name a reader of the call's column gives it: the select list's, else the call as EXPLAIN
 // shows one.
@@ -3292,18 +3411,16 @@ arrow::Result<Rewritten> PartitionedBlock(const Correlation& correlation, const 
                            .right = inner,
                            .null_equal = representatives.null_equal.contains(outer)});
   }
-  std::vector<ExprPtr> residual;
-  LogicalNodePtr node = MembershipNode(
+  return MembershipNode(
       correlation, JoinNode{.kind = single && at_most_one ? JoinKind::kLeft : correlation.join.kind,
                             .left = correlation.join.left,
-                            .right = right,
+                            .right = std::move(right),
                             .keys = std::move(keys),
-                            .residual = std::move(residual),
+                            .residual = {},
                             .mark = correlation.join.mark,
                             .build = BuildSide::kRight,
                             .estimate = EstimateRows(*correlation.join.left),
                             .span = correlation.join.span});
-  return Rewritten{.node = std::move(node), .right = std::move(right)};
 }
 
 // GROUP BY () is the single empty grouping set, hence a static aggregate. Mixed
@@ -3344,9 +3461,7 @@ arrow::Result<Rewritten> ExistsJoin(const Correlation& correlation) {
   }
   LogicalNodePtr declined;
   if (const auto plain = Descend(Mode::kLift, input, &declined, correlation.outer)) {
-    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr node, LiftJoin(correlation, *plain));
-    const LogicalNodePtr right = std::get<JoinNode>(*node).right;
-    return Rewritten{.node = std::move(node), .right = right};
+    return LiftJoin(correlation, *plain);
   }
   const auto spine = Descend(Mode::kPartitioned, input, &declined, correlation.outer);
   if (!spine.has_value()) {
@@ -3366,9 +3481,7 @@ arrow::Result<Rewritten> MembershipJoin(const Correlation& correlation) {
   const LogicalNodePtr input = StaticGrouping(correlation.join.right);
   LogicalNodePtr declined;
   if (const auto plain = Descend(Mode::kLift, input, &declined, correlation.outer)) {
-    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr node, LiftJoin(correlation, *plain));
-    const LogicalNodePtr right = std::get<JoinNode>(*node).right;
-    return Rewritten{.node = std::move(node), .right = right};
+    return LiftJoin(correlation, *plain);
   }
   const auto spine = Descend(Mode::kPartitioned, input, &declined, correlation.outer);
   if (!spine.has_value()) {
@@ -3526,13 +3639,13 @@ arrow::Result<Rewritten> SingleJoin(const Correlation& correlation) {
     return correlation.RefuseShape();
   }
   if (PlainScalarMaps(correlation, *spine)) {
-    ARROW_ASSIGN_OR_RAISE(auto node, LiftJoin(correlation, *spine));
-    const auto& single = std::get<JoinNode>(*node);
+    ARROW_ASSIGN_OR_RAISE(auto out, LiftJoin(correlation, *spine));
+    const auto& single = std::get<JoinNode>(*out.node);
     // A LIMIT can stop between input batches. A filter or join above the scalar may
     // also move below it. Only check bindings eagerly when every outer row is consumed.
     const bool all_bindings = ConsumesAllBindings(correlation.above);
     if (!single.keys.empty() || EstimateRows(*single.right) == 0 || !all_bindings) {
-      return Rewritten{.node = node, .right = single.right};
+      return out;
     }
     LogicalNodePtr values = spine->below;
     Equivalences equivalences;
@@ -3570,9 +3683,9 @@ void CollectIndependentInputs(const LogicalNodePtr& node, std::set<const Logical
 }
 
 // The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.
-arrow::Result<LogicalNodePtr> UnnestJoin(DependentJoinNode join, ColumnId& last_id,
-                                         int64_t build_side_ratio, std::span<const Ancestor> above,
-                                         UnnestReport* report) {
+arrow::Result<Rewritten> UnnestJoin(DependentJoinNode join, ColumnId& last_id,
+                                    int64_t build_side_ratio, std::span<const Ancestor> above,
+                                    UnnestReport* report) {
   const auto holds_window = [](this const auto& self, const LogicalNodePtr& node) -> bool {
     return std::holds_alternative<WindowNode>(*node) || std::ranges::any_of(InputsOf(*node), self);
   };
@@ -3653,7 +3766,7 @@ arrow::Result<LogicalNodePtr> UnnestJoin(DependentJoinNode join, ColumnId& last_
     return correlation.Refuse(
         "with a potentially failing sibling expression under a middle-block key");
   }
-  return out.node;
+  return out;
 }
 
 // The walk, outermost first as the top-down algorithm goes: a dependent join is rewritten before
@@ -3683,12 +3796,36 @@ class Walker {
   }
 
  private:
+  arrow::Result<LogicalNodePtr> WalkSubstituted(const Rewritten& rewritten,
+                                                const DependentJoinNode& dependent) {
+    // Follow the existing middle input through sibling rewrites. Check work on extra middle
+    // rows, including eager projections. The final deferred item only runs on matched pairs.
+    middle_inputs_.push_back(dependent.left);
+    auto result = Walk(rewritten.node);
+    LogicalNodePtr middle = std::move(middle_inputs_.back());
+    middle_inputs_.pop_back();
+    if (result.ok() && FirstUnsafeInnerNode(*result, /*guarded=*/true, {middle.get()},
+                                            rewritten.deferred_match.get()) != nullptr) {
+      if (dependent.membership.has_value()) {
+        return UnsupportedError(
+            "membership with a middle-block key and a potentially failing "
+            "set expression is not supported",
+            dependent.span);
+      }
+      return UnsupportedError(
+          "nested EXISTS with a middle-block key and a potentially failing "
+          "inner expression is not supported",
+          dependent.span);
+    }
+    return result;
+  }
+
   arrow::Result<LogicalNodePtr> WalkNode(const LogicalNodePtr& node) {
     if (node == nullptr) {
       return node;
     }
     if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
-      ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
+      ARROW_ASSIGN_OR_RAISE(const Rewritten rewritten,
                             UnnestJoin(*dependent, last_id_, build_side_ratio_, above_, report_));
       if (dependent->middle_key == DependentJoinNode::MiddleKey::kUnsafeConsumer) {
         return UnsupportedError(
@@ -3696,28 +3833,18 @@ class Walker {
             "not supported",
             dependent->span);
       }
-      if (dependent->middle_key != DependentJoinNode::MiddleKey::kSubstituted) {
-        return Walk(rewritten);  // its inputs may hold more dependent joins
-      }
-      // Check the rewritten inner EXISTS above its middle input. A membership set that supplied
-      // the key also checks its own work above the outer probe: set filters and projected items
-      // can otherwise run on extra middle rows. Track each left input through sibling rewrites.
-      middle_inputs_.push_back(dependent->left);
-      auto result = Walk(rewritten);
-      LogicalNodePtr middle = std::move(middle_inputs_.back());
-      middle_inputs_.pop_back();
-      if (result.ok() &&
-          FirstUnsafeInnerNode(*result, /*guarded=*/true, {middle.get()}) != nullptr) {
-        if (dependent->membership.has_value()) {
-          return UnsupportedError(
-              "membership with a middle-block key and a potentially failing "
-              "set expression is not supported",
-              dependent->span);
+      const bool guarded = dependent->guard_membership ||
+                           dependent->middle_key == DependentJoinNode::MiddleKey::kSubstituted;
+      ARROW_ASSIGN_OR_RAISE(
+          auto result, guarded ? WalkSubstituted(rewritten, *dependent) : Walk(rewritten.node));
+      if (rewritten.pending_lookups.has_value()) {
+        const auto& join = std::get<JoinNode>(*result);
+        if (WorthNestedLookups(join, above_) && !UnsafeToClone(join.right) &&
+            FreeVariables(*join.right).empty()) {
+          JoinNode keyed = join;
+          keyed.residual.clear();  // The sole residual was the provisional NOT IN comparison.
+          return MembershipLookups(std::move(keyed), *rewritten.pending_lookups, last_id_);
         }
-        return UnsupportedError(
-            "nested EXISTS with a middle-block key and a potentially failing "
-            "inner expression is not supported",
-            dependent->span);
       }
       return result;
     }

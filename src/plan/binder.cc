@@ -7211,8 +7211,8 @@ LogicalNodePtr SubqueryJoinNode(
         .membership = join.left_key.id != kNoColumnId
                           ? std::optional(JoinKey{.left = join.left_key, .right = join.right_key})
                           : std::nullopt,
-        .middle_key =
-            join.guard_membership ? DependentJoinNode::MiddleKey::kSubstituted : middle_key,
+        .middle_key = middle_key,
+        .guard_membership = join.guard_membership,
         .span = join.span});
   } else {
     // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its

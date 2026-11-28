@@ -9526,6 +9526,82 @@ TEST(BinderTest, MiddleEqualityMembershipChecksTheSetAfterBinding) {
   }
 }
 
+TEST(BinderTest, MiddleEqualityMembershipKeepsEagerAndSiblingChecks) {
+  const Catalog catalog = MakeCatalog();
+  const auto refuses = [&](const std::string& sql, std::string_view message) {
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimize(*bound);
+    ASSERT_FALSE(plan.ok());
+    ASSERT_NE(GetSqlError(plan.status()), nullptr);
+    EXPECT_EQ(GetSqlError(plan.status())->kind(), kUnsupported);
+    EXPECT_TRUE(plan.status().message().contains(message)) << plan.status();
+  };
+  refuses(
+      "SELECT g.i16 FROM t g WHERE g.i16 NOT IN (SELECT CAST(m.i64 AS SMALLINT) FROM u m "
+      "WHERE m.i16=g.i16 AND EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16))",
+      "potentially failing set expression");
+  refuses(
+      "SELECT g.i16 FROM t g WHERE g.i16 IN (SELECT m.k FROM "
+      "(SELECT i16 AS k FROM u EXCEPT SELECT CAST(i64 AS SMALLINT) FROM t) m "
+      "WHERE m.k=g.i16 AND EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16))",
+      "potentially failing set expression");
+
+  // A deferred cast over matched x/m pairs can still run on an m that no g binds.
+  const std::string_view exists = "EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)";
+  const std::string_view membership =
+      "m.i16 IN (SELECT CAST(x.i64 AS SMALLINT) FROM t x WHERE x.i16=m.i16 AND "
+      "EXISTS (SELECT 1 FROM ok y WHERE y.i16=m.i16))";
+  for (bool exists_first : {false, true}) {
+    refuses(std::format("SELECT g.i16 FROM t g WHERE EXISTS (SELECT 1 FROM u m WHERE m.i16=g.i16 "
+                        "AND g.i16=2 AND {} AND {})",
+                        exists_first ? exists : membership, exists_first ? membership : exists),
+            "potentially failing sibling expression");
+  }
+}
+
+TEST(BinderTest, MiddleEqualityMembershipChoosesLookupsAfterUnnesting) {
+  Catalog catalog = MakeCatalog();
+  const auto repeated = std::make_shared<FakeTable>(testing::AllTypesSchema(), 8192);
+  repeated->WithStats(0, 0, PartStats{.min = 0, .max = 1, .null_count = 0, .rows = 8192});
+  ASSERT_TRUE(catalog.Register("repeated", repeated).ok());
+  const auto disjoint = std::make_shared<FakeTable>(testing::AllTypesSchema(), 8192);
+  disjoint->WithStats(0, 0, PartStats{.min = 2, .max = 3, .null_count = 0, .rows = 8192});
+  ASSERT_TRUE(catalog.Register("disjoint", disjoint).ok());
+  const auto check = [&](std::string_view middle, std::string_view condition, bool lookups,
+                         std::string_view outer = "repeated") {
+    const auto sql = std::format(
+        "SELECT g.i32 FROM {} g WHERE g.i32 NOT IN "
+        "(SELECT m.i32 FROM {} m WHERE m.i16=g.i16 AND {})",
+        outer, middle, condition);
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    const auto plan = Optimize(*bound);
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    const std::string explain = Explain(*plan);
+    EXPECT_EQ(explain.contains("NOT IN match"), !lookups) << explain;
+    EXPECT_LE(CountOf(explain, "NULL membership"), 1U) << explain;
+    if (lookups) {
+      EXPECT_TRUE(explain.contains("NULL membership")) << explain;
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt);
+  };
+  check("repeated", "EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)", true);
+  check("t", "EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)", false);
+  check("disjoint", "EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)", false);
+  check("repeated", "EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)", false, "disjoint");
+  check("repeated", "EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)", false,
+        "(SELECT i16, i32 FROM t WHERE i16=2)");
+  check("(SELECT i32, i16 FROM repeated LIMIT 10)", "EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)",
+        false);
+  check("(SELECT i16, i32 FROM repeated WHERE i32=2)",
+        "EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)", false);
+  check("repeated", "m.i32>g.i32 AND EXISTS (SELECT 1 FROM ok i WHERE i.i16=g.i16)", false);
+  check("repeated", "m.i32 NOT IN (SELECT x.i32 FROM t x WHERE x.i16=m.i16)", false);
+}
+
 TEST(BinderTest, MiddleEqualityMembershipRequiresAnOrdinaryEquality) {
   const std::string sql =
       "SELECT g.i32 FROM t g WHERE g.i32 NOT IN (SELECT m.i32 FROM u m "
