@@ -6064,6 +6064,8 @@ TEST(QueryGenerator, MiddleEqualityExistsReachesPastTheMiddleTable) {
       {.supported = features.Minus({Feature::kMiddleEqualityExists}), .target_percent = 0});
   int positive = 0;
   int negative = 0;
+  bool saw_in = false;
+  bool saw_not_in = false;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     const auto plain = control.Generate(i);
@@ -6073,12 +6075,17 @@ TEST(QueryGenerator, MiddleEqualityExistsReachesPastTheMiddleTable) {
     }
     SCOPED_TRACE(q.sql);
     EXPECT_FALSE(plain.features.Has(Feature::kMiddleEqualityExists));
-    EXPECT_TRUE(q.features.Has(Feature::kCorrelatedExists));
     const auto parsed = sql::Parse(q.sql);
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     std::vector<const sql::SubqueryExpr*> blocks;
     DeepSubqueries(*parsed, blocks);
     ASSERT_EQ(blocks.size(), 2U);
+    const bool membership = blocks.front()->kind == sql::SubqueryExpr::Kind::kIn;
+    EXPECT_EQ(q.features.Has(Feature::kCorrelatedIn), membership);
+    EXPECT_EQ(q.features.Has(Feature::kCorrelatedExists), !membership);
+    EXPECT_EQ(blocks.back()->kind, sql::SubqueryExpr::Kind::kExists);
+    saw_in |= membership && !blocks.front()->negated;
+    saw_not_in |= membership && blocks.front()->negated;
     const auto& middle = *blocks.front()->query;
     const auto& inner = *blocks.back()->query;
     ASSERT_FALSE(middle.where.empty());
@@ -6099,6 +6106,38 @@ TEST(QueryGenerator, MiddleEqualityExistsReachesPastTheMiddleTable) {
   }
   EXPECT_GT(positive, 0);
   EXPECT_GT(negative, 0);
+  EXPECT_TRUE(saw_in);
+  EXPECT_TRUE(saw_not_in);
+}
+
+TEST(QueryGenerator, MiddleEqualityMembershipBoundsRepeatedKeys) {
+  const auto generator = [](int64_t rows) {
+    auto tables = Tables();
+    for (auto& table : tables) {
+      table.rows = rows;
+    }
+    const auto repeated = Stats(rows, 1, rows);
+    tables.front().refs = {GenRef{.columns = {"i"},
+                                  .table = "big",
+                                  .ref_columns = {"i"},
+                                  .stats = repeated,
+                                  .ref_stats = repeated}};
+    return MakeOver(std::move(tables), 71,
+                    {.supported = kSupportedFeatures.Minus({Feature::kCommaJoin, Feature::kJoinOn}),
+                     .target_percent = 0});
+  };
+  const auto within = generator(100);
+  const auto above = generator(101);
+  const auto nested_membership = [](const GeneratedQuery& query) {
+    return query.features.Has(Feature::kCorrelatedIn) &&
+           query.features.Has(Feature::kMiddleEqualityExists);
+  };
+  bool sampled = false;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    sampled |= nested_membership(within.Generate(i));
+    EXPECT_FALSE(nested_membership(above.Generate(i))) << i;
+  }
+  EXPECT_TRUE(sampled);
 }
 
 TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
@@ -6120,7 +6159,7 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
     ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
     std::vector<const sql::SubqueryExpr*> blocks;
     DeepSubqueries(*parsed, blocks);
-    ASSERT_EQ(blocks.size(), 1U);
+    ASSERT_EQ(blocks.size(), q.features.Has(Feature::kMiddleEqualityExists) ? 2U : 1U);
     EXPECT_EQ(blocks.front()->query->items.size(), 1U);
     EXPECT_FALSE(blocks.front()->query->where.empty());
     if (q.sql.contains("NOT IN")) {
