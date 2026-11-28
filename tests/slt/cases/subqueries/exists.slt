@@ -944,6 +944,24 @@ AND EXISTS (SELECT 1 FROM edge j WHERE j.id = i.id)))
 BIGINT
 12
 
+# A checked cast belongs to an independent, already filtered EXISTS. Substituting the other
+# EXISTS key must leave that cast in place in either conjunct order.
+query I nosort
+SELECT g.id FROM edge g WHERE EXISTS (SELECT 1 FROM edge m WHERE m.id = g.id
+AND EXISTS (SELECT 1 FROM edge x WHERE x.id = m.id AND x.id = 2 AND CAST(x.i64 AS SMALLINT) >= 0)
+AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id)) ORDER BY 1
+----
+INTEGER
+2
+
+query I nosort
+SELECT g.id FROM edge g WHERE EXISTS (SELECT 1 FROM edge m WHERE m.id = g.id
+AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id)
+AND EXISTS (SELECT 1 FROM edge x WHERE x.id = m.id AND x.id = 2 AND CAST(x.i64 AS SMALLINT) >= 0)) ORDER BY 1
+----
+INTEGER
+2
+
 # ---- DuckDB only, for good: DuckDB's error texts ----
 
 onlyif duckdb

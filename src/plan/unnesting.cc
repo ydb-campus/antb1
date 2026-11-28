@@ -3645,17 +3645,39 @@ class Walker {
       : last_id_(last_id), build_side_ratio_(build_side_ratio), report_(report) {}
 
   arrow::Result<LogicalNodePtr> Walk(const LogicalNodePtr& node) {
+    if (middle_inputs_.empty()) {
+      return WalkNode(node);
+    }
+    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr result, WalkNode(node));
+    if (node != result) {
+      for (auto& input : middle_inputs_) {
+        if (input == node) {
+          input = result;
+        }
+      }
+    }
+    return result;
+  }
+
+ private:
+  arrow::Result<LogicalNodePtr> WalkNode(const LogicalNodePtr& node) {
     if (node == nullptr) {
       return node;
     }
     if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
       ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
                             UnnestJoin(*dependent, last_id_, build_side_ratio_, above_, report_));
-      ARROW_ASSIGN_OR_RAISE(LogicalNodePtr result, Walk(rewritten));  // its inputs may hold more
+      if (!dependent->used_middle_key) {
+        return Walk(rewritten);  // its inputs may hold more dependent joins
+      }
       // A substituted key can match middle rows the original outer binding excludes. Check
-      // the operators that actually run, after unused EXISTS items and nested joins are resolved.
-      if (dependent->used_middle_key &&
-          FirstUnsafeInnerNode(result, /*guarded=*/true, dependent->left.get()) != nullptr) {
+      // the operators that actually run, excluding the existing middle input even when an
+      // earlier subquery rewrites that input. Nested substitutions track their own boundary.
+      middle_inputs_.push_back(dependent->left);
+      auto result = Walk(rewritten);
+      LogicalNodePtr middle = std::move(middle_inputs_.back());
+      middle_inputs_.pop_back();
+      if (result.ok() && FirstUnsafeInnerNode(*result, /*guarded=*/true, middle.get()) != nullptr) {
         return UnsupportedError(
             "nested EXISTS with a middle-block key and a potentially failing "
             "inner expression is not supported",
@@ -3686,7 +3708,7 @@ class Walker {
     return changed ? WithInputs(*node, std::move(inputs)) : node;
   }
 
- private:
+  std::vector<LogicalNodePtr> middle_inputs_;
   ColumnId& last_id_;
   int64_t build_side_ratio_;
   UnnestReport* report_;
