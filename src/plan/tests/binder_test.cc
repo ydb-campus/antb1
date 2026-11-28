@@ -9381,13 +9381,15 @@ TEST(BinderTest, CorrelatedMembershipKeepsItsPairAndColumnIds) {
   constexpr const char* kJoinedMembership =
       "SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u JOIN ok ON "
       "u.i16 = ok.i16 AND ok.i16 = t.i64)";
+  constexpr const char* kMixedNotIn =
+      "SELECT i16 FROM t WHERE i32 NOT IN (SELECT CAST(u.i32 AS BIGINT) + t.i32 AS x FROM u "
+      "WHERE u.i64=t.i64 ORDER BY x)";
   for (const char* sql :
        {"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i64 = t.i64)",
         "SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE i64 = t.i64)",
         "SELECT i16 FROM t WHERE i32 IN (SELECT COALESCE(u.i32, t.i32) FROM u WHERE u.i64=t.i64)",
-        "SELECT i16 FROM t WHERE i32 NOT IN (SELECT CAST(u.i32 AS BIGINT) + t.i32 AS x FROM u "
-        "WHERE u.i64=t.i64 ORDER BY x)",
-        "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)", kJoinedMembership,
+        kMixedNotIn, "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)",
+        kJoinedMembership,
         "SELECT i16 FROM t WHERE i32 IN (SELECT t.i64 FROM u WHERE u.i16 = t.i16)"}) {
     SCOPED_TRACE(sql);
     auto bound = BindSql(sql, catalog);
