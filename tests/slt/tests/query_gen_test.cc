@@ -6155,6 +6155,7 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
   int negative = 0;
   int mixed_positive = 0;
   int mixed_negative = 0;
+  int derived = 0;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedIn)) {
@@ -6169,7 +6170,17 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
     DeepSubqueries(*parsed, blocks);
     ASSERT_EQ(blocks.size(), q.features.Has(Feature::kMiddleEqualityExists) ? 2U : 1U);
     EXPECT_EQ(blocks.front()->query->items.size(), 1U);
-    EXPECT_FALSE(blocks.front()->query->where.empty());
+    const auto& set = *blocks.front()->query;
+    if (q.features.Has(Feature::kDerivedCorrelation)) {
+      ++derived;
+      EXPECT_TRUE(set.where.empty());
+      ASSERT_EQ(set.from.size(), 1U);
+      const auto* input = std::get_if<sql::DerivedTable>(&set.from.front().source);
+      ASSERT_NE(input, nullptr);
+      EXPECT_EQ(input->query->where.size(), 1U);
+    } else {
+      EXPECT_FALSE(set.where.empty());
+    }
     const bool mixed = q.features.Has(Feature::kMixedMembershipItem);
     if (mixed) {
       EXPECT_EQ(parsed->from.size(), 1U);
@@ -6188,6 +6199,7 @@ TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
   EXPECT_GT(negative, 10);
   EXPECT_GT(mixed_negative, 0);
   EXPECT_GT(mixed_positive, 0);
+  EXPECT_GT(derived, 0);
 }
 
 // SQ8b's seven block shapes retain SQ8a's keyed correlation and expose their feature tag.
