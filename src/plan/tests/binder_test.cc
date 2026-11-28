@@ -9410,6 +9410,74 @@ TEST(BinderTest, CorrelatedMembershipKeepsItsPairAndColumnIds) {
   }
 }
 
+TEST(BinderTest, CorrelationThroughASoleProjectedInput) {
+  const Catalog catalog = MakeCatalog();
+  constexpr const char* kDerived =
+      "SELECT d.member FROM (SELECT u.i16 FROM u WHERE u.i32=t.i32) d(member)";
+  constexpr const char* kCte =
+      "WITH d(member) AS (SELECT u.i16 FROM u WHERE u.i32=t.i32) SELECT t.member FROM d t";
+  for (const std::string_view condition : {"EXISTS", "NOT EXISTS", "t.i16 IN", "t.i16 NOT IN"}) {
+    for (const char* input : {kDerived, kCte}) {
+      const std::string sql = std::format("SELECT t.i16 FROM t WHERE {} ({})", condition, input);
+      SCOPED_TRACE(sql);
+      const auto bound = BindSql(sql, catalog);
+      ASSERT_TRUE(bound.ok()) << bound.status();
+      EXPECT_EQ(PositionMismatch(*bound), std::nullopt);
+      const auto optimized = Optimize(*bound);
+      ASSERT_TRUE(optimized.ok()) << optimized.status();
+      EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+      EXPECT_TRUE(FreeVariables(*optimized->root).empty());
+      EXPECT_FALSE(Explain(*optimized).contains("DependentJoin"));
+      const JoinNode* join = testing::FirstJoin(*optimized);
+      ASSERT_NE(join, nullptr);
+      EXPECT_FALSE(join->keys.empty());
+    }
+  }
+}
+
+TEST(BinderTest, ProjectedInputCorrelationStopsAtOtherBoundaries) {
+  const Catalog catalog = MakeCatalog();
+  constexpr const char* kWithLimit =
+      "SELECT t.i16 FROM t WHERE EXISTS "
+      "(SELECT 1 FROM (SELECT u.i16 FROM u WHERE u.i32=t.i32 LIMIT 1) d)";
+  constexpr const char* kWithSibling =
+      "SELECT t.i16 FROM t WHERE EXISTS "
+      "(SELECT 1 FROM ok, (SELECT u.i16 FROM u WHERE u.i32=t.i32) d)";
+  constexpr const char* kLateral = "SELECT t.i16 FROM t, (SELECT u.i16 FROM u WHERE u.i32=t.i32) d";
+  constexpr const char* kCheckedSource =
+      "WITH source AS (SELECT i32, CAST(i64 AS SMALLINT) AS v FROM u) "
+      "SELECT t.i16 FROM t WHERE t.i16 IN "
+      "(SELECT d.v FROM (SELECT i.v FROM source i WHERE i.i32=t.i32) d)";
+  for (const char* sql : {kWithLimit, kWithSibling, kLateral, kCheckedSource}) {
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok());
+    const auto detail = GetSqlError(bound.status());
+    ASSERT_NE(detail, nullptr) << bound.status();
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_EQ(SpanText(sql, bound.status()), "t.i32");
+  }
+}
+
+TEST(BinderTest, ProjectedInputCorrelationRejectsExistsAboveGrouping) {
+  const Catalog catalog = MakeCatalog();
+  constexpr const char* kHaving =
+      "SELECT t.i32 FROM t GROUP BY t.i32 "
+      "HAVING EXISTS (SELECT 1 FROM (SELECT u.i16 FROM u WHERE u.i32=t.i32) d)";
+  constexpr const char* kGroupedItem =
+      "SELECT t.i32, CASE WHEN EXISTS (WITH d AS (SELECT u.i16 FROM u WHERE u.i32=t.i32) "
+      "SELECT 1 FROM d) THEN 1 ELSE 0 END FROM t GROUP BY t.i32";
+  for (const char* sql : {kHaving, kGroupedItem}) {
+    SCOPED_TRACE(sql);
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok());
+    const auto detail = GetSqlError(bound.status());
+    ASSERT_NE(detail, nullptr) << bound.status();
+    EXPECT_EQ(detail->kind(), kUnsupported);
+    EXPECT_EQ(SpanText(sql, bound.status()), "EXISTS");
+  }
+}
+
 TEST(BinderTest, MixedMembershipHashesItemsSuppliedByCorrelationKeys) {
   const Catalog catalog = MakeCatalog();
   for (const std::string_view op : {"IN", "NOT IN"}) {
