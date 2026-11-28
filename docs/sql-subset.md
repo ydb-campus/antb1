@@ -718,7 +718,13 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   block's aggregates (SQ13 too) exit 4 once their blocks bind. SQ8c also answers a nested correlated scalar value
   or EXISTS in a conjunct that reads the enclosing block itself: each nested subquery binds to its immediate
   enclosing block, and the outer reference stays in the containing block's correlated filter. The existing key
-  and representative requirements still apply; a reference two blocks out remains unsupported. The unnesting's
+  and representative requirements still apply. In a nested `[NOT] EXISTS` conjunct of an `EXISTS` block's
+  `WHERE`, an ordinary equality between an inner column and a column two blocks out can use a middle-block
+  column of the same type. The middle `WHERE` must equate those columns, directly or through a chain of
+  ordinary column equalities that every passing row satisfies. The equality filters NULLs and preserves
+  duplicate outer rows. Names resolve in the nearest visible scope before substitution. The inner plan must
+  be safe to evaluate for middle rows whose key no outer row binds. A checked expression that could fail on
+  such a row gives exit code 4. The unnesting's
   refusals (for example, an inequality-only scalar aggregate whose binding source contains a LIMIT)
   come once the whole query is bound, after every bind error. A
   correlated `EXISTS` block binds its clauses before the unnesting checks its shape, so its own bind errors
@@ -734,8 +740,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   A subquery in an inner join's `ON` sees its block's FROM items as that `ON` does (rule 10 of
   [ADR 0022](adr/0022-joins-and-query-blocks.md)): an outer name there never resolves to a later item, as in DuckDB. An
   outer reference is read only in a `WHERE` conjunct of the subquery's own block, an inner join's `ON` included, and
-  only one block out; in a select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or a `FULL JOIN`'s `ON`,
-  further out, or in a derived table or a CTE (a lateral reference) it is exit code 4 at the reference, each with its
+  can reach two blocks out through the middle-block equality above. Other distant references, references in a
+  select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or `FULL JOIN`'s `ON`, and references in a
+  derived table or a CTE (a lateral reference) give exit code 4 at the reference, each with its
   own message. A star in an `EXISTS` block is checked by name but not expanded (but under an uncorrelated block's
   `DISTINCT`): a `GROUP BY` or `ORDER BY` position there counts its columns, and one that names a column of it is exit
   code 4 (one out of range is a bind error, as in DuckDB);

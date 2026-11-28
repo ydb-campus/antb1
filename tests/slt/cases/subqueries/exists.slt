@@ -865,6 +865,85 @@ SELECT COUNT(*) FROM trips WHERE tr_fare > 25 OR EXISTS (SELECT * FROM riders WH
 BIGINT
 1114
 
+# ---- SQ10: ordinary equality through a middle EXISTS ----
+
+# The middle equality can follow the nested subquery. Only cities with a qualifying zone survive.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM riders r
+WHERE EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id AND z.zn_id > 30)
+AND c.ct_id = r.rd_city) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# A nullable, duplicated outer city key. The outer anti join keeps unmatched rows, including NULLs.
+query III nosort
+SELECT z.zn_city, COUNT(*), COUNT(z.zn_city) FROM zones z WHERE NOT EXISTS (SELECT * FROM riders r
+WHERE r.rd_city = z.zn_city AND NOT EXISTS (SELECT * FROM cities c WHERE z.zn_city = c.ct_id AND c.ct_id > 1))
+GROUP BY z.zn_city ORDER BY 1
+----
+SMALLINT	BIGINT	BIGINT
+2	8	8
+3	7	7
+4	7	7
+5	8	8
+9	1	1
+NULL	1	0
+
+# The middle column proves two distinct outer column IDs equal. The inner comparison uses the
+# second one, and the middle block still tests both equalities on the original rows.
+query I nosort
+SELECT COUNT(*) FROM cities c CROSS JOIN riders r WHERE EXISTS (SELECT * FROM zones z
+WHERE z.zn_city = c.ct_id AND c.ct_id = r.rd_city
+AND EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city AND d.dv_city > 1))
+----
+BIGINT
+155
+
+# The innermost alias shadows the outer relation for one comparison. The unqualified city ID
+# in the other comparison is visible only two blocks out. The outer ct_id never exceeds 30.
+query I nosort
+SELECT c.ct_id FROM (SELECT ct_id, ct_id AS outer_key FROM cities) c WHERE EXISTS
+(SELECT * FROM riders r WHERE r.rd_city = c.outer_key AND EXISTS
+(SELECT * FROM (SELECT zn_city, zn_id AS ct_id FROM zones) c WHERE c.zn_city = outer_key AND c.ct_id > 30))
+ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# Empty innermost input. Every middle row passes NOT EXISTS, but only matching outer rows survive.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND NOT EXISTS (SELECT * FROM promos p WHERE p.pm_id = c.ct_id)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# Evaluating this sum for all candidate pairs before the outer guard could overflow.
+# DuckDB evaluates the surviving binding. antb1 refuses until it can restrict the nested join.
+onlyif duckdb
+query I nosort
+SELECT g.id FROM edge g WHERE EXISTS (SELECT 1 FROM edge m WHERE m.id = g.id AND g.id = 2
+AND EXISTS (SELECT 1 FROM edge i WHERE i.id = g.id AND i.i64 + m.i64 >= 0))
+----
+INTEGER
+2
+
+# An unused SELECT item cannot fail. The second nested EXISTS adds a safe one-level correlation.
+query I nosort
+SELECT COUNT(*) FROM edge g WHERE EXISTS (SELECT 1 FROM edge m WHERE m.id = g.id
+AND EXISTS (SELECT CAST(i.i64 AS SMALLINT) FROM edge i WHERE i.id = g.id
+AND EXISTS (SELECT 1 FROM edge j WHERE j.id = i.id)))
+----
+BIGINT
+12
+
 # ---- DuckDB only, for good: DuckDB's error texts ----
 
 onlyif duckdb

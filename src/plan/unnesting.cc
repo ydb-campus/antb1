@@ -1985,9 +1985,13 @@ bool ReadsEmptyScan(const LogicalNodePtr& input) {
 }
 
 // A derived table may hide a checked expression behind an ordinary column reference.
-const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded = false) {
+const LogicalNode* FirstUnsafeInnerNode(const LogicalNodePtr& input, bool guarded = false,
+                                        const LogicalNode* existing_input = nullptr) {
+  if (input.get() == existing_input) {
+    return nullptr;
+  }
   for (const auto& child : InputsOf(*input)) {
-    if (const auto* unsafe = FirstUnsafeInnerNode(child, guarded)) {
+    if (const auto* unsafe = FirstUnsafeInnerNode(child, guarded, existing_input)) {
       return unsafe;
     }
   }
@@ -3647,7 +3651,17 @@ class Walker {
     if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
       ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
                             UnnestJoin(*dependent, last_id_, build_side_ratio_, above_, report_));
-      return Walk(rewritten);  // its inputs may hold more
+      ARROW_ASSIGN_OR_RAISE(LogicalNodePtr result, Walk(rewritten));  // its inputs may hold more
+      // A substituted key can match middle rows the original outer binding excludes. Check
+      // the operators that actually run, after unused EXISTS items and nested joins are resolved.
+      if (dependent->used_middle_key &&
+          FirstUnsafeInnerNode(result, /*guarded=*/true, dependent->left.get()) != nullptr) {
+        return UnsupportedError(
+            "nested EXISTS with a middle-block key and a potentially failing "
+            "inner expression is not supported",
+            dependent->span);
+      }
+      return result;
     }
     std::vector<LogicalNodePtr> inputs = InputsOf(*node);
     bool changed = false;

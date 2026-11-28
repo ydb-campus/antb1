@@ -610,6 +610,9 @@ struct DependentJoinNode {
   // probe with the completed right block's item, after its grouping and HAVING. The correlation
   // remains in the right input; NOT IN adds the pair's NULL checks only when unnested.
   std::optional<JoinKey> membership;
+  // SQ10: the inner condition substituted a key from two blocks out. Its evaluation must be
+  // safe for middle rows that the original outer binding would exclude.
+  bool used_middle_key = false;
   SourceSpan span;  // the subquery in the query
 };
 
