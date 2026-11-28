@@ -8,6 +8,7 @@
 #include "../shared_builds.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -382,6 +383,107 @@ TEST_F(SharedBuildsTest, ComputesARepeatedSubPlanOnceAndKeepsTheAnswer) {
       << without->rows->ToString();
 }
 
+TEST_F(SharedBuildsTest, ProfilesTheProducerAndPointsEveryReaderAtIt) {
+  const auto table = KeyedTable();
+  table->set_claimed_rows(20'000'000);
+  const auto plan = PlanOf(kTwiceReferencedCte, table);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(*plan, &profile);
+  ASSERT_TRUE(op.ok()) << op.status();
+  MemoryBudget budget(int64_t{1024} * 1024 * 1024);
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .budget = &budget};
+  const auto rows = Drain(**op, ctx);
+  ASSERT_TRUE(rows.ok()) << rows.status();
+
+  std::vector<const ProfileNode*> readers;
+  const auto walk = [&](const auto& self, const ProfileNode& node) -> void {
+    if (node.name() == "Scan" && node.detail().contains("source=shared")) {
+      readers.push_back(&node);
+    }
+    for (const ProfileNode* child : node.children()) {
+      self(self, *child);
+    }
+  };
+  walk(walk, profile);
+  ASSERT_EQ(readers.size(), 2U);
+  const ProfileNode* producer = readers[0]->shared_producer();
+  ASSERT_NE(producer, nullptr);
+  EXPECT_EQ(readers[1]->shared_producer(), producer);
+  EXPECT_TRUE(readers[0]->detail().contains("source=shared#1"));
+  EXPECT_TRUE(readers[1]->detail().contains("source=shared#1"));
+  EXPECT_EQ(producer->name(), "Project");
+  const ProfileNode* aggregate = nullptr;
+  const auto find_aggregate = [&](const auto& self, const ProfileNode& node) -> void {
+    if (node.name() == "PartGroupAggregate") {
+      aggregate = &node;
+    }
+    for (const ProfileNode* child : node.children()) {
+      self(self, *child);
+    }
+  };
+  find_aggregate(find_aggregate, *producer);
+  ASSERT_NE(aggregate, nullptr);
+  EXPECT_EQ(aggregate->rows(), 7);
+  EXPECT_TRUE(readers[0]->children().empty());
+  EXPECT_TRUE(readers[1]->children().empty());
+  const auto reachable = [&](const auto& self, const ProfileNode& node) -> bool {
+    if (&node == producer) {
+      return true;
+    }
+    return std::ranges::any_of(node.children(),
+                               [&](const ProfileNode* child) { return self(self, *child); });
+  };
+  EXPECT_FALSE(reachable(reachable, profile));
+}
+
+TEST_F(SharedBuildsTest, NumbersEachSharedResultSoItsReadersMatch) {
+  const auto table = KeyedTable();
+  table->set_claimed_rows(20'000'000);
+  constexpr std::string_view kSql =
+      "WITH g AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k), "
+      "h AS (SELECT k, SUM(v) AS s FROM t GROUP BY k) "
+      "SELECT COUNT(*) FROM g AS a, g AS b, h AS c, h AS d "
+      "WHERE a.k = b.k AND a.k = c.k AND c.k = d.k";
+  const auto plan = PlanOf(kSql, table);
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(*plan, &profile);
+  ASSERT_TRUE(op.ok()) << op.status();
+
+  std::vector<const ProfileNode*> readers;
+  const auto walk = [&](const auto& self, const ProfileNode& node) -> void {
+    if (node.name() == "Scan" && node.detail().contains("source=shared#")) {
+      readers.push_back(&node);
+    }
+    for (const ProfileNode* child : node.children()) {
+      self(self, *child);
+    }
+  };
+  walk(walk, profile);
+  ASSERT_EQ(readers.size(), 4U);
+  std::array<const ProfileNode*, 3> producer_of{};
+  std::array<int, 3> scans_of{};
+  for (const ProfileNode* reader : readers) {
+    const auto at = reader->detail().find("source=shared#");
+    ASSERT_NE(at, std::string::npos);
+    const int id = reader->detail()[at + std::string_view("source=shared#").size()] - '0';
+    ASSERT_GE(id, 1);
+    ASSERT_LE(id, 2);
+    const ProfileNode* producer = reader->shared_producer();
+    ASSERT_NE(producer, nullptr);
+    if (producer_of[static_cast<std::size_t>(id)] == nullptr) {
+      producer_of[static_cast<std::size_t>(id)] = producer;
+    } else {
+      EXPECT_EQ(producer_of[static_cast<std::size_t>(id)], producer);
+    }
+    ++scans_of[static_cast<std::size_t>(id)];
+  }
+  EXPECT_EQ(scans_of[1], 2);
+  EXPECT_EQ(scans_of[2], 2);
+  EXPECT_NE(producer_of[1], producer_of[2]);
+}
+
 TEST_F(SharedBuildsTest, ReleasesOversizedResultAndReopensWithTheOriginalPlan) {
   const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
   const auto values =
@@ -418,6 +520,42 @@ TEST_F(SharedBuildsTest, ReleasesOversizedResultAndReopensWithTheOriginalPlan) {
   EXPECT_EQ(producer_builds, 2);
   EXPECT_EQ(shared_scan_calls->opens(), 0);
   EXPECT_EQ(fallback_builds, 1);
+}
+
+TEST_F(SharedBuildsTest, FallbackProfileNamesTheOriginalPlan) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto values =
+      testing::Int64s(std::vector<std::optional<int64_t>>(std::size_t{128} * 1024, 7));
+  const auto large = arrow::RecordBatch::Make(schema, values->length(), {values});
+  const auto small = large->Slice(0, 1);
+  const auto make_producer = [&] {
+    return std::make_unique<testing::ScriptedSource>(schema,
+                                                     std::vector<Batch>(257, Batch{.data = large}));
+  };
+  std::vector<SharedBuild> builds;
+  builds.push_back({.table = std::make_shared<MaterializedTable>(schema),
+                    .first_producer = make_producer(),
+                    .make_producer = make_producer});
+  MemoryBudget budget(int64_t{512} * 1024 * 1024);
+  ProfileNode profile;
+  SharedBuildsOperator op(std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{}),
+                          std::move(builds), [&](ProfileNode* slot) {
+                            if (slot != nullptr) {
+                              slot->set_name("ScalarAggregate");
+                              slot->set_detail("Aggregate COUNT(*)");
+                            }
+                            return std::make_unique<testing::ScriptedSource>(
+                                schema, std::vector<Batch>{{.data = small}});
+                          });
+  op.set_profile(&profile);
+  const auto rows = Drain(op, ExecContext{.budget = &budget});
+  ASSERT_TRUE(rows.ok()) << rows.status();
+  EXPECT_EQ(testing::SingleInt64(**rows), 7);
+  const ProfileNode* fallback = profile.fallback_plan();
+  ASSERT_NE(fallback, nullptr);
+  EXPECT_EQ(fallback->name(), "ScalarAggregate");
+  EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 1);
+  EXPECT_EQ(profile.children().back(), fallback);
 }
 
 TEST_F(SharedBuildsTest, ReleasesBothProducersAndTheirReservationsBeforeBudgetFallback) {

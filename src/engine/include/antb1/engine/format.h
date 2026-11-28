@@ -33,9 +33,13 @@ enum class ProfileFormat { kText, kJson };
 // earlier input). Each line is the operator's name, its logical node's EXPLAIN text, and in
 // brackets its rows, time (and self time when its inputs ran on the same thread), runs (per part)
 // and metrics. A HashBuild is drawn under its HashJoin, before the probe when the join builds on
-// the left and after it when the join builds on the right. kJson: the same operators
+// the left and after it when the join builds on the right. A shared producer is drawn in full
+// under the first consumer in that order; later consumers keep their own metrics and no subtree.
+// When sharing is dropped at runtime, the text is the original plan, with the attempt's `shared`
+// and `shared_fallbacks` metrics on its root. kJson: the same operators
 // as one object, times in nanoseconds, memory in bytes, with each HashBuild left on the operator
-// that prepares it.
+// that prepares it. The shared producer is an input of the same first consumer. A dropped attempt
+// is the original plan object.
 std::string FormatProfile(const QueryProfile& profile, ProfileFormat format);
 
 // Renders a physical plan nobody ran (`antb1 explain --physical`, Session::ExplainPhysical): the

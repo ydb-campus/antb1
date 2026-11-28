@@ -117,6 +117,9 @@ arrow::Status SharedBuildsOperator::PrepareFallback(ExecContext& ctx) {
       ProfileNode* fallback_profile =
           profile() == nullptr ? nullptr : profile()->Child(profile()->children().size());
       ARROW_ASSIGN_OR_RAISE(unshared_, fallback_(fallback_profile));
+      if (fallback_profile != nullptr) {
+        profile()->set_fallback_plan(fallback_profile);
+      }
     }
     use_fallback_ = true;
     if (profile() != nullptr) {

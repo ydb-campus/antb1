@@ -47,6 +47,15 @@ class ProfileNode {
   // Input `index` (created when missing; the nodes of a part pipeline are created by its first
   // build and found again by the builds of the other parts). Thread-safe.
   ProfileNode* Child(std::size_t index);
+  // A shared producer's profile. Owned here, and not an input: EXPLAIN draws it under the first
+  // consumer and leaves the others as scans of the retained result. Plan time only.
+  ProfileNode* Park();
+  // The producer parked for a scan of a shared result. Plan time, on the first build of that scan.
+  void set_shared_producer(const ProfileNode* producer) { shared_producer_ = producer; }
+  [[nodiscard]] const ProfileNode* shared_producer() const { return shared_producer_; }
+  // Set when sharing was dropped and the original plan ran. EXPLAIN shows that plan.
+  void set_fallback_plan(const ProfileNode* plan) { fallback_plan_ = plan; }
+  [[nodiscard]] const ProfileNode* fallback_plan() const { return fallback_plan_; }
 
   // While the query runs; thread-safe.
   void AddRows(int64_t rows) {
@@ -96,6 +105,9 @@ class ProfileNode {
   mutable std::mutex mutex_;
   std::vector<ProfileMetric> metrics_;
   std::vector<std::unique_ptr<ProfileNode>> children_;
+  std::vector<std::unique_ptr<ProfileNode>> parked_;
+  const ProfileNode* shared_producer_ = nullptr;
+  const ProfileNode* fallback_plan_ = nullptr;
 };
 
 // Adds the time from its construction to its destruction to duration metric `name` of `node`;
