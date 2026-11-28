@@ -2609,7 +2609,7 @@ TEST(OptimizerTest, RestrictsLargeScalarGroupsOnlyForSelectiveOuterGuards) {
   table->WithParts({kPart, kPart});
   for (int part = 0; part < 2; ++part) {
     table->WithStats(part, 0, {.min = 1, .max = 50, .rows = kPart})
-        .WithStats(part, 1, {.min = part * kPart + 1, .max = (part + 1) * kPart, .rows = kPart})
+        .WithStats(part, 1, {.min = (part * kPart) + 1, .max = (part + 1) * kPart, .rows = kPart})
         .WithStats(part, 3, {.min = 1, .max = 60000, .rows = kPart})
         .WithStats(part, 7, {.min = 1, .max = kRows, .rows = kPart});
   }
