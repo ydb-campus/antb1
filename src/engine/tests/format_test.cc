@@ -688,6 +688,97 @@ TEST(FormatPhysicalPlanTest, DrawsASharedProducerUnderTheFirstConsumer) {
   EXPECT_EQ(json.find("PartGroupAggregate"), json.rfind("PartGroupAggregate")) << json;
 }
 
+TEST(FormatProfileTest, PrintsTheProducerUnderTheFirstSharedScan) {
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("PartAggregate");
+  root->set_detail("Aggregate COUNT(*)");
+  exec::ProfileNode& join = *root->Child(0);
+  join.set_name("HashJoin");
+  join.set_detail("Join INNER build=left keys=[u.k = t.k]");
+  join.set_per_part(true);
+  exec::ProfileNode& probe = *join.Child(0);
+  probe.set_name("Scan");
+  probe.set_detail("Scan table=shared source=shared#1 columns=[key0, agg0]");
+  probe.set_per_part(true);
+  probe.AddRows(100);
+  exec::ProfileNode& build = *root->Child(1);
+  build.set_name("HashBuild");
+  build.set_detail("Join INNER build=left keys=[u.k = t.k]");
+  exec::ProfileNode& left = *build.Child(0);
+  left.set_name("Scan");
+  left.set_detail("Scan table=shared source=shared#1 columns=[key0, agg0]");
+  left.AddRows(100);
+  exec::ProfileNode& producer = *root->Park();
+  producer.set_name("PartGroupAggregate");
+  producer.set_detail("GroupAggregate keys=[k] COUNT(*)");
+  producer.AddRows(100);
+  exec::ProfileNode& input = *producer.Child(0);
+  input.set_name("Scan");
+  input.set_detail("Scan table=t source=memory columns=[k]");
+  input.set_per_part(true);
+  input.AddRows(60);
+  probe.set_shared_producer(&producer);
+  left.set_shared_producer(&producer);
+  const QueryProfile profile{.output = "Output: c:BIGINT", .root = root, .threads = 1};
+  EXPECT_EQ(FormatProfile(profile, ProfileFormat::kText),
+            "Output: c:BIGINT\n"
+            "Total: time=0.000ms rows=0 peak_memory=0 bytes threads=1\n"
+            "PartAggregate Aggregate COUNT(*)  [rows=0 batches=0 time=0.000ms self=0.000ms]\n"
+            "└─HashJoin Join INNER build=left keys=[u.k = t.k]  [rows=0 batches=0 parts=0 "
+            "time=0.000ms (summed over parts) self=0.000ms]\n"
+            "  ├─HashBuild Join INNER build=left keys=[u.k = t.k]  [rows=0 batches=0 "
+            "time=0.000ms self=0.000ms]\n"
+            "  │ └─Scan table=shared source=shared#1 columns=[key0, agg0]  [rows=100 batches=1 "
+            "time=0.000ms]\n"
+            "  │   └─PartGroupAggregate GroupAggregate keys=[k] COUNT(*)  [rows=100 batches=1 "
+            "time=0.000ms]\n"
+            "  │     └─Scan table=t source=memory columns=[k]  [rows=60 batches=1 parts=0 "
+            "time=0.000ms (summed over parts)]\n"
+            "  └─Scan table=shared source=shared#1 columns=[key0, agg0]  [rows=100 batches=1 "
+            "parts=0 time=0.000ms (summed over parts)]\n");
+}
+
+TEST(FormatProfileTest, ANestedDroppedSharePrintsTheOriginalPlan) {
+  constexpr int64_t kMs = int64_t{1000} * 1000;
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("DeferredDimensionJoin");
+  root->set_detail("verify unique, non-NULL surrogate and business keys");
+  exec::ProfileNode& shared = *root->Child(0);
+  shared.set_name("PartAggregate");
+  shared.set_detail("Aggregate COUNT(*)");
+  shared.Add("shared", exec::MetricUnit::kNanos, 5 * kMs);
+  shared.Add("shared_fallbacks", exec::MetricUnit::kCount, 1);
+  exec::ProfileNode& abandoned = *shared.Child(0);
+  abandoned.set_name("Scan");
+  abandoned.set_detail("Scan table=shared source=shared#1 columns=[k]");
+  abandoned.AddRows(100);
+  exec::ProfileNode& fallback = *shared.Child(1);
+  fallback.set_name("ScalarAggregate");
+  fallback.set_detail("Aggregate COUNT(*)");
+  fallback.AddRows(1);
+  fallback.AddTime(std::chrono::nanoseconds(kMs));
+  exec::ProfileNode& scan = *fallback.Child(0);
+  scan.set_name("Scan");
+  scan.set_detail("Scan table=t source=memory columns=[k]");
+  scan.AddRows(60);
+  scan.AddTime(std::chrono::nanoseconds(2 * kMs));
+  shared.set_fallback_plan(&fallback);
+  const QueryProfile profile{.output = "Output: c:BIGINT", .root = root, .threads = 1};
+  EXPECT_EQ(FormatProfile(profile, ProfileFormat::kText),
+            "Output: c:BIGINT\n"
+            "Total: time=0.000ms rows=0 peak_memory=0 bytes threads=1\n"
+            "DeferredDimensionJoin verify unique, non-NULL surrogate and business keys  "
+            "[rows=0 batches=0 time=0.000ms self=0.000ms]\n"
+            "└─ScalarAggregate Aggregate COUNT(*)  [rows=1 batches=1 time=1.000ms self=0.000ms "
+            "shared=5.000ms shared_fallbacks=1]\n"
+            "  └─Scan table=t source=memory columns=[k]  [rows=60 batches=1 time=2.000ms]\n");
+  const std::string json = FormatProfile(profile, ProfileFormat::kJson);
+  EXPECT_EQ(json.find("source=shared"), std::string::npos) << json;
+  EXPECT_NE(json.find(R"("name":"ScalarAggregate")"), std::string::npos) << json;
+  EXPECT_NE(json.find(R"("shared_fallbacks":1)"), std::string::npos) << json;
+  EXPECT_NE(json.find(R"("shared_ns":5000000)"), std::string::npos) << json;
+}
+
 TEST(FormatProfileTest, ADroppedSharePrintsTheOriginalPlan) {
   constexpr int64_t kMs = int64_t{1000} * 1000;
   auto root = std::make_shared<exec::ProfileNode>();

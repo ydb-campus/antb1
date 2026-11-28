@@ -143,6 +143,9 @@ std::string_view DetailText(const exec::ProfileNode& node) {
 // the operator that prepares it.
 struct Drawn {
   const exec::ProfileNode* node = nullptr;
+  // Set when `node` replaced a shared plan that was dropped. Its preparation metrics are printed
+  // on this line.
+  const exec::ProfileNode* abandoned = nullptr;
   std::vector<Drawn> children;
 };
 
@@ -228,6 +231,14 @@ void OrderJoinSides(Drawn& drawn) {
 }
 
 Drawn Draw(const exec::ProfileNode& node, std::vector<const exec::ProfileNode*>& queue) {
+  // A nested shared plan can drop its result too. Show the original plan in its place, and do
+  // not let that plan claim HashBuilds that belong to the operator above it.
+  if (const exec::ProfileNode* fallback = node.fallback_plan()) {
+    std::vector<const exec::ProfileNode*> none;
+    Drawn drawn = Draw(*fallback, none);
+    drawn.abandoned = &node;
+    return drawn;
+  }
   Drawn drawn{.node = &node};
   std::vector<const exec::ProfileNode*> own;
   std::vector<const exec::ProfileNode*> lifted;
@@ -290,10 +301,9 @@ void AttachShared(Drawn& drawn, std::vector<const exec::ProfileNode*>& seen) {
 
 // One line per operator, root first. Without `counters` -- a plan nobody ran
 // (FormatPhysicalPlan) -- the line ends after the operator and its logical node, since rows, times
-// and metrics are what a run measures and this node has never been through one. `abandoned` is
-// consulted on the root line only, to keep the dropped attempt's counters on the plan that ran.
+// and metrics are what a run measures and this node has never been through one.
 void Write(const Drawn& drawn, std::string_view prefix, bool last, bool root, bool counters,
-           const exec::ProfileNode* abandoned, std::string& out) {
+           std::string& out) {
   const exec::ProfileNode& node = *drawn.node;
   std::string line;
   if (!root) {
@@ -316,7 +326,7 @@ void Write(const Drawn& drawn, std::string_view prefix, bool last, bool root, bo
     if (HasInputInside(node)) {
       line += std::format(" self={}", Duration(SelfTime(node)));
     }
-    for (const exec::ProfileMetric& metric : DisplayMetrics(node, root ? abandoned : nullptr)) {
+    for (const exec::ProfileMetric& metric : DisplayMetrics(node, drawn.abandoned)) {
       line += std::format(" {}={}", metric.name, MetricText(metric));
     }
     line += ']';
@@ -327,29 +337,16 @@ void Write(const Drawn& drawn, std::string_view prefix, bool last, bool root, bo
     child_prefix += last ? "  " : "│ ";
   }
   for (std::size_t i = 0; i < drawn.children.size(); ++i) {
-    Write(drawn.children[i], child_prefix, i + 1 == drawn.children.size(), false, counters, nullptr,
-          out);
+    Write(drawn.children[i], child_prefix, i + 1 == drawn.children.size(), false, counters, out);
   }
-}
-
-// The node EXPLAIN shows. A dropped shared plan is replaced by the original plan that ran.
-const exec::ProfileNode* Shown(const exec::ProfileNode& node, const exec::ProfileNode*& abandoned) {
-  if (const exec::ProfileNode* fallback = node.fallback_plan()) {
-    abandoned = &node;
-    return fallback;
-  }
-  abandoned = nullptr;
-  return &node;
 }
 
 void Text(const exec::ProfileNode& node, bool counters, std::string& out) {
-  const exec::ProfileNode* abandoned = nullptr;
-  const exec::ProfileNode* shown = Shown(node, abandoned);
   std::vector<const exec::ProfileNode*> pending;
-  Drawn drawn = Draw(*shown, pending);
+  Drawn drawn = Draw(node, pending);
   std::vector<const exec::ProfileNode*> seen;
   AttachShared(drawn, seen);
-  Write(drawn, "", false, true, counters, abandoned, out);
+  Write(drawn, "", false, true, counters, out);
 }
 
 // Nodes whose drawn children include the shared producer. Text and JSON then expand the same scan,
@@ -367,13 +364,19 @@ void CollectOwners(const Drawn& drawn, std::vector<const exec::ProfileNode*>& ow
 }
 
 void Json(const exec::ProfileNode& node, const std::vector<const exec::ProfileNode*>& owners,
-          const exec::ProfileNode* abandoned, std::string& out) {
+          std::string& out) {
+  const exec::ProfileNode* abandoned = nullptr;
+  const exec::ProfileNode* shown = &node;
+  if (const exec::ProfileNode* fallback = node.fallback_plan()) {
+    shown = fallback;
+    abandoned = &node;
+  }
   out += std::format(
       R"({{"name":"{}","detail":"{}","per_part":{},"runs":{},"rows":{},"batches":{},"time_ns":{},"self_time_ns":{},"metrics":{{)",
-      JsonEscape(node.name()), JsonEscape(node.detail()), node.per_part() ? "true" : "false",
-      node.instances(), node.rows(), node.batches(), node.time().count(), SelfTime(node));
+      JsonEscape(shown->name()), JsonEscape(shown->detail()), shown->per_part() ? "true" : "false",
+      shown->instances(), shown->rows(), shown->batches(), shown->time().count(), SelfTime(*shown));
   bool first = true;
-  for (const exec::ProfileMetric& metric : DisplayMetrics(node, abandoned)) {
+  for (const exec::ProfileMetric& metric : DisplayMetrics(*shown, abandoned)) {
     out +=
         std::format(R"({}"{}":{})", first ? "" : ",", JsonEscape(MetricKey(metric)), metric.value);
     first = false;
@@ -382,28 +385,26 @@ void Json(const exec::ProfileNode& node, const std::vector<const exec::ProfileNo
   first = true;
   const auto emit = [&](const exec::ProfileNode& input) {
     out += first ? "" : ",";
-    Json(input, owners, nullptr, out);
+    Json(input, owners, out);
     first = false;
   };
-  for (const exec::ProfileNode* child : node.children()) {
+  for (const exec::ProfileNode* child : shown->children()) {
     emit(*child);
   }
-  if (std::ranges::contains(owners, &node) && node.shared_producer() != nullptr) {
-    emit(*node.shared_producer());
+  if (std::ranges::contains(owners, shown) && shown->shared_producer() != nullptr) {
+    emit(*shown->shared_producer());
   }
   out += "]}";
 }
 
 void EmitJson(const exec::ProfileNode& node, std::string& out) {
-  const exec::ProfileNode* abandoned = nullptr;
-  const exec::ProfileNode* shown = Shown(node, abandoned);
   std::vector<const exec::ProfileNode*> pending;
-  Drawn drawn = Draw(*shown, pending);
+  Drawn drawn = Draw(node, pending);
   std::vector<const exec::ProfileNode*> seen;
   AttachShared(drawn, seen);
   std::vector<const exec::ProfileNode*> owners;
   CollectOwners(drawn, owners);
-  Json(*shown, owners, abandoned, out);
+  Json(node, owners, out);
 }
 
 }  // namespace

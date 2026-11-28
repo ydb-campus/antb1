@@ -50,6 +50,8 @@ class ProfileNode {
   // A shared producer's profile. Owned here, and not an input: EXPLAIN draws it under the first
   // consumer and leaves the others as scans of the retained result. Plan time only.
   ProfileNode* Park();
+  // Takes ownership of a node built aside, so a declined producer never touches this profile.
+  ProfileNode* Adopt(std::unique_ptr<ProfileNode> node);
   // The producer parked for a scan of a shared result. Plan time, on the first build of that scan.
   void set_shared_producer(const ProfileNode* producer) { shared_producer_ = producer; }
   [[nodiscard]] const ProfileNode* shared_producer() const { return shared_producer_; }

@@ -1959,18 +1959,34 @@ OperatorResult BuildUnconditionalPlan(const plan::LogicalPlan& plan, ProfileNode
     const auto* widened =
         group.widens_join_build ? std::get_if<plan::GroupAggregateNode>(node.get()) : nullptr;
     const bool split = group.separate_partition_states;
-    ProfileNode* const producer_profile = profile == nullptr ? nullptr : profile->Park();
+    // Held aside until the producer is accepted, so a declined group does not park a node on
+    // the guard profile.
+    std::unique_ptr<ProfileNode> held =
+        profile == nullptr ? nullptr : std::make_unique<ProfileNode>();
+    ProfileNode* const producer_profile = held.get();
     auto make_producer = [node, widened, split, predicates = group.reader_predicates, profile,
-                          producer_profile] {
-      return widened != nullptr
-                 ? Builder{.slot = producer_profile}.Grouped(*widened, /*check_widened_build=*/true,
-                                                             split ? &predicates : nullptr, profile)
-                 : Build(node, std::nullopt, producer_profile);
+                          producer_profile]() -> OperatorResult {
+      if (widened == nullptr) {
+        return Build(node, std::nullopt, producer_profile);
+      }
+      // Grouped names the slot but does not wrap the operator, so its rows and time would stay
+      // zero. Profiled is what records them, as Build does for every other producer.
+      ARROW_ASSIGN_OR_RAISE(auto built, Builder{.slot = producer_profile}.Grouped(
+                                            *widened, /*check_widened_build=*/true,
+                                            split ? &predicates : nullptr, profile));
+      if (!built) {
+        return std::unique_ptr<Operator>{};
+      }
+      OperatorResult accepted = std::move(built);
+      return Profiled(std::move(accepted), node, producer_profile);
     };
     ARROW_ASSIGN_OR_RAISE(auto op, make_producer());
     if (!op) {
       declined_split |= split;
       return arrow::Status::OK();
+    }
+    if (held != nullptr) {
+      profile->Adopt(std::move(held));
     }
     if (split) {
       accepted_members.insert(accepted_members.end(), group.members.begin(), group.members.end());

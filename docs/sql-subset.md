@@ -1581,7 +1581,8 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     part of that scan's. If a shared result exceeds the 256 MiB cap, the query budget refuses a
     reservation, or preparation fails, antb1 releases the shared results and producer working
     memory before opening the original plan. In that case, `shared_fallbacks` counts the retry and
-    the profile shows that original plan, with `shared` and `shared_fallbacks` on its root.
+    the profile shows that original plan in place of the shared one, including when the shared plan
+    is nested under another operator, with `shared` and `shared_fallbacks` on the replacement.
   - `wait` (for parts);
   - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;

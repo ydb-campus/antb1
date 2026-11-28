@@ -86,7 +86,8 @@ Proposed
     that printed order. Later consumers stay scans of the retained result, marked `source=shared#N` with
     the same `N` as the scan that shows the producer, and with their own metrics and no subtree.
     JSON adds the producer as an input of that same first consumer. If sharing is dropped while the query runs,
-    both forms show the original plan instead, and keep `shared` and `shared_fallbacks` on its root.
+    both forms show the original plan in place of that shared plan, including when it sits under another
+    operator, and keep `shared` and `shared_fallbacks` on the replacement.
   - Update (2026-10-09, E2a): semi, anti, null-aware anti and one-row joins show the same two lines and metrics. A
     probe has `find` only when it looks keys up: not a one-row join's, nor one that keeps every row or none without
     looking (an anti join over a build without rows, a null-aware anti join over an empty build input or one with a

@@ -75,6 +75,11 @@ arrow::Result<bool> Prepare(SharedBuild& build, ExecContext& ctx) {
 arrow::Status SharedBuildsOperator::Open(ExecContext& ctx) {
   use_fallback_ = false;
   retry_if_empty_ = false;
+  // A previous Open may have fallen back. This run starts from the shared plan; PrepareFallback
+  // sets the pointer again only if this run drops sharing too.
+  if (profile() != nullptr) {
+    profile()->set_fallback_plan(nullptr);
+  }
   int64_t shared_rows = 0;
   for (SharedBuild& build : builds_) {
     const ProfileTimer timer(profile(), "shared");
@@ -114,15 +119,13 @@ arrow::Status SharedBuildsOperator::PrepareFallback(ExecContext& ctx) {
       ctx.scans = std::make_shared<plan::ScanContext>();
     }
     if (unshared_ == nullptr) {
-      ProfileNode* fallback_profile =
+      fallback_profile_ =
           profile() == nullptr ? nullptr : profile()->Child(profile()->children().size());
-      ARROW_ASSIGN_OR_RAISE(unshared_, fallback_(fallback_profile));
-      if (fallback_profile != nullptr) {
-        profile()->set_fallback_plan(fallback_profile);
-      }
+      ARROW_ASSIGN_OR_RAISE(unshared_, fallback_(fallback_profile_));
     }
     use_fallback_ = true;
     if (profile() != nullptr) {
+      profile()->set_fallback_plan(fallback_profile_);
       profile()->Add("shared_fallbacks", MetricUnit::kCount, 1);
     }
     return arrow::Status::OK();

@@ -205,6 +205,8 @@ TEST_F(SharedBuildsTest, OneScanKeepsEachPartitionSumNullsAndJoinMultiplicity) {
   ProfileNode shared;
   auto plan = fixture.Plan(7, true);
   ASSERT_TRUE(plan.ok()) << plan.status();
+  ASSERT_TRUE(std::ranges::any_of(plan::MaterializableSubPlans(*plan),
+                                  &plan::SharedSubPlan::widens_join_build));
   auto got = RunPeriods(*plan, shared, budget);
   ASSERT_TRUE(got.ok()) << got.status();
   EXPECT_EQ(fixture.events->scanned_parts().size(), 6U);
@@ -214,6 +216,21 @@ TEST_F(SharedBuildsTest, OneScanKeepsEachPartitionSumNullsAndJoinMultiplicity) {
   EXPECT_EQ(std::min(first_rows, second_rows), 8);
   EXPECT_EQ(std::max(first_rows, second_rows), 12);
   EXPECT_EQ(MetricSum(shared, "shared_rows"), 6);
+  std::vector<const ProfileNode*> readers;
+  const auto walk = [&](const auto& self, const ProfileNode& node) -> void {
+    if (node.shared_producer() != nullptr) {
+      readers.push_back(&node);
+    }
+    for (const ProfileNode* child : node.children()) {
+      self(self, *child);
+    }
+  };
+  walk(walk, shared);
+  ASSERT_FALSE(readers.empty());
+  const ProfileNode* producer = readers.front()->shared_producer();
+  ASSERT_NE(producer, nullptr);
+  EXPECT_EQ(producer->rows(), MetricSum(shared, "shared_rows"))
+      << "a widened producer is profiled for the rows it retains";
   ASSERT_TRUE((*got)->Equals(**expected));
   // Per-part cancellation gives zero; two matches in the first band count twice.
   const auto combined = (*got)->CombineChunks();
@@ -556,6 +573,41 @@ TEST_F(SharedBuildsTest, FallbackProfileNamesTheOriginalPlan) {
   EXPECT_EQ(fallback->name(), "ScalarAggregate");
   EXPECT_EQ(MetricSum(profile, "shared_fallbacks"), 1);
   EXPECT_EQ(profile.children().back(), fallback);
+}
+
+TEST_F(SharedBuildsTest, ALaterSuccessfulRunClearsTheFallbackProfile) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  constexpr int64_t kRows = 32;
+  const auto values = testing::Int64s(std::vector<std::optional<int64_t>>(kRows, 7));
+  const auto batch = arrow::RecordBatch::Make(schema, kRows, {values});
+  const auto make_producer = [&] {
+    return std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{{.data = batch}});
+  };
+  const auto answer = arrow::RecordBatch::Make(schema, 1, {testing::Int64s({9})});
+  std::vector<SharedBuild> builds;
+  builds.push_back({.table = std::make_shared<MaterializedTable>(schema),
+                    .first_producer = make_producer(),
+                    .make_producer = make_producer});
+  ProfileNode profile;
+  SharedBuildsOperator op(std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{}),
+                          std::move(builds), [&](ProfileNode* slot) {
+                            if (slot != nullptr) {
+                              slot->set_name("ScalarAggregate");
+                            }
+                            return std::make_unique<testing::ScriptedSource>(
+                                schema, std::vector<Batch>{{.data = answer}});
+                          });
+  op.set_profile(&profile);
+  MemoryBudget tiny(int64_t{1});
+  const auto dropped = Drain(op, ExecContext{.budget = &tiny});
+  ASSERT_TRUE(dropped.ok()) << dropped.status();
+  EXPECT_EQ(testing::SingleInt64(**dropped), 9);
+  EXPECT_NE(profile.fallback_plan(), nullptr);
+  MemoryBudget roomy(int64_t{1} << 20);
+  const auto kept = Drain(op, ExecContext{.budget = &roomy});
+  ASSERT_TRUE(kept.ok()) << kept.status();
+  EXPECT_EQ(profile.fallback_plan(), nullptr);
+  EXPECT_EQ(MetricSum(profile, "shared_rows"), kRows);
 }
 
 TEST_F(SharedBuildsTest, ReleasesBothProducersAndTheirReservationsBeforeBudgetFallback) {
